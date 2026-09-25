@@ -106,6 +106,7 @@ The `web` service waits for the `api` healthcheck. SQLite is stored in the named
 | `WEB_PORT` / `API_PORT` | Host ports for the frontend / backend (default `9180` / `9181`) |
 | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_THINKING_LEVEL` | Gemini provider (used from Phase 1; `LLM_PROVIDER=fake` for offline runs) |
 | `REQRES_API_KEY`, `REQRES_BASE_URL` | Hosted ReqRes mock API; requires an `x-api-key` header |
+| `DATABASE_URL` | SQLite location (default `sqlite:///./data/app.db`; in Docker `sqlite:////app/data/app.db` on the `api-data` volume) |
 | `DB_AUTO_SEED` | Create tables and load the fictional demo data on startup when the database is empty (default `true`) |
 | `AUTH_COOKIE_SECURE`, `AUTH_COOKIE_NAME` | Session cookie flags. Set `AUTH_COOKIE_SECURE=true` when served over https (production mode forces it). If you change the name, the frontend's "session expired" notice still expects `scmp_session` |
 | `JWT_SECRET_KEY`, `JWT_EXPIRE_MINUTES`, `JWT_ISSUER` | JWT signing. Empty secret = random per-process secret in development (logins reset when the API restarts); production requires 32+ characters (`openssl rand -hex 32`) |

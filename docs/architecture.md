@@ -6,7 +6,7 @@ bell inbox is described only as far as [inbox-design.md](inbox-design.md) says.
 ## 1. System overview
 
 ```mermaid
-flowchart LR
+flowchart TB
     browser["Browser<br/>mock Google sign-in"]
     subgraph compose["docker compose"]
         web["Nuxt web<br/>port 9180"]
@@ -14,24 +14,24 @@ flowchart LR
         sqlite[("SQLite<br/>/app/data/app.db")]
         uploads[("Uploads<br/>/app/data/uploads")]
     end
+    reqres["ReqRes hosted mock API<br/>POST reqres.in/api/users"]
     subgraph llm["LLM provider interface"]
         fallback["FallbackLLMProvider"]
         gemini["Gemini"]
         ollama["Ollama on the host"]
         fake["Fake, tests only"]
     end
-    reqres["ReqRes hosted mock API<br/>POST reqres.in/api/users"]
 
     browser -->|"pages"| web
     browser -->|"fetch with httpOnly cookie"| api
     web -->|"SSR: GET /api/auth/me"| api
     api --> sqlite
     api --> uploads
+    api -->|"ReqresSubmissionAdapter"| reqres
     api -->|"analyse()"| fallback
+    api -.->|"LLM_PROVIDER=fake"| fake
     fallback -->|"primary"| gemini
     fallback -->|"on error"| ollama
-    api -.->|"LLM_PROVIDER=fake"| fake
-    api -->|"ReqresSubmissionAdapter"| reqres
 ```
 
 - `sqlite` and `uploads` live in the same named volume `api-data`, so `docker compose down -v`
@@ -240,7 +240,8 @@ frontend/
   tests/, scripts/     Vitest, mock API stub for UI work
 docs/                  design notes, business rules, test cases, this file, troubleshooting
 scripts/reset-demo.sh  put the demo data back to the start
-e2e/                   Playwright end-to-end tests: planned for Phase 4, not in the repo yet
+e2e/                   Playwright end-to-end tests (own servers on 9280/9281) and the screenshot script
+docs/screenshots/      five fictional-data screenshots produced by `cd e2e && bun run screenshots`
 ```
 
 ## 7. Key design choices and trade-offs

@@ -156,9 +156,13 @@ Code changes need `--build`; `.env` changes only need `up -d`. The `web` contain
 ```bash
 cd backend && uv run pytest -q && uv run ruff check . && uv run ruff format --check .
 cd frontend && bun run lint && bun run typecheck && bun run test
+# end-to-end (Playwright, offline, own servers on 9280/9281, system Chrome)
+cd e2e && bun install && bun run test
 # opt-in live AI check (local Ollama)
 cd backend && RUN_LIVE_LLM=1 uv run python scripts/live_llm_smoke.py --provider ollama
 ```
 
-Backend tests are offline (fake LLM, temporary SQLite) and never read `.env`. Playwright end-to-end
-tests are planned for Phase 4 and are not in the repository yet.
+Backend tests are offline (fake LLM, temporary SQLite) and never read `.env`. The Playwright
+end-to-end tests are offline too (fake LLM and fake submission adapter, reseeded before every test).
+If one fails to start, check that ports 9280 and 9281 are free; without system Chrome run
+`bunx playwright install chromium` and `E2E_BROWSER=chromium bun run test` (see `e2e/README.md`).

@@ -37,10 +37,13 @@ one by one; also a small number on the bell." All data is fictional.
 | `POST /api/chat/inbox` (no body) | Nothing to handle: `200 {"empty": true, "unread_count": 0}`. Otherwise `201 {"empty": false, "conversation": ConversationSummary, "assistant_messages": [Message], "warning_code": null}` (intro message, then the first card) |
 | `POST /api/chat/conversations/{id}/actions` | Existing endpoint; body gains inbox actions: `{"card_id": "...", "action": "approve" \| "reject" \| "skip" \| "acknowledge", "note": null \| "<=500 chars", "confirmed": true}` (`confirmed` required for approve and reject, ignored otherwise; `note` only for approve and reject). Returns `TurnResponse` with the result message(s) and the NEXT card (or the closing message) |
 
-Errors: 409 for a stale card, an item already decided elsewhere (the card becomes `stale` and the
-next item is shown), or a card that is not the newest open one; 422 for a missing `confirmed`, a bad
-action for the card kind, or a note over 500 characters; 404 for someone else's conversation; 403
-for users who neither file nor approve (the existing rule).
+Errors: 409 for a card that is not the newest open one, a card already used (including a double
+click: exactly one decision wins), or a confirmation-card id sent with an inbox action; 422 for a
+missing `confirmed`, a bad action for the card kind, or a note over 500 characters; 404 for someone
+else's conversation; 403 for users who neither file nor approve (the existing rule).
+
+**An item decided or cancelled elsewhere is not an error:** the turn returns HTTP 200, the card
+becomes `stale` ("That request was already handled"), and the next item is shown.
 
 ```jsonc
 InboxCard = {                                    // Message.ui.type = "inbox_card"

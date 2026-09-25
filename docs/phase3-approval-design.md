@@ -171,15 +171,24 @@ Notifications match the pending items. Audit events keep the same variety.
 New: `departments` (name, `claim_limit_amount`), `leave_entitlements`; `users.department_id`,
 `users.job_title`, `users.leave_approver_user_id`, `users.claim_approver_user_id`;
 `leave_requests.approver_user_id`, `claim_requests.approver_user_id`;
-`notifications` gets a nullable short `payload_json` if needed. Removed: the CHECK constraint
+`notifications` needed no new column (the approver name and the note are read from the decided request when a notification is displayed). Removed: the CHECK constraint
 "rejected requests need a reviewer note" (the note is optional now) and the domain rule that
 enforces it. SQLite cannot drop a CHECK constraint in place, so **existing databases must be
-recreated**: `docker compose down -v` (or `python -m app.cli seed --reset --yes`). The API must
+recreated**: `docker compose down -v` (or `python -m app.cli reset-demo --yes`). The API must
 detect an older schema at startup and log a clear instruction instead of failing obscurely.
+
+## 7b. Implementation notes (differences from the first draft)
+
+- A request that is assigned to the caller but no longer pending gives `404` on the detail `GET` and
+  `409` on the decision `POST`; an unknown, unassigned or wrong-type request is `404` for both.
+- The list summary reuses the chat status card text ("Travel claim, HKD 180.00, receipt ..."); money
+  values are strings and day counts are numbers in the API.
+- The decision audit metadata keeps the numbers under one `snapshot` key (`kind` is
+  `leave_balance` or `department_budget`) and never contains the note text.
 
 ## 8. Changing limits and routing later (no admin UI in the PoC)
 
-Entitlements, department claim limits and approvers are plain data. Phase 3 adds a documentation
+Entitlements, department claim limits and approvers are plain data. There is a documentation
 page `docs/limits-and-routing.md` (where each value lives) and small CLI commands:
 `python -m app.cli set-entitlement --email E --year Y --type annual|sick --days N`,
 `set-claim-limit --department D --amount N`, `set-approvers --email E [--leave-approver A]

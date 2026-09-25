@@ -583,6 +583,17 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
 - **Verification commands and results:** as above; E2E 10 passed; backend 1482 passed; frontend 144 passed.
 - **Commit:** `8231026` (AGENTS.md), `a84cf7f` and the following README commit; the log is committed after this entry.
 
+## Entry 34 - Final documentation review and commit (integrator)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`).
+- **Actual prompt (Ken):** the test is good; commit it; please check all the docs are good first.
+- **Allowed scope:** documentation only (README, docs, this log); no code changes.
+- **Agent result:** checked 15 tracked Markdown files. Scripted checks: no broken relative links; all 26 commit hashes cited in this log exist in the repository; every documented CLI command and flag matches `python -m app.cli`; every script mentioned exists in `package.json`; code fences are balanced; every `.env.example` setting is documented (the six theme colours as the documented `NUXT_PUBLIC_THEME_*` pattern; `DATABASE_URL` was missing from the README table and was added). Stale text fixed: the architecture and troubleshooting docs said the E2E tests were "planned"; `docs/inbox-design.md` said an item decided elsewhere returns 409 while the built behaviour is HTTP 200 with a `stale` card; `docs/phase3-approval-design.md` still mentioned a `payload_json` column that was not needed, the old reset command, and now has an "Implementation notes" section (404 on detail and 409 on decision for a non-pending assigned request, summary text style, audit snapshot layout). The four Mermaid diagrams were rendered in a browser (all valid); diagram 1 was reflowed top-to-bottom so the arrows no longer cross. Final numbers re-run and confirmed against the docs: backend 1,482 tests, frontend 144, end-to-end 10, ruff and lint clean.
+- **Human review / changes requested:** Ken confirmed the manual test round was good.
+- **Verification commands and results:** `uv run pytest -q` 1482 passed; `bun run test` 144 passed; `cd e2e && bun run test` 10 passed in 13.8 s.
+- **Commit:** the next commit ("docs: final review ...").
+
 ## Entry template
 
 ### Entry NN - [phase and short task name]
