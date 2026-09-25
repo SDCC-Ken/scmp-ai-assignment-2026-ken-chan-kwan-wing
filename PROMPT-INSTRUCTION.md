@@ -266,6 +266,106 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
   - Not repeated in the browser this round: logins for the other four users (covered by backend tests and the earlier Phase 1 browser check as Daniel Wong).
 - **Commit:** `0ab3401` docs: document cookie session, top-right sign-in prompt and cookie settings.
 
+## Entry 13 - Phase 2 kickoff and decisions (Ken → integrator agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), integrator.
+- **Actual prompt (Ken, condensed):**
+  ```text
+  Phase 2. 1 one simple chat UI. 2 use gemini-3.8-flash with Pydantic structured output to control and validate the final leave/claim form.
+  3 ask again when something is wrong or misunderstood. 4 when all is OK show a confirmation card, save to SQLite and send to reqres.in with only
+  the defined API fields, keep the rest in SQLite. 5 leave working days skip public holidays and Saturday/Sunday. 6 save every conversation so the
+  user can call it back, continue editing, or cancel. 7 users can ask the LLM for the status of their leave and claims. 8 create success and failure
+  test cases (e.g. wrong dates) for create, update and delete. 9 the Gemini key is in .env.
+  Follow-ups: the assignment's API spec (screenshot: JSON keys `email`, `leave_type` "Annual", `start_date`, `end_date`; no token needed; claims use
+  the same endpoint) - "you can try"; "rules will be set into phase 3, keep and can CRUD leaves and claims first"; single date must ask whether it is one day
+  (single day is allowed); past leave is allowed only for sick leave; other rules are fine; write all rules to an md file; attachments 5 MB per file;
+  the machine has Ollama, use it as a fallback if the key has a problem; do not use Gemini first (free quota); wait for the quota reset for phase 4 testing.
+  ```
+- **Allowed scope:** integrator: shared contracts (`backend/app/llm/{schemas,base}.py`, `backend/app/integrations/base.py`), settings, `docs/chat-api-contract.md`, `.env.example`, compose.
+- **Agent result:**
+  - Wrote the interface contracts and the chat API contract so three agents could work in parallel (LLM/ReqRes adapters, chat engine, UI).
+  - The screenshot showed my earlier assumption was wrong (`employee_email` and a required key). Added `to_wire()` to the payload models, corrected AGENTS.md, and made the `x-api-key` header optional.
+  - Made two live ReqRes calls (one leave, one claim, fictional sample data) to confirm: HTTP 201, string `id` and `createdAt`, plus extra `_meta` ignored.
+  - Deferred the invented business rules to Phase 3 as Ken asked; the code has an empty rules registry. After Ken's answers the registry holds exactly one rule (past leave only for sick leave) and the single-date question was added.
+  - Read Google's Gemini docs on rate limits (per project, daily reset at midnight Pacific, exact numbers only in AI Studio) and on image/PDF input.
+  - Added Ollama settings and a container-to-host route (`host.docker.internal`); verified a Docker container can reach the host Ollama.
+- **Human review / changes requested:** Ken made the rule decisions listed above.
+- **Verification commands and results:** see Entries 14 to 17.
+- **Commit:** `7ba037f` (documents); contract and settings files are in the backend commit (pending, see Entry 15).
+
+## Entry 14 - Phase 2 Gemini/Ollama and ReqRes adapters (backend sub-agent B1)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 2, role backend-B1. Own backend/app/llm/*, backend/app/integrations/*, their tests and scripts. Build: Gemini provider (gemini-3.8-flash, thinking level low,
+  structured output validated by AgentTurn), a deterministic fake LLM, the ReqRes adapter sending payload.to_wire() only (x-api-key only when configured, no retries),
+  a fake submission adapter, factories, offline tests, and a bounded live Gemini smoke script. Later tasks: attachments (multimodal parts, document extraction,
+  sample fictional documents) and a local Ollama provider with an automatic fallback wrapper and PDF-to-image conversion.
+  ```
+- **Allowed scope:** `backend/app/llm/`, `backend/app/integrations/`, `backend/tests/llm|integrations/`, `backend/scripts/`, `backend/samples/`.
+- **Agent result:** Gemini and Fake providers, ReqRes and fake adapters, factories, document-aware prompts and fake fixtures, four fictional sample documents, and (later, partly finished) Ollama provider, fallback wrapper and PDF renderer. Live checks: 1 of 12 Gemini cases completed before the free quota ran out (429) after 503 "high demand" errors, although the agent ran the smoke script four times against an instruction to run it once; two live ReqRes POSTs returned 201.
+- **Human review / changes requested:** The agent was cut off by the account session limit while running the live Ollama comparison. The Ollama provider, fallback, PDF renderer and factory existed without tests. The integrator's live check of `qwen2.5:7b` then found it dropped explicit fields, so a follow-up agent was launched (Entry 18).
+- **Verification commands and results:** the agent reported 181 tests passing in `tests/llm` and `tests/integrations` before the Ollama work; the whole suite was 599 passing and ruff clean when the integrator re-ran it after the interruption.
+- **Commit:** pending (backend commit).
+
+## Entry 15 - Phase 2 chat engine and business rules (backend sub-agent B2)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 2, role backend-B2. Build the chat engine: LangGraph turn pipeline (understand, route, merge, validate, decide, respond) with a per-node AI trace, conversation state and
+  additive schema changes, policy and validation with deterministic follow-ups, confirmation cards (confirm only via the newest card), create/update/cancel/retry/status flows,
+  graceful LLM/ReqRes failures, the /api/chat endpoints, and offline tests. Later corrections: business rules deferred (empty registry), wire format via to_wire(); then Ken's rule
+  decisions (single-date question, past leave only for sick leave) and a request to write docs/business-rules.md.
+  ```
+- **Allowed scope:** `backend/` except the LLM/integration files owned by B1; `docs/test-cases.md`.
+- **Agent result:** LangGraph pipeline in `app/agent/graph.py`, `app/chat/*` (policy, validation, state, cards, actions), additive migrator, chat routes, new state transition `pending_approval` -> `cancelled` for the owner, and 3,395 lines of chat tests. The agent was cut off by the account session limit while updating tests for Ken's rule decisions and before writing the two documents.
+- **Human review / changes requested:** The integrator confirmed the single-date question and the past-leave rule were already implemented and tested, then wrote `docs/business-rules.md` and `docs/test-cases.md` from the code and verified by script that every cited test exists.
+- **Verification commands and results (integrator):** `uv run pytest -q` 599 passed; `ruff check` and `ruff format --check` clean (before the later agents began editing).
+- **Commit:** pending (backend commit).
+
+## Entry 16 - Phase 2 chat UI and attachment upload UI (frontend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 2, role frontend. One simple chat for employees at `/`: conversation list with New chat, thread, composer, confirmation/status/result cards, loading state, collapsible AI trace,
+  resume old conversations, warning banners, stale-card handling; approvers keep the "coming next phase" panel. Then Phase 2b: attach (button, drag-drop, paste), 5 MB and 3-file limits,
+  staged chips, thumbnails via credentialed fetch, preview dialog, "from document" tags. Develop against the API contract and a dev stub.
+  ```
+- **Allowed scope:** `frontend/` only.
+- **Agent result:** New composables, types, utilities, 15 components, an extended stub. Deviations reported: indeterminate spinner instead of a progress bar; Send blocked while an upload fails; an empty new chat is reused instead of creating another.
+- **Human review / changes requested:** Integrator re-ran the checks. Not yet tested against the real backend (the attachment endpoints do not exist yet).
+- **Verification commands and results (integrator):** `bun run lint` clean; `bun run typecheck` clean; `bun run test` 70 passed; `bun run build` complete.
+- **Commit:** `a90b427` feat(frontend): add employee chat UI with cards, AI trace and attachment upload.
+
+## Entry 17 - Rules, test-case and Phase 3 documents (integrator)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`).
+- **Actual prompt:** Ken: write all the validation rules to an md file (Entry 13); later Phase 3 brief (13 points on departments, approval routing, limits, reviewer note, bell notifications and audit).
+- **Allowed scope:** `docs/`, `AGENTS.md`.
+- **Agent result:** `docs/business-rules.md` (Leave, Claim, update/cancel, chat rules with IDs, status, enforcement location, follow-up text and proving tests), `docs/test-cases.md` (create/update/cancel success and failure matrix), and `docs/phase3-approval-design.md` (people and routing, limits, approver API, notifications, seed and schema changes). Ken's Phase 3 brief required two design changes: approvers can also file requests (Cathy), and the reviewer note becomes optional, which removes a database check and therefore needs a database reset.
+- **Human review / changes requested:** Pending. Assumptions that Ken can change are marked **(assumption)** in the Phase 3 design (leave entitlements 15/10 days, department claim limits, counting rules).
+- **Verification commands and results:** a script confirmed every test name cited in both documents exists in `backend/tests`.
+- **Commit:** `7ba037f` docs: add chat API contract, business rules, test cases and Phase 3 design.
+
+## Entry 18 - Local model tuning and delegated follow-ups (integrator, then sub-agents)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`).
+- **Actual prompt:** Ken: the machine has Ollama, use it as a fallback and do not use Gemini for now; then, after the agents were cut off: "do not continue your jobs, create some small sub agents to do the work that is not finished".
+- **Allowed scope:** live experiments only (no code committed from them); two new sub-agents with separate file ownership.
+- **Agent result:** The integrator ran live tests of the local models on five text cases. `qwen2.5:7b` always returned valid JSON but skipped fields such as leave type; `llama3.1:8b` was more accurate on the leave type but returned invalid JSON on 2 of 5 cases (about 60 s each); `gemma3:12b` failed most cases and took over 100 s. A flat schema with a compact prompt scored 9 of 12 on `qwen2.5:7b`; the remaining failures were a cold-model timeout, the one-day reply and "next Monday" date arithmetic. Two sub-agents were then launched: one to finish the Ollama provider (flat schema, calendar table, tests, live comparison, smoke script) and one to build attachment storage and the upload/download API.
+- **Human review / changes requested:** Ken asked for delegation to small agents rather than the integrator continuing the work.
+- **Verification commands and results:** pending the two agents' reports.
+- **Commit:** pending.
+
 ## Entry template
 
 ### Entry NN - [phase and short task name]
