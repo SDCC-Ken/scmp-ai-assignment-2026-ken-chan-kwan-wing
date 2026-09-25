@@ -21,6 +21,12 @@ HELEN = "helen.yeung@example.com"
 EVA = "eva.cheung@example.com"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_upload_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``seed --reset`` empties the upload directory: never point a test at real data."""
+    monkeypatch.setattr(cli, "_configured_upload_dir", lambda: str(tmp_path / "uploads"))
+
+
 @pytest.fixture
 def db(tmp_path: Path) -> Iterator[Database]:
     database = Database(f"sqlite:///{tmp_path / 'org.db'}")

@@ -12,6 +12,12 @@ from app.seed import table_counts
 BUNDLED = Path(__file__).resolve().parents[1] / "app" / "data" / "hk_public_holidays_1823.ics"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_upload_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``seed --reset`` empties the upload directory: never point a test at real data."""
+    monkeypatch.setattr(cli, "_configured_upload_dir", lambda: str(tmp_path / "uploads"))
+
+
 @pytest.fixture
 def tmp_db(tmp_path: Path):
     database = Database(f"sqlite:///{tmp_path / 'cli.db'}")

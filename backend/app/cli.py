@@ -1,14 +1,18 @@
 """Command line tools: ``uv run python -m app.cli <command>``.
 
-Commands: ``init-db``, ``seed [--reset --yes]``,
+Commands: ``init-db``, ``seed [--reset --yes]``, ``reset-demo --yes`` (drop everything, reseed and
+delete the uploaded files),
 ``import-holidays [--year YYYY ...] [--file PATH | --url URL]``, and the Phase 3 organisation
 tools (no admin UI in the PoC): ``show-org``, ``set-entitlement``, ``set-claim-limit``,
 ``set-approvers``. In Docker: ``docker compose exec api python -m app.cli <command>``.
 """
 
 import argparse
+import os
+import stat
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlalchemy import select
@@ -37,8 +41,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init-db", help="create missing tables")
 
     seed = sub.add_parser("seed", help="load fictional demo data (no-op if users exist)")
-    seed.add_argument("--reset", action="store_true", help="DROP ALL TABLES first")
+    seed.add_argument(
+        "--reset", action="store_true", help="DROP ALL TABLES (and delete uploads) first"
+    )
     seed.add_argument("--yes", action="store_true", help="confirm --reset")
+
+    reset = sub.add_parser(
+        "reset-demo",
+        help="drop all tables, reseed the fictional demo data and delete the uploaded files",
+    )
+    reset.add_argument("--yes", action="store_true", help="confirm the reset")
 
     imp = sub.add_parser("import-holidays", help="import public holidays from an iCal feed")
     imp.add_argument("--year", type=int, nargs="+", metavar="YYYY", help="only these years")
@@ -81,12 +93,130 @@ def cmd_init_db(database: Database) -> int:
     return 0
 
 
-def cmd_seed(database: Database, *, reset: bool, yes: bool) -> int:
+class UnsafeUploadDir(Exception):
+    """The upload directory is not one this tool may empty (nothing has been changed)."""
+
+
+@dataclass
+class UploadCleanup:
+    files: int = 0
+    dirs: int = 0
+    skipped: list[str] = field(default_factory=list)
+
+
+def _configured_upload_dir() -> str:
+    return get_settings().upload_dir
+
+
+def _upload_dir(explicit: str | Path | None) -> str | Path:
+    return explicit if explicit is not None else _configured_upload_dir()
+
+
+def safe_upload_root(upload_dir: str | Path) -> Path:
+    """The resolved upload directory, or ``UnsafeUploadDir`` for `/`, a filesystem root, the
+    home directory or any parent of it (a mistyped UPLOAD_DIR must never empty those)."""
+    raw = str(upload_dir).strip()
+    if not raw:
+        raise UnsafeUploadDir("UPLOAD_DIR is empty")
+    root = Path(raw).expanduser().resolve()
+    try:
+        home: Path | None = Path.home().resolve()
+    except (RuntimeError, OSError):
+        home = None
+    if root.parent == root or (home is not None and (root == home or home.is_relative_to(root))):
+        raise UnsafeUploadDir(f"refusing to empty {root}: not an upload directory")
+    return root
+
+
+def clear_uploads(upload_dir: str | Path) -> UploadCleanup:
+    """Delete the regular files and the then-empty sub-directories INSIDE ``upload_dir``.
+
+    The directory itself stays (it may be a Docker volume mount). Symbolic links are never
+    followed and never removed, and neither are sockets or other special files: they are
+    reported as skipped, so nothing outside the directory can be touched. A missing directory
+    is fine (nothing to remove).
+    """
+    root = safe_upload_root(upload_dir)
+    result = UploadCleanup()
+    if not root.exists():
+        return result
+    if not root.is_dir():
+        raise UnsafeUploadDir(f"{root} is not a directory")
+    for current, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        here = Path(current)
+        for name in filenames:
+            path = here / name
+            try:
+                if stat.S_ISREG(path.lstat().st_mode):
+                    path.unlink()
+                    result.files += 1
+                else:
+                    result.skipped.append(str(path))
+            except OSError:
+                result.skipped.append(str(path))
+        for name in dirnames:
+            path = here / name
+            if path.is_symlink():
+                result.skipped.append(str(path))
+                continue
+            try:
+                path.rmdir()
+                result.dirs += 1
+            except OSError:  # not empty because something inside was skipped
+                result.skipped.append(str(path))
+    return result
+
+
+@dataclass
+class ResetOutcome:
+    counts: dict[str, int]
+    uploads: UploadCleanup
+
+
+def _reset_everything(database: Database, upload_dir: str | Path) -> ResetOutcome | int:
+    """Drop and recreate every table, reseed, then empty the upload directory.
+
+    The upload directory is validated first, so an unsafe path stops before anything changes.
+    Returns the outcome, or an exit code after printing the error.
+    """
+    try:
+        safe_upload_root(upload_dir)
+    except UnsafeUploadDir as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    drop_all(database.engine)
+    if (failed := _check_schema(database)) is not None:
+        return failed
+    with database.session_factory() as session:
+        result = seed_demo_data(session)
+        counts = result.counts
+    try:
+        uploads = clear_uploads(upload_dir)
+    except UnsafeUploadDir as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    if uploads.skipped:
+        print(
+            f"Warning: {len(uploads.skipped)} item(s) in {upload_dir} could not be removed "
+            "(symbolic links, special files or permissions); they were left alone.",
+            file=sys.stderr,
+        )
+    return ResetOutcome(counts, uploads)
+
+
+def cmd_seed(database: Database, *, reset: bool, yes: bool, upload_dir: str | Path) -> int:
     if reset and not yes:
         print("Refusing to reset: --reset drops every table. Re-run with --reset --yes.")
         return 2
     if reset:
-        drop_all(database.engine)
+        outcome = _reset_everything(database, upload_dir)
+        if isinstance(outcome, int):
+            return outcome
+        print("Seeded fictional demo data:")
+        for table, count in outcome.counts.items():
+            print(f"  {table}: {count}")
+        print(f"Uploaded files removed: {outcome.uploads.files}")
+        return 0
     if (failed := _check_schema(database)) is not None:
         return failed
     with database.session_factory() as session:
@@ -98,6 +228,30 @@ def cmd_seed(database: Database, *, reset: bool, yes: bool) -> int:
     print("Seeded fictional demo data:")
     for table, count in counts.items():
         print(f"  {table}: {count}")
+    return 0
+
+
+def cmd_reset_demo(database: Database, *, yes: bool, upload_dir: str | Path) -> int:
+    if not yes:
+        print(
+            "Refusing to reset: reset-demo drops every table, reseeds the demo data and deletes "
+            "every uploaded file. Re-run with --yes."
+        )
+        return 2
+    outcome = _reset_everything(database, upload_dir)
+    if isinstance(outcome, int):
+        return outcome
+    counts = outcome.counts
+    print("Demo data reset.")
+    print(f"  users: {counts.get('users', 0)}")
+    leave, claims = counts.get("leave_requests", 0), counts.get("claim_requests", 0)
+    print(f"  requests: {leave + claims} ({leave} leave, {claims} claim)")
+    print(f"  public holidays: {counts.get('public_holidays', 0)}")
+    print(f"  uploaded files removed: {outcome.uploads.files}")
+    print("Sign in (mock Google, no password) as one of:")
+    with database.session_factory() as session:
+        for user in session.scalars(select(User).order_by(User.id)):
+            print(f"  {user.display_name:<13} {user.email:<28} {user.role.value}")
     return 0
 
 
@@ -205,14 +359,30 @@ def cmd_import_holidays(
     return 0
 
 
-def main(argv: Sequence[str] | None = None, *, database: Database | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    database: Database | None = None,
+    upload_dir: str | Path | None = None,
+) -> int:
     args = build_parser().parse_args(argv)
     database = database or Database(get_settings().database_url)
     try:
         if args.command == "init-db":
             return cmd_init_db(database)
         if args.command == "seed":
-            return cmd_seed(database, reset=args.reset, yes=args.yes)
+            return cmd_seed(
+                database,
+                reset=args.reset,
+                yes=args.yes,
+                upload_dir=_upload_dir(upload_dir) if args.reset else "",
+            )
+        if args.command == "reset-demo":
+            return cmd_reset_demo(
+                database,
+                yes=args.yes,
+                upload_dir=_upload_dir(upload_dir),
+            )
         if args.command == "show-org":
             return cmd_show_org(database)
         if args.command == "set-entitlement":
