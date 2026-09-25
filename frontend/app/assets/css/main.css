@@ -179,3 +179,36 @@ body {
     border-color: #f87171;
   }
 }
+
+/* ---- Mock One Tap card ------------------------------------------------------------------------ */
+.one-tap {
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 20%), 0 10px 24px -4px rgb(0 0 0 / 25%);
+}
+
+.one-tap:focus-visible {
+  outline: 2px solid var(--theme-secondary);
+  outline-offset: 2px;
+}
+
+/* "MOCK" chip: same amber palette as the warning banner (contrast verified there). */
+.mock-chip {
+  display: inline-block;
+  border: 1px solid var(--warn-border);
+  border-radius: 9999px;
+  background-color: var(--warn-bg);
+  color: var(--warn-text);
+  padding: 0 0.5rem;
+  font-size: 0.6875rem;
+  line-height: 1.125rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.one-tap-cta {
+  white-space: nowrap;
+}
+
+[data-account-row]:hover .one-tap-cta,
+[data-account-row]:focus-visible .one-tap-cta {
+  text-decoration: underline;
+}

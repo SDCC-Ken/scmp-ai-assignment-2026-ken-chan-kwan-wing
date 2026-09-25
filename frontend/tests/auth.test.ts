@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import {
-  authCookieMaxAge,
+  apiRequestHeaders,
   authErrorMessage,
   avatarColour,
+  CSRF_HEADER,
   extractStatus,
+  firstName,
   getInitials,
   groupUsersByRole,
+  hasSessionCookie,
   isAuthUser,
+  isUnsafeMethod,
   MOCK_WARNING,
   parseMockUsers,
   resolveApiBase,
@@ -58,15 +62,43 @@ describe('getInitials / avatarColour', () => {
   })
 })
 
-describe('authCookieMaxAge', () => {
-  it('uses expires_in seconds when valid', () => {
-    expect(authCookieMaxAge(3600)).toBe(3600)
-    expect(authCookieMaxAge(90.9)).toBe(90)
+describe('firstName ("Continue as ...")', () => {
+  it('uses the first word of the display name', () => {
+    expect(firstName('Amy Lau')).toBe('Amy')
+    expect(firstName('  Chloe   Cheung ')).toBe('Chloe')
   })
 
-  it('falls back to one hour for invalid values and caps very long ones', () => {
-    for (const bad of [0, -5, Number.NaN, Infinity, '3600', null, undefined]) expect(authCookieMaxAge(bad)).toBe(3600)
-    expect(authCookieMaxAge(10 ** 9)).toBe(60 * 60 * 24 * 7)
+  it('falls back to the e-mail local part, then a generic word', () => {
+    expect(firstName('', 'henry.ho@example.com')).toBe('henry.ho')
+    expect(firstName(null, null)).toBe('account')
+  })
+})
+
+describe('httpOnly cookie session helpers', () => {
+  it('flags only unsafe methods (case-insensitive; missing method is a GET)', () => {
+    for (const m of ['POST', 'put', 'PATCH', 'delete']) expect(isUnsafeMethod(m)).toBe(true)
+    for (const m of ['GET', 'head', 'OPTIONS', undefined, null]) expect(isUnsafeMethod(m)).toBe(false)
+  })
+
+  it('adds the CSRF header to unsafe requests only, and keeps caller headers', () => {
+    expect(apiRequestHeaders('POST')).toEqual({ [CSRF_HEADER.name]: 'XMLHttpRequest' })
+    expect(apiRequestHeaders('delete', { 'x-trace': '1' })).toEqual({ 'x-trace': '1', 'X-Requested-With': 'XMLHttpRequest' })
+    expect(apiRequestHeaders('GET')).toEqual({})
+    expect(apiRequestHeaders(undefined, { a: 'b' })).toEqual({ a: 'b' })
+  })
+
+  it('forwards a cookie header only when given (SSR) and never builds an Authorization header', () => {
+    expect(apiRequestHeaders('GET', {}, 'scmp_session=abc; theme-mode=dark')).toEqual({ cookie: 'scmp_session=abc; theme-mode=dark' })
+    expect(apiRequestHeaders('GET', {}, '')).toEqual({})
+    expect(Object.keys(apiRequestHeaders('POST', {}, 'x=y')).map(k => k.toLowerCase())).not.toContain('authorization')
+  })
+
+  it('detects the session cookie by name in a raw Cookie header', () => {
+    expect(hasSessionCookie('theme-mode=dark; scmp_session=abc')).toBe(true)
+    expect(hasSessionCookie('scmp_session=abc')).toBe(true)
+    expect(hasSessionCookie('theme-mode=dark; not_scmp_session=abc')).toBe(false)
+    expect(hasSessionCookie('')).toBe(false)
+    expect(hasSessionCookie(undefined)).toBe(false)
   })
 })
 

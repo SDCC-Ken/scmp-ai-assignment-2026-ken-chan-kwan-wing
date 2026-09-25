@@ -1,6 +1,7 @@
 <template>
   <div class="min-h-screen bg-background text-secondary">
-    <div class="absolute right-4 top-4">
+    <!-- Top-left: the top-right corner belongs to the One Tap card. -->
+    <div class="absolute left-4 top-4">
       <ThemeToggle />
     </div>
     <slot />

@@ -9,12 +9,17 @@ export interface AuthUser {
   role: Role
 }
 
+/** Body of POST /api/auth/mock-google/login. The session JWT is NOT in the body: it travels only in the httpOnly cookie. */
 export interface LoginResponse {
-  access_token: string
-  token_type: string
   expires_in: number
   user: AuthUser
 }
+
+/** Name of the httpOnly session cookie the API sets (the frontend can never read its value). */
+export const SESSION_COOKIE_NAME = 'scmp_session'
+
+/** Sent on every unsafe request; the API rejects state-changing calls without it (CSRF check). */
+export const CSRF_HEADER = { name: 'X-Requested-With', value: 'XMLHttpRequest' } as const
 
 /** Canonical display order (matches the order the API returns mock users in). */
 export const ROLES: readonly Role[] = ['employee', 'hr_approver', 'finance_approver']
@@ -31,7 +36,7 @@ export const ROLE_GROUP_LABELS: Readonly<Record<Role, string>> = {
   finance_approver: 'Finance approvers',
 }
 
-/** Single source of truth for the mock-SSO warning; reused by the login page and the chooser modal. */
+/** Single source of truth for the mock-SSO warning; reused by the login page and the One Tap card. */
 export const MOCK_WARNING = {
   title: 'Mock sign-in: demonstration only',
   text: 'This is a demonstration-only mock sign-in. It is not connected to Google. '
@@ -131,15 +136,36 @@ export function avatarColour(seed: string): string {
   return AVATAR_COLOURS[hash % AVATAR_COLOURS.length]!
 }
 
-export const DEFAULT_COOKIE_MAX_AGE = 3600
-const MAX_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
+/** First word of the display name (for "Continue as ..."), falling back to the e-mail local part, then "account". */
+export function firstName(displayName: string | null | undefined, email?: string | null): string {
+  const word = (displayName ?? '').trim().split(/\s+/).find(Boolean)
+  if (word) return word
+  const local = (email ?? '').trim().split('@')[0]
+  return local || 'account'
+}
 
-/** Cookie lifetime in seconds from the API's `expires_in`; invalid values fall back to one hour. */
-export function authCookieMaxAge(expiresIn: unknown): number {
-  if (typeof expiresIn !== 'number' || !Number.isFinite(expiresIn) || expiresIn < 1) {
-    return DEFAULT_COOKIE_MAX_AGE
-  }
-  return Math.min(Math.floor(expiresIn), MAX_COOKIE_MAX_AGE)
+export function isUnsafeMethod(method: string | null | undefined): boolean {
+  return !['GET', 'HEAD', 'OPTIONS'].includes((method ?? 'GET').toUpperCase())
+}
+
+/** True when a raw `Cookie` request header carries the session cookie (name only; the value is never inspected). */
+export function hasSessionCookie(cookieHeader: string | null | undefined): boolean {
+  return (cookieHeader ?? '').split(';').some(part => part.trim().startsWith(`${SESSION_COOKIE_NAME}=`))
+}
+
+/**
+ * Headers for an API call: adds the CSRF header for unsafe methods and, during SSR only (the caller passes
+ * `forwardCookie`), forwards the incoming request's `Cookie` header. Never adds an Authorization header.
+ */
+export function apiRequestHeaders(
+  method: string | null | undefined,
+  extra: Record<string, string> = {},
+  forwardCookie?: string | null,
+): Record<string, string> {
+  const headers: Record<string, string> = { ...extra }
+  if (isUnsafeMethod(method)) headers[CSRF_HEADER.name] = CSRF_HEADER.value
+  if (forwardCookie) headers.cookie = forwardCookie
+  return headers
 }
 
 /** Extracts an HTTP status from an ofetch/FetchError-like value; undefined for network errors. */

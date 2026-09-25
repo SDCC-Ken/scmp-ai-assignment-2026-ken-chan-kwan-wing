@@ -1,20 +1,25 @@
-import type { CookieRef } from '#app'
+import type { NitroFetchOptions, NitroFetchRequest } from 'nitropack'
 
-const TOKEN_COOKIE = 'auth-token'
-const tokenCookies = new WeakMap<object, CookieRef<string | null>>()
 const EXPIRED_NOTICE = 'Your session has expired. Please sign in again.'
 
 /**
- * Session state. The JWT lives only in the `auth-token` cookie (never in useState, so it is not
- * serialised into the SSR payload); only the user object is shared state.
+ * Session state. The session JWT lives only in the API's httpOnly `scmp_session` cookie, which page scripts
+ * cannot read; this composable never sees or stores it. Auth state is just the (non-secret) user object in
+ * `useState`, which is safe to serialise into the SSR payload.
+ *
+ * Every browser call to the API is cross-origin (web :9180 -> API :9181), so it uses `credentials: 'include'`.
+ * During SSR the incoming request's `cookie` header is forwarded to the API by hand.
  */
 export function useAuth() {
   const nuxtApp = useNuxtApp()
   const config = useRuntimeConfig()
-  const secure = useRequestURL().protocol === 'https:'
+  // Read once, in a valid Nuxt context (empty object in the browser).
+  const ssrCookie = useRequestHeaders(['cookie']).cookie
 
   const user = useState<AuthUser | null>('auth-user', () => null)
   const notice = useState<string | null>('auth-notice', () => null)
+  /** True once the session has been validated (server render) or set by an explicit sign-in / sign-out. */
+  const checked = useState<boolean>('auth-checked', () => false)
 
   function apiBase(): string {
     return resolveApiBase({
@@ -24,92 +29,89 @@ export function useAuth() {
     })
   }
 
-  // useCookie/navigateTo need the Nuxt context, which is lost after an `await` in event handlers.
+  // navigateTo needs the Nuxt context, which is lost after an `await` in event handlers.
   // Re-enter it only when it is really missing: a nested runWithContext during SSR would clear the
   // outer context and break later composable calls in the same middleware.
   function withContext<T>(fn: () => T): T {
     return tryUseNuxtApp() ? fn() : nuxtApp.runWithContext(fn) as T
   }
 
-  const cookieOptions = { sameSite: 'lax', secure, default: () => null } as const
-  // One ref per Nuxt app (i.e. per SSR request, or once in the browser), created in a valid context
-  // and reused for reads and clearing, so navigations do not pile up cookie watchers.
-  const tokenCookie = tokenCookies.get(nuxtApp) ?? useCookie<string | null>(TOKEN_COOKIE, cookieOptions)
-  tokenCookies.set(nuxtApp, tokenCookie)
-
-  const getToken = (): string | null => tokenCookie.value || null
-
-  /** Client-only (called from the sign-in click handler). */
-  function setToken(token: string, expiresIn: number) {
-    // A cookie ref's maxAge is fixed at creation, so make one with the lifetime the API gave us.
-    // Create it before touching tokenCookie so it still sees the old value and therefore writes.
-    const withLifetime = withContext(() =>
-      useCookie<string | null>(TOKEN_COOKIE, { ...cookieOptions, maxAge: authCookieMaxAge(expiresIn) }),
-    ) as CookieRef<string | null>
-    tokenCookie.value = token // keep this instance in sync
-    withLifetime.value = token // last write wins: cookie now carries Max-Age
+  /** Low-level API call: base URL, cookie credentials, CSRF header. No 401 handling (see useApi). */
+  async function request<T>(path: string, options: NitroFetchOptions<NitroFetchRequest> = {}): Promise<T> {
+    return await $fetch<T>(path, {
+      ...options,
+      baseURL: apiBase(),
+      headers: apiRequestHeaders(
+        options.method,
+        options.headers as Record<string, string> | undefined,
+        import.meta.server ? ssrCookie : undefined,
+      ),
+      ...(import.meta.client ? { credentials: 'include' as const } : {}),
+    }) as T
   }
 
   function clearSession(message: string | null = null) {
-    tokenCookie.value = null
     user.value = null
     notice.value = message
   }
 
-  const bearer = (token: string) => ({ Authorization: `Bearer ${token}` })
-
   async function listMockUsers(): Promise<AuthUser[]> {
-    const data = await $fetch<unknown>('/api/auth/mock-users', { baseURL: apiBase(), timeout: 8000 })
-    return parseMockUsers(data)
+    return parseMockUsers(await request<unknown>('/api/auth/mock-users', { timeout: 8000 }))
   }
 
-  async function loginAs(email: string): Promise<AuthUser> {
-    const data = await $fetch<Partial<LoginResponse>>('/api/auth/mock-google/login', {
+  /** Signs in as a seeded mock user (the API sets the httpOnly cookie), stores the user and redirects home. */
+  async function login(email: string): Promise<AuthUser> {
+    const data = await request<Partial<LoginResponse>>('/api/auth/mock-google/login', {
       method: 'POST',
-      baseURL: apiBase(),
       body: { email },
       timeout: 8000,
     })
-    if (typeof data.access_token !== 'string' || !isAuthUser(data.user)) {
-      throw new Error('Malformed login response')
-    }
-    setToken(data.access_token, data.expires_in ?? 0)
+    if (!isAuthUser(data.user)) throw new Error('Malformed login response')
     user.value = data.user
     notice.value = null
+    checked.value = true
+    await withContext(() => navigateTo('/'))
     return data.user
   }
 
-  /** Validates the cookie token with /api/auth/me. Clears the session on 401/403. */
-  async function refreshUser(): Promise<AuthUser | null> {
-    const token = getToken()
-    if (!token) {
-      user.value = null
+  /**
+   * Validates the session cookie with /api/auth/me (server: forwards the incoming cookie header).
+   * A 401/403 clears the user; the "expired" notice is only set when a session actually existed.
+   */
+  async function fetchMe(): Promise<AuthUser | null> {
+    if (import.meta.server && !ssrCookie) {
+      user.value = null // no cookies at all: cannot be signed in, skip the API call
+      checked.value = true
       return null
     }
+    const hadSession = user.value !== null || hasSessionCookie(ssrCookie)
     try {
-      const me = await $fetch<unknown>('/api/auth/me', { baseURL: apiBase(), headers: bearer(token), timeout: 8000 })
+      const me = await request<unknown>('/api/auth/me', { timeout: 8000 })
       if (!isAuthUser(me)) throw new Error('Malformed /me response')
       user.value = me
       return me
     }
     catch (error) {
       const status = extractStatus(error)
-      if (status === 401 || status === 403) clearSession(EXPIRED_NOTICE)
+      if (status === 401 || status === 403) clearSession(hadSession ? EXPIRED_NOTICE : null)
       else user.value = null
       return null
     }
+    finally {
+      checked.value = true
+    }
   }
 
-  /** Best-effort server logout; the local session is always cleared first. */
+  /** Best-effort server logout (clears the cookie); the local session is always cleared. */
   async function logout() {
-    const token = getToken()
-    clearSession()
-    if (token) {
-      void $fetch('/api/auth/logout', { method: 'POST', baseURL: apiBase(), headers: bearer(token), timeout: 3000 })
-        .catch(() => undefined)
+    try {
+      await request('/api/auth/logout', { method: 'POST', timeout: 3000 })
     }
+    catch { /* best effort */ }
+    clearSession()
+    checked.value = true
     await withContext(() => navigateTo('/login'))
   }
 
-  return { user, notice, apiBase, withContext, getToken, clearSession, listMockUsers, loginAs, refreshUser, logout, expiredNotice: EXPIRED_NOTICE }
+  return { user, notice, checked, apiBase, withContext, request, clearSession, listMockUsers, login, fetchMe, logout, expiredNotice: EXPIRED_NOTICE }
 }
