@@ -30,7 +30,7 @@ All accounts, requests, dates, policies, and records are fictional demonstration
 
 ## Development status
 
-**Phase 0 (foundation) and Phase 1 (database, seed data, mock Google sign-in with real JWT auth) are complete.** The chat workflow, LangGraph agent, ReqRes submission and approval screens are added in later phases; this README is updated with each one.
+**Phase 0 (foundation) and Phase 1 (database, seed data, mock Google sign-in with real JWT auth in an httpOnly cookie) are complete.** The chat workflow, LangGraph agent, ReqRes submission and approval screens are added in later phases; this README is updated with each one.
 
 ## Deployment (Docker Compose)
 
@@ -43,7 +43,7 @@ docker compose up --build
 
 | Service | URL | Notes |
 | --- | --- | --- |
-| Frontend (Nuxt 4) | <http://localhost:9180> | Redirects to the mock Google sign-in, then a role-aware home page |
+| Frontend (Nuxt 4) | <http://localhost:9180> | Redirects to the mock Google sign-in (top-right prompt), then a role-aware home page |
 | Backend (FastAPI) | <http://localhost:9181/health> | Returns `{"status":"ok"}`; interactive docs at `/docs` |
 
 Useful commands:
@@ -67,6 +67,7 @@ The `web` service waits for the `api` healthcheck. SQLite is stored in the named
 | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_THINKING_LEVEL` | Gemini provider (used from Phase 1; `LLM_PROVIDER=fake` for offline runs) |
 | `REQRES_API_KEY`, `REQRES_BASE_URL` | Hosted ReqRes mock API; requires an `x-api-key` header |
 | `DB_AUTO_SEED` | Create tables and load the fictional demo data on startup when the database is empty (default `true`) |
+| `AUTH_COOKIE_SECURE`, `AUTH_COOKIE_NAME` | Session cookie flags. Set `AUTH_COOKIE_SECURE=true` when served over https (production mode forces it). If you change the name, the frontend's "session expired" notice still expects `scmp_session` |
 | `JWT_SECRET_KEY`, `JWT_EXPIRE_MINUTES`, `JWT_ISSUER` | JWT signing. Empty secret = random per-process secret in development (logins reset when the API restarts); production requires 32+ characters (`openssl rand -hex 32`) |
 | `MOCK_SSO_ENABLED` | Enables the mock Google sign-in endpoints (default `true`) |
 | `NUXT_PUBLIC_API_BASE` | Backend URL as seen by the browser |
@@ -86,7 +87,9 @@ Values are set through `NUXT_PUBLIC_THEME_{LIGHT,DARK}_{PRIMARY,SECONDARY,BACKGR
 
 ## Demo sign-in and seeded users
 
-Open <http://localhost:9180>, click **Sign in with Google**, and pick an account. This is a **mock** sign-in: the page says so before and after the click, nothing is sent to Google, and choosing an account signs you in immediately as that fictional user (no password). Behind it the backend issues a real signed JWT.
+Open <http://localhost:9180>. A Google One Tap-style prompt is always shown in the top-right corner of the login page (close it with the X or Escape, and reopen it with the **Sign in with Google** button). Pick an account to continue. This is a **mock** sign-in: the page says so, nothing is sent to Google, and choosing an account signs you in immediately as that fictional user (no password). Behind it the backend issues a real signed JWT.
+
+**Session cookie.** The JWT is delivered only in an `httpOnly`, `SameSite=Lax` cookie set by the API, so page scripts and browser storage never see it. The login response body contains no token. Writes (POST, PUT, PATCH, DELETE) must send `X-Requested-With: XMLHttpRequest` and, if an `Origin` header is present, it must be an allowed origin (a second defence against cross-site requests); the frontend does this automatically. The cookie is host-scoped, so it is shared by `localhost:9180` and `localhost:9181`. Deploying the web app and API on different hosts would need a same-origin reverse proxy, which is not part of this PoC. Disabling a user takes effect on the next request, because the API re-reads the user and role from the database every time.
 
 | User | Email | Role | Can do (from the next phase) |
 | --- | --- | --- | --- |
@@ -148,9 +151,9 @@ Tests run locally, not inside Docker. Docker Compose is only used to run and dem
 
 | What | Command | Where |
 | --- | --- | --- |
-| Backend unit tests (205, offline) | `cd backend && uv run pytest -q` | local |
+| Backend unit tests (237, offline) | `cd backend && uv run pytest -q` | local |
 | Backend lint | `cd backend && uv run ruff check . && uv run ruff format --check .` | local |
-| Frontend lint, types, unit tests (18) | `cd frontend && bun run lint && bun run typecheck && bun run test` | local |
+| Frontend lint, types, unit tests (22) | `cd frontend && bun run lint && bun run typecheck && bun run test` | local |
 | Full-stack smoke check | `docker compose up --build`, then open both URLs above | Docker |
 
 Backend tests use in-memory or temporary SQLite databases, never read `.env`, and never call ReqRes or Gemini.
