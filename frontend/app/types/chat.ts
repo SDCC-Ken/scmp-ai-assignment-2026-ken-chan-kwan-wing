@@ -1,6 +1,8 @@
 /** Types for the Phase 2 chat API (see docs/chat-api-contract.md). All data is fictional. */
 /* Card payload types carry a "Data" suffix so they never shadow the Vue components of the same name. */
 
+import type { ApprovalDetail } from './approvals'
+
 export type RequestType = 'leave' | 'claim'
 
 export interface ConversationSummary {
@@ -123,7 +125,30 @@ export interface BalanceCardData {
   lines: BalanceLine[]
 }
 
-export type MessageUi = ConfirmationCardData | StatusCardData | ResultCardData | BalanceCardData
+/** Bell inbox card (see docs/inbox-design.md): one item waiting for the person, shown one card at a time. */
+export type InboxKind = 'approval' | 'notice'
+export type InboxCardState = 'open' | 'done' | 'skipped' | 'stale'
+export type InboxOutcome = 'approved' | 'rejected' | 'acknowledged'
+export type InboxAction = 'approve' | 'reject' | 'skip' | 'acknowledge'
+
+export interface InboxCardData {
+  type: 'inbox_card'
+  card_id: string
+  kind: InboxKind
+  position: { index: number, total: number }
+  title: string
+  request_type: RequestType | null
+  request_id: number | null
+  /** kind "approval": exactly the shape of GET /api/approvals/{type}/{id}. */
+  detail: ApprovalDetail | null
+  /** kind "notice": plain text. */
+  notice: { title: string, body: string } | null
+  actions: InboxAction[]
+  state: InboxCardState
+  outcome: InboxOutcome | null
+}
+
+export type MessageUi = ConfirmationCardData | StatusCardData | ResultCardData | BalanceCardData | InboxCardData
 
 export interface Message {
   id: number
@@ -154,3 +179,18 @@ export interface ConversationDetail {
 export interface ConversationList {
   items: ConversationSummary[]
 }
+
+/** Body of `POST /api/chat/conversations/{id}/actions` for an inbox card. */
+export interface InboxActionBody {
+  card_id: string
+  action: InboxAction
+  /** Only for approve and reject: trimmed, null when empty. */
+  note?: string | null
+  /** Only for approve and reject: always true (the second, explicit click). */
+  confirmed?: boolean
+}
+
+/** `POST /api/chat/inbox`: nothing waiting, or a new conversation with its first messages. */
+export type InboxResponse =
+  | { empty: true, unread_count: number }
+  | { empty: false, conversation: ConversationSummary, assistant_messages: Message[] }

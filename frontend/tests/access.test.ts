@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { approvalsHeading, hasAnyAccess, homePath, isTabActive, navTabs, routeRedirect } from '../app/utils/access'
+import { approvalsHeading, canUseChat, chatTabLabel, hasAnyAccess, homePath, isTabActive, navTabs, routeRedirect } from '../app/utils/access'
 import { normalizeUser, parseMockUsers, userSubtitle } from '../app/utils/auth'
 
 const amy = { can_request: true, approves: null }
@@ -67,11 +67,15 @@ describe('route rules', () => {
     expect(routeRedirect(helen, '/login')).toBe('/approvals')
   })
 
-  it('/ needs can_request', () => {
+  it('/ is open to users who file requests or approve something (the bell inbox lives there)', () => {
     expect(routeRedirect(amy, '/')).toBeNull()
     expect(routeRedirect(cathy, '/')).toBeNull()
-    expect(routeRedirect(helen, '/')).toBe('/approvals')
+    expect(routeRedirect(helen, '/')).toBeNull()
+    expect(routeRedirect(eva, '/')).toBeNull()
     expect(routeRedirect(nobody, '/')).toBe('/no-access')
+    expect(canUseChat(helen)).toBe(true)
+    expect(canUseChat(nobody)).toBe(false)
+    expect(canUseChat(null)).toBe(false)
   })
 
   it('/approvals and its children need approves', () => {
@@ -97,13 +101,20 @@ describe('route rules', () => {
 describe('navigation tabs', () => {
   const keys = (u: typeof amy) => navTabs(u).map(t => t.label)
 
-  it('shows only the tabs a user may use (Cathy both; Amy chat; Helen and Eva approvals)', () => {
+  it('shows only the tabs a user may use (Cathy both; Amy chat; Helen and Eva Inbox and Approvals)', () => {
     expect(keys(amy)).toEqual(['My requests'])
     expect(keys(cathy)).toEqual(['My requests', 'Approvals'])
-    expect(keys(helen)).toEqual(['Approvals'])
-    expect(keys(eva)).toEqual(['Approvals'])
+    expect(keys(helen)).toEqual(['Inbox', 'Approvals'])
+    expect(keys(eva)).toEqual(['Inbox', 'Approvals'])
     expect(keys(nobody)).toEqual([])
     expect(navTabs(null)).toEqual([])
+  })
+
+  it('labels the chat tab "My requests" for requesters and "Inbox" for approve-only users', () => {
+    expect(chatTabLabel(amy)).toBe('My requests')
+    expect(chatTabLabel(cathy)).toBe('My requests')
+    expect(chatTabLabel(helen)).toBe('Inbox')
+    expect(chatTabLabel(eva)).toBe('Inbox')
   })
 
   it('marks the current tab (the chat tab only on exactly "/")', () => {

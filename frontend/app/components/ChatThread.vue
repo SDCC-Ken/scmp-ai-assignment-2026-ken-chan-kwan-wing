@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Message } from '~/types/chat'
+import type { InboxAction, Message } from '~/types/chat'
 
 const props = defineProps<{
   conversationId: number | null
@@ -8,9 +8,15 @@ const props = defineProps<{
   sending: boolean
   acting: { cardId: string, decision: 'confirm' | 'discard' } | null
   busy: boolean
+  /** The user may file requests: show the filing suggestions in the empty state. Otherwise a lighter inbox hint. */
+  canRequest: boolean
+  activeInboxId: string | null
+  inboxActing: { cardId: string, action: InboxAction } | null
+  inboxError: { cardId: string, action: InboxAction, text: string } | null
 }>()
 const emit = defineEmits<{
   action: [cardId: string, decision: 'confirm' | 'discard']
+  inbox: [cardId: string, action: InboxAction, note: string | null]
   suggest: [text: string]
 }>()
 
@@ -83,6 +89,18 @@ const isEmpty = computed(() => !props.loading && props.messages.length === 0)
         Loading conversation...
       </div>
 
+      <div v-else-if="isEmpty && !canRequest" class="mx-auto flex h-full max-w-xl flex-col items-center justify-center gap-3 py-6 text-center">
+        <span class="flex h-12 w-12 items-center justify-center rounded-full border border-secondary/40" aria-hidden="true">
+          <IconGlyph name="inbox" class="h-6 w-6" />
+        </span>
+        <h2 class="text-lg font-semibold">
+          Nothing here yet
+        </h2>
+        <p class="text-sm opacity-90">
+          Use the bell to see what needs your attention. You can also ask me a question below, for example about the status of a request.
+        </p>
+      </div>
+
       <div v-else-if="isEmpty" class="mx-auto flex h-full max-w-xl flex-col items-center justify-center gap-4 py-6 text-center">
         <span class="flex h-12 w-12 items-center justify-center rounded-full border border-secondary/40" aria-hidden="true">
           <IconGlyph name="chat" class="h-6 w-6" />
@@ -106,7 +124,11 @@ const isEmpty = computed(() => !props.loading && props.messages.length === 0)
           :message="message"
           :pending="acting"
           :locked="busy"
+          :active-inbox-id="activeInboxId"
+          :inbox-acting="inboxActing"
+          :inbox-error="inboxError"
           @action="(id, decision) => emit('action', id, decision)"
+          @inbox="(id, action, note) => emit('inbox', id, action, note)"
         />
         <li v-if="sending" class="flex items-start" role="status">
           <span class="inline-flex items-center gap-2 rounded-2xl rounded-bl-md border border-secondary/30 bg-secondary/5 px-3.5 py-2 text-sm">

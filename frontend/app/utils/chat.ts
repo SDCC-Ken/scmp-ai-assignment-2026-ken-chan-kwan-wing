@@ -15,6 +15,13 @@ import type {
 
 export const MAX_MESSAGE_LENGTH = 1000
 
+/** The backend titles an inbox conversation "Items to handle (N)"; the sidebar tags it by this prefix. */
+export const INBOX_TITLE_PREFIX = 'Items to handle'
+
+export function isInboxConversation(summary: Pick<ConversationSummary, 'title'> | null | undefined): boolean {
+  return !!summary && typeof summary.title === 'string' && summary.title.startsWith(INBOX_TITLE_PREFIX)
+}
+
 /** Suggestion chips of the empty state; picking one sends it as a message. */
 export const CHAT_SUGGESTIONS: readonly string[] = [
   'I need annual leave next Monday and Tuesday',
@@ -165,7 +172,10 @@ export interface ConversationBadge {
 /** Badges for the sidebar: an open card and/or the form type being filled. */
 export function conversationBadges(summary: ConversationSummary): ConversationBadge[] {
   const badges: ConversationBadge[] = []
-  if (summary.has_pending_card) badges.push({ kind: 'card', label: 'Awaiting confirmation' })
+  if (summary.has_pending_card) {
+    // An inbox conversation waits for a decision on its open item, not for a form confirmation.
+    badges.push({ kind: 'card', label: isInboxConversation(summary) ? 'Items waiting' : 'Awaiting confirmation' })
+  }
   if (summary.active_request_type) {
     badges.push({ kind: 'form', label: summary.active_request_type === 'leave' ? 'Leave form' : 'Claim form' })
   }
@@ -257,6 +267,11 @@ export function announcementFor(message: Message): string {
   }
   else if (message.ui?.type === 'balance_card') {
     parts.push(`Leave balance for ${message.ui.year}: ${message.ui.lines.length} leave type(s) shown.`)
+  }
+  else if (message.ui?.type === 'inbox_card') {
+    const { position, title, kind, state } = message.ui
+    const head = position && position.index >= 1 && position.total >= 1 ? `Item ${position.index} of ${position.total}. ${title}.` : `${title}.`
+    parts.push(state !== 'open' ? head : `${head} ${kind === 'approval' ? 'Choose Approve, Reject or Skip.' : 'Choose Got it or Skip.'}`)
   }
   return parts.filter(Boolean).join(' ')
 }

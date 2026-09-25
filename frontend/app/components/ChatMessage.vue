@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Message } from '~/types/chat'
+import type { InboxAction, Message } from '~/types/chat'
 
 defineProps<{
   message: Message
@@ -7,8 +7,15 @@ defineProps<{
   pending: { cardId: string, decision: 'confirm' | 'discard' } | null
   /** A turn or card action is running: card buttons are disabled. */
   locked: boolean
+  /** card_id of the newest open inbox card (the only one with active buttons). */
+  activeInboxId?: string | null
+  inboxActing?: { cardId: string, action: InboxAction } | null
+  inboxError?: { cardId: string, action: InboxAction, text: string } | null
 }>()
-defineEmits<{ action: [cardId: string, decision: 'confirm' | 'discard'] }>()
+defineEmits<{
+  action: [cardId: string, decision: 'confirm' | 'discard']
+  inbox: [cardId: string, action: InboxAction, note: string | null]
+}>()
 </script>
 
 <template>
@@ -44,7 +51,7 @@ defineEmits<{ action: [cardId: string, decision: 'confirm' | 'discard'] }>()
     >
       <span class="sr-only">Assistant: </span>{{ message.content }}
     </p>
-    <div v-if="message.ui" class="mt-2 w-full max-w-[min(100%,34rem)]">
+    <div v-if="message.ui" class="mt-2 w-full" :class="message.ui.type === 'inbox_card' ? 'max-w-[min(100%,42rem)]' : 'max-w-[min(100%,34rem)]'">
       <ConfirmationCard
         v-if="message.ui.type === 'confirmation_card'"
         :card="message.ui"
@@ -55,6 +62,15 @@ defineEmits<{ action: [cardId: string, decision: 'confirm' | 'discard'] }>()
       <StatusCard v-else-if="message.ui.type === 'status_card'" :card="message.ui" />
       <ResultCard v-else-if="message.ui.type === 'result_card'" :card="message.ui" />
       <BalanceCard v-else-if="message.ui.type === 'balance_card'" :card="message.ui" />
+      <InboxCard
+        v-else-if="message.ui.type === 'inbox_card'"
+        :card="message.ui"
+        :active="activeInboxId === message.ui.card_id"
+        :pending="inboxActing && inboxActing.cardId === message.ui.card_id ? inboxActing.action : null"
+        :locked="locked"
+        :error="inboxError && inboxError.cardId === message.ui.card_id ? inboxError : null"
+        @action="(id, action, note) => $emit('inbox', id, action, note)"
+      />
     </div>
     <TraceDisclosure v-if="message.trace && message.trace.length" :steps="message.trace" />
     <p class="mt-0.5 px-1 text-xs opacity-80">

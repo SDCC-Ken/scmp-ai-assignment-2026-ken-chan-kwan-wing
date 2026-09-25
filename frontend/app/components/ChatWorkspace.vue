@@ -1,5 +1,9 @@
 <script setup lang="ts">
+import type { InboxAction } from '~/types/chat'
+
 const chat = useChat()
+const { user } = useAuth()
+const canRequest = computed(() => !!user.value?.can_request)
 const composer = ref<{ focus: () => void } | null>(null)
 const drawerOpen = ref(false)
 const toggleButton = ref<HTMLButtonElement | null>(null)
@@ -17,11 +21,32 @@ async function openDrawer() {
   drawer.value?.querySelector<HTMLElement>('button:not([disabled])')?.focus()
 }
 
+/** Puts keyboard focus on the heading of the open inbox card (after a bell click, a reopen or an action). */
+function focusInboxCard() {
+  // Wait for the render and for the thread's own scroll-to-bottom, then let the focus bring the card heading into view.
+  setTimeout(() => {
+    document.querySelector<HTMLElement>('[data-inbox-active] [data-inbox-heading]')?.focus()
+  }, 30)
+}
+
 async function onSelect(id: number) {
   closeDrawer()
   await chat.select(id)
-  composer.value?.focus()
+  if (chat.activeInboxId.value) focusInboxCard()
+  else composer.value?.focus()
 }
+
+async function onInboxAction(cardId: string, action: InboxAction, note: string | null) {
+  await chat.inboxAction(cardId, action, note)
+  if (chat.activeInboxId.value) focusInboxCard() // next card (or the same card again after an error)
+  else composer.value?.focus() // closing message: back to the composer
+}
+
+// The bell opened an inbox conversation: start at its first card.
+watch(chat.inboxOpenedTick, () => {
+  closeDrawer()
+  focusInboxCard()
+})
 
 /** After removing a chip its button is gone; keep keyboard users in the composer. */
 async function onRemoveFile(id: string) {
@@ -212,7 +237,12 @@ const composerUnavailable = computed(() => chat.initialising.value || chat.loadi
         :sending="chat.sending.value"
         :acting="chat.acting.value"
         :busy="chat.busy.value"
+        :can-request="canRequest"
+        :active-inbox-id="chat.activeInboxId.value"
+        :inbox-acting="chat.inboxActing.value"
+        :inbox-error="chat.inboxError.value"
         @action="chat.cardAction"
+        @inbox="onInboxAction"
         @suggest="text => chat.send(text)"
       />
 
@@ -221,6 +251,7 @@ const composerUnavailable = computed(() => chat.initialising.value || chat.loadi
         v-model="chat.draft.value"
         :busy="chat.busy.value"
         :unavailable="composerUnavailable"
+        :can-request="canRequest"
         :staged="chat.staged.value"
         :attachment-errors="chat.attachmentErrors.value"
         @send="chat.send()"

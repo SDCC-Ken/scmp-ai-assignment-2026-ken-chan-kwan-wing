@@ -7,8 +7,8 @@ const signingOut = ref(false)
 
 const tabs = computed(() => navTabs(user.value))
 
-// One poll for everything in the header: the bell and (for approvers) the pending queue that feeds the tab badge and
-// the approvals list. Every 30 s, on window focus, paused while the tab is hidden.
+// One poll for everything in the header: the bell's unread count and (for approvers) the pending queue that feeds the tab
+// badge and the approvals list. Every 30 s, on window focus, paused while the tab is hidden.
 usePolling(async () => {
   if (!user.value) return
   await Promise.all([

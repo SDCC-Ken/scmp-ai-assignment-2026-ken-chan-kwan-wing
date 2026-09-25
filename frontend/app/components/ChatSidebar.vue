@@ -53,7 +53,17 @@ onBeforeUnmount(() => clearInterval(timer))
           :disabled="busy && conversation.id !== activeId"
           @click="$emit('select', conversation.id)"
         >
-          <span class="block truncate text-sm font-medium">{{ conversation.title }}</span>
+          <span class="flex items-center gap-1.5">
+            <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ conversation.title }}</span>
+            <span
+              v-if="isInboxConversation(conversation)"
+              class="inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-xs font-semibold"
+              :class="toneClass('grey')"
+            >
+              <IconGlyph name="inbox" class="h-3 w-3" />
+              Inbox
+            </span>
+          </span>
           <span class="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
             <span class="opacity-90">Updated {{ relativeTime(conversation.updated_at, now) }}</span>
             <span

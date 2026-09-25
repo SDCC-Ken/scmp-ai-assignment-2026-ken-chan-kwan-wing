@@ -5,7 +5,7 @@ export default defineNuxtRouteMiddleware(async (to) => {
   // in the payload, so hydration and later navigations do not repeat the call.
   if (!checked.value) await fetchMe()
 
-  // Role rules live in utils/access.ts: `/` needs can_request, `/approvals*` needs approves, `/login` bounces
+  // Role rules live in utils/access.ts: `/` needs can_request or approves, `/approvals*` needs approves, `/login` bounces
   // signed-in users to their home, and a user with neither capability is sent to /no-access.
   const target = routeRedirect(user.value, to.path)
   if (!target) return

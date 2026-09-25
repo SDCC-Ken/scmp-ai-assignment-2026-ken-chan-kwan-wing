@@ -1,8 +1,9 @@
 <script setup lang="ts">
-useHead({ title: 'My requests - SCMP Internal Operations AI Assistant' })
+const { user } = useAuth()
+useHead(() => ({ title: `${chatTabLabel(user.value)} - SCMP Internal Operations AI Assistant` }))
 </script>
 
-<!-- The global middleware only lets users with can_request reach this route. -->
+<!-- The global middleware lets users who file requests or approve something reach this route. -->
 <template>
   <main class="h-full">
     <ChatWorkspace />

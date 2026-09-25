@@ -10,7 +10,7 @@
  *   Every POST/PUT/PATCH/DELETE needs `X-Requested-With: XMLHttpRequest` (else 403 "CSRF check failed").
  *   CORS: explicit allowed origin + Access-Control-Allow-Credentials: true (credentials are used, so no "*").
  *
- * Chat endpoints (Phase 2, see docs/chat-api-contract.md; users with can_request only, others get 403). A SCRIPTED flow, no LLM:
+ * Chat endpoints (Phase 2, see docs/chat-api-contract.md; users who can_request OR approve, others get 403). A SCRIPTED flow, no LLM:
  *   text with "leave"   -> asks once for the end date; the next text -> confirmation_card (+ trace)
  *   text with "claim"/"taxi" -> confirmation_card for a claim;  "change"/"update" -> update card with a diff
  *   text with "cancel"  -> cancel card;  "yes"/"ok" while a card is open -> reminder to press the button
@@ -26,8 +26,8 @@
  *   Data lives in memory only (reset by /__stub/reset or a restart).
  *
  * Phase 3 (see docs/phase3-approval-design.md, section 5). Six users: Amy Lau, Ben Chow (IT employees), Cathy Ng (HR approver for
- *   leave AND a requester), Daniel Wong (HR employee), Helen Yeung (HR manager, approves leave, no chat), Eva Cheung (Finance,
- *   approves claims, no chat). The chat needs `can_request`; /api/approvals* needs `approves` (else 403); the request must be assigned
+ *   leave AND a requester), Daniel Wong (HR employee), Helen Yeung (HR manager, approves leave, cannot file), Eva Cheung (Finance,
+ *   approves claims, cannot file). The chat needs `can_request` or `approves` (Helen and Eva can use it for the inbox); /api/approvals* needs `approves` (else 403); the request must be assigned
  *   to the caller and pending (else 404; a second decision answers 409).
  *   GET  /api/approvals, GET /api/approvals/{type}/{id}, POST /api/approvals/{type}/{id}/decision {decision, note}
  *   GET  /api/notifications?limit=20, POST /api/notifications/{id}/read, POST /api/notifications/read-all, GET /api/me/balances
@@ -35,6 +35,15 @@
  *   certificate) -> Helen; claim #9 (Amy, over the IT budget, receipt image) -> Eva. 20 s after an approver's first list or
  *   notification call one more item appears for them (with a notification). A decision creates a notification for the requester.
  *   Chat: "how many annual leave days do I have left?" -> balance_card; leave cards carry `info` lines (one with tone warning).
+ *
+ * Bell inbox (see docs/inbox-design.md): the chat API is open to users who file OR approve (Helen and Eva can use it, but the scripted
+ *   assistant refuses to file for them). POST /api/chat/inbox creates a conversation "Items to handle (N)" with an intro and the first
+ *   inbox_card, or answers {empty:true, unread_count:0}. Per user: Cathy = 2 approvals (leave #12 over the balance, team overlap, PDF;
+ *   leave #13 plain) + 1 notice; Helen = 1 approval; Eva = 2 claims (#9 over the IT budget, #11 within the HR budget); Amy = 1 notice;
+ *   Ben and Daniel = empty. POST /actions takes {card_id, action: approve|reject|skip|acknowledge, note, confirmed}: approve/reject need
+ *   confirmed:true (else 422), a card that is not the newest open one answers 409, a request decided elsewhere (see /__stub/decide below)
+ *   marks the card `stale`, answers 409 and the next card is already in the conversation. Deciding marks the approver's notifications for
+ *   that request read, so the bell number drops; skipped items stay unread.
  *
  * Extra dev endpoints (no CSRF header needed, so they work with plain curl):
  *   POST /__stub/expire  -> every later /api/auth/me returns 401 (cookie stays in the browser)
@@ -112,6 +121,23 @@ interface StubConversation {
   awaitingDocEnd: Json[] | null
   stale: boolean
   inFlight: Set<string>
+  inbox: InboxState | null
+}
+
+interface InboxItem {
+  kind: 'approval' | 'notice'
+  type?: 'leave' | 'claim'
+  requestId?: number
+  notificationId?: number
+  cardId: string
+}
+
+interface InboxState {
+  items: InboxItem[]
+  /** Index of the item whose card is open; equal to items.length once everything is handled. */
+  index: number
+  handled: number
+  skipped: number
 }
 
 const conversations: StubConversation[] = []
@@ -250,6 +276,12 @@ function handleText(c: StubConversation, text: string, attachments: Json[] = [])
   if (has('status')) {
     push(c, 'assistant', 'Here are your requests.', { type: 'status_card', requests: STATUS_REQUESTS, empty: false },
       trace(step('understand', 'Intent detected', 'check_status (confidence 0.97)'), step('status', 'Looked up your requests', '3 found'), step('respond', 'Wrote the answer', 'status card')))
+    return warning
+  }
+  const owner = USERS.find(u => u.email === c.owner)
+  if (owner && !owner.can_request && has('leave', 'claim', 'taxi', 'change', 'update', 'cancel', 'balance', 'how many')) {
+    push(c, 'assistant', 'I cannot file or change requests for you: no approver is set up for you, and your role is to approve. Use the bell to see what needs your attention, or ask me about the status of a request.', null,
+      trace(step('understand', 'Intent detected', 'create_request (not allowed for this user)'), step('decide', 'Next step', 'explain and stop')))
     return warning
   }
   if (!attachments.length && !c.awaitingEnd && !c.awaitingDocEnd && (has('balance', 'how many') || (has('left') && has('leave')))) {
@@ -417,16 +449,22 @@ function handleChat(req: IncomingMessage, path: string, send: Send): boolean {
       'cache-control': 'private, no-store',
     }), true
   }
-  if (!user.can_request) return send(403, { detail: 'Forbidden' }), true
+  if (!user.can_request && !user.approves) return send(403, { detail: 'Forbidden' }), true
 
   const own = () => conversations.filter(c => c.owner === user.email).sort((a, b) => b.id - a.id)
   const method = req.method
+
+  if (path === '/api/chat/inbox') {
+    if (method !== 'POST') return send(405, { detail: 'Method not allowed' }), true
+    void openInbox(user, send)
+    return true
+  }
 
   if (path === '/api/chat/conversations') {
     if (method === 'GET') return send(200, { items: own().sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at) || b.id - a.id).map(summary) }), true
     if (method === 'POST') {
       const now = iso()
-      const c: StubConversation = { id: ++conversationSeq, owner: user.email, title: 'New chat', active_request_type: null, has_pending_card: false, created_at: now, updated_at: now, messages: [], awaitingEnd: false, awaitingDocEnd: null, stale: false, inFlight: new Set() }
+      const c: StubConversation = { id: ++conversationSeq, owner: user.email, title: 'New chat', active_request_type: null, has_pending_card: false, created_at: now, updated_at: now, messages: [], awaitingEnd: false, awaitingDocEnd: null, stale: false, inFlight: new Set(), inbox: null }
       conversations.push(c)
       return send(201, summary(c)), true
     }
@@ -469,6 +507,10 @@ function handleChat(req: IncomingMessage, path: string, send: Send): boolean {
     void readJson(req).then(async (body) => {
       const cardId = typeof body?.card_id === 'string' ? body.card_id : ''
       const action = body?.action
+      if (typeof action === 'string' && INBOX_ACTIONS.includes(action)) {
+        await sleep(600) // keeps the card's loading state visible
+        return handleInboxAction(c, user, cardId, action, body ?? {}, send)
+      }
       if (!cardId || (action !== 'confirm' && action !== 'discard')) return send(422, { detail: 'invalid action' })
       const holder = c.messages.find(m => (m.ui as Json | null)?.card_id === cardId)
       const card = holder?.ui as Json | undefined
@@ -626,11 +668,13 @@ function makePdf(text: string): Buffer {
 
 const SEED_PDF_ID = 901
 const SEED_PNG_ID = 902
+const SEED_BOOKING_ID = 903
 
 function seedAttachments() {
   const seeds: [number, string, string, string, Buffer][] = [
     [SEED_PDF_ID, 'daniel.wong@example.com', 'clinic-medical-certificate.pdf', 'application/pdf', makePdf('Medical certificate: 2 days rest')],
     [SEED_PNG_ID, 'amy.lau@example.com', 'team-dinner-receipt.png', 'image/png', makePng(240, 160)],
+    [SEED_BOOKING_ID, 'amy.lau@example.com', 'flight-booking.pdf', 'application/pdf', makePdf('Flight booking: 12 to 16 Oct')],
   ]
   for (const [id, owner, filename, type, bytes] of seeds) {
     if (!attachmentStore.some(a => a.id === id)) {
@@ -667,7 +711,7 @@ function seedRequests() {
       { key: 'end_date', label: 'End date', value: 'Fri 2026-10-16' },
       { key: 'working_days', label: 'Working days', value: '5' },
     ],
-    attachmentIds: [], external_reference_id: '531',
+    attachmentIds: [SEED_BOOKING_ID], external_reference_id: '531',
     limits: { leave_balance: { leave_type: 'annual', year: 2026, entitled_days: 15, approved_days: 12, pending_other_days: 0, requested_days: 5, remaining_after_days: -2, over_limit: true }, department_budget: null },
     team_overlap: [
       { employee: 'Ben Chow', leave_type: 'annual', start_date: '2026-10-14', end_date: '2026-10-15', status: 'approved', working_days: 2 },
@@ -702,17 +746,35 @@ function seedRequests() {
     team_overlap: [], warnings: ['Over the IT department claim limit by HKD 146.50. You decide.'],
     over_limit: true, reviewer_note: null, reviewed_at: null,
   }
-  requests.push(leave12, leave14, claim9)
+  const leave13: StubRequest = {
+    type: 'leave', id: 13, employeeId: 2, approverId: 3, status: 'pending_approval', submitted_at: ago(3 * 60),
+    summary: 'Annual leave, Tue 2026-10-27 to Wed 2026-10-28 (2 working days)',
+    fields: leaveFields('Annual', 'Tue 2026-10-27', 'Wed 2026-10-28', 2),
+    attachmentIds: [], external_reference_id: '545',
+    limits: { leave_balance: { leave_type: 'annual', year: 2026, entitled_days: 15, approved_days: 4, pending_other_days: 0, requested_days: 2, remaining_after_days: 9, over_limit: false }, department_budget: null },
+    team_overlap: [], warnings: [], over_limit: false, reviewer_note: null, reviewed_at: null,
+  }
+  const claim11: StubRequest = {
+    type: 'claim', id: 11, employeeId: 4, approverId: 6, status: 'pending_approval', submitted_at: ago(4 * 60),
+    summary: 'Training claim, HKD 420.00, receipt 2026-09-22',
+    fields: [{ key: 'claim_type', label: 'Claim type', value: 'Training' }, { key: 'amount', label: 'Amount', value: 'HKD 420.00' }, { key: 'receipt_date', label: 'Receipt date', value: 'Tue 2026-09-22' }],
+    attachmentIds: [], external_reference_id: '546',
+    limits: { leave_balance: null, department_budget: { department: 'HR', year: 2026, limit_amount: '30000.00', approved_amount: '12000.00', pending_other_amount: '0.00', requested_amount: '420.00', remaining_after_amount: '17580.00', over_limit: false, currency: 'HKD' } },
+    team_overlap: [], warnings: [], over_limit: false, reviewer_note: null, reviewed_at: null,
+  }
+  requests.push(leave12, leave13, leave14, claim9, claim11)
 
   notify(3, 'request.submitted', 'New leave request from Amy Lau', leave12.summary, leave12, '/approvals/leave/12', false, 2 * 24 * 60)
   notify(3, 'request.approved', 'Your leave request #3 was approved', 'Annual leave, Mon 2026-08-03 to Tue 2026-08-04. Note from Helen Yeung: "Enjoy the break."', null, null, false, 5 * 60)
+  notify(3, 'request.submitted', 'New leave request from Ben Chow', leave13.summary, leave13, '/approvals/leave/13', false, 3 * 60)
   notify(5, 'request.submitted', 'New leave request from Daniel Wong', leave14.summary, leave14, '/approvals/leave/14', false, 6 * 60)
   notify(6, 'request.submitted', 'New claim from Amy Lau', claim9.summary, claim9, '/approvals/claim/9', false, 26 * 60)
+  notify(6, 'request.submitted', 'New claim from Daniel Wong', claim11.summary, claim11, '/approvals/claim/11', false, 4 * 60)
   notify(6, 'request.submitted', 'New claim from Ben Chow', 'Transport claim, HKD 95.00, receipt 2026-09-18', null, null, true, 5 * 24 * 60)
   notify(1, 'request.rejected', 'Your leave request #5 was rejected', 'Sick leave, 2026-09-08. Note from Cathy Ng: "Please attach a medical certificate and resubmit."', null, null, false, 90)
   notify(1, 'request.approved', 'Your claim #8 was approved', 'Transport claim, HKD 95.00, receipt 2026-09-18', null, null, true, 3 * 24 * 60)
-  notify(2, 'request.approved', 'Your leave request #7 was approved', 'Annual leave, Mon 2026-09-14 to Tue 2026-09-15. Note from Cathy Ng: "Approved, have a good trip."', null, null, false, 30)
-  // Daniel (4) has none on purpose: the bell's empty state.
+  notify(2, 'request.approved', 'Your leave request #7 was approved', 'Annual leave, Mon 2026-09-14 to Tue 2026-09-15. Note from Cathy Ng: "Approved, have a good trip."', null, null, true, 30)
+  // Ben (2) and Daniel (4) have nothing unread on purpose: the bell's "all caught up" state.
 }
 
 const leaveFields = (type: string, start: string, end: string, days: number) => [
@@ -764,7 +826,15 @@ const detailOf = (r: StubRequest) => ({
   limits: r.limits, team_overlap: r.team_overlap, warnings: r.warnings,
 })
 
+/** The approver's own notifications about this request are handled once it is decided (the bell number drops). */
+function markRequestRead(user: StubUser, r: StubRequest) {
+  for (const n of notifications) {
+    if (n.userId === user.id && n.request_type === r.type && n.request_id === r.id) n.read_at ??= iso()
+  }
+}
+
 function decide(r: StubRequest, decision: 'approve' | 'reject', note: string | null, by: StubUser) {
+  markRequestRead(by, r)
   r.status = decision === 'approve' ? 'approved' : 'rejected'
   r.reviewed_at = iso()
   r.reviewer_note = note
@@ -843,6 +913,118 @@ function handleApprovals(req: IncomingMessage, path: string, query: URLSearchPar
     return true
   }
   return send(405, { detail: 'Method not allowed' }), true
+}
+
+
+/* ---- Bell inbox (docs/inbox-design.md) ------------------------------------------------------------------------------ */
+
+const INBOX_ACTIONS = ['approve', 'reject', 'skip', 'acknowledge']
+
+const unreadOf = (user: StubUser) => notifications.filter(n => n.userId === user.id && !n.read_at).length
+
+/** Approvals first (oldest first), then the other unread notifications; a still-pending request's "submitted" notice is covered by its card. */
+function buildInboxItems(user: StubUser): InboxItem[] {
+  const queue = user.approves
+    ? requests.filter(r => r.approverId === user.id && r.type === user.approves && r.status === 'pending_approval')
+        .sort((a, b) => Date.parse(a.submitted_at) - Date.parse(b.submitted_at) || a.id - b.id)
+    : []
+  const covered = new Set(queue.map(r => `${r.type}:${r.id}`))
+  const notices = notifications
+    .filter(n => n.userId === user.id && !n.read_at
+      && !(['request.submitted', 'request.updated'].includes(n.event_type) && n.request_type && covered.has(`${n.request_type}:${n.request_id}`)))
+    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id - b.id)
+  return [
+    ...queue.map((r): InboxItem => ({ kind: 'approval', type: r.type, requestId: r.id, cardId: `i_${(++cardSeq).toString(16).padStart(4, '0')}` })),
+    ...notices.map((n): InboxItem => ({ kind: 'notice', notificationId: n.id, cardId: `i_${(++cardSeq).toString(16).padStart(4, '0')}` })),
+  ]
+}
+
+function inboxCardUi(item: InboxItem, index: number, total: number): Json {
+  const base = { type: 'inbox_card', card_id: item.cardId, position: { index: index + 1, total }, state: 'open', outcome: null }
+  if (item.kind === 'approval') {
+    const r = requests.find(x => x.type === item.type && x.id === item.requestId)!
+    const who = userById(r.employeeId).display_name
+    return { ...base, kind: 'approval', title: `${r.type === 'leave' ? 'Leave request' : 'Claim'} #${r.id} from ${who}`, request_type: r.type, request_id: r.id,
+      detail: detailOf(r), notice: null, actions: ['approve', 'reject', 'skip'] }
+  }
+  const n = notifications.find(x => x.id === item.notificationId)!
+  return { ...base, kind: 'notice', title: n.title, request_type: n.request_type, request_id: n.request_id,
+    detail: null, notice: { title: n.title, body: n.body }, actions: ['acknowledge', 'skip'] }
+}
+
+async function openInbox(user: StubUser, send: Send) {
+  await sleep(700) // keeps the bell's spinner visible
+  const items = buildInboxItems(user)
+  if (!items.length) return send(200, { empty: true, unread_count: unreadOf(user) })
+  const now = iso()
+  const c: StubConversation = { id: ++conversationSeq, owner: user.email, title: `Items to handle (${items.length})`, active_request_type: null, has_pending_card: true, created_at: now, updated_at: now, messages: [], awaitingEnd: false, awaitingDocEnd: null, stale: false, inFlight: new Set(), inbox: { items, index: 0, handled: 0, skipped: 0 } }
+  conversations.push(c)
+  push(c, 'assistant', `You have ${items.length} ${items.length === 1 ? 'item' : 'items'} waiting for you. I will show them one at a time. Skipped items stay in your bell.`)
+  push(c, 'assistant', '', inboxCardUi(items[0]!, 0, items.length))
+  return send(201, { empty: false, conversation: summary(c), assistant_messages: c.messages, warning_code: null })
+}
+
+const plural = (n: number) => `${n} ${n === 1 ? 'item' : 'items'}`
+
+/** Adds the result text, then the next card or the closing message; returns the messages added. */
+function advanceInbox(c: StubConversation, resultText: string | null): Json[] {
+  const inbox = c.inbox!
+  const before = c.messages.length
+  if (resultText) push(c, 'assistant', resultText)
+  inbox.index++
+  if (inbox.index < inbox.items.length) {
+    push(c, 'assistant', '', inboxCardUi(inbox.items[inbox.index]!, inbox.index, inbox.items.length))
+  }
+  else {
+    c.has_pending_card = false
+    push(c, 'assistant', `You handled ${plural(inbox.handled)} and skipped ${inbox.skipped}. Skipped items stay in the bell and in Approvals.`)
+  }
+  return c.messages.slice(before)
+}
+
+function handleInboxAction(c: StubConversation, user: StubUser, cardId: string, action: string, body: Json, send: Send) {
+  const holder = c.messages.find(m => (m.ui as Json | null)?.type === 'inbox_card' && (m.ui as Json).card_id === cardId)
+  const ui = holder?.ui as Json | undefined
+  const inbox = c.inbox
+  if (!ui || !inbox) return send(404, { detail: 'Card not found' })
+  const current = inbox.items[inbox.index]
+  if (ui.state !== 'open' || !current || current.cardId !== cardId) return send(409, { detail: 'Card is no longer open' })
+  if (!(ui.actions as string[]).includes(action)) return send(422, { detail: 'action not allowed for this card' })
+  const decides = action === 'approve' || action === 'reject'
+  const note = decides ? (body.note ?? null) : null
+  if (decides && body.confirmed !== true) return send(422, { detail: 'confirmed must be true' })
+  if (decides && note !== null && (typeof note !== 'string' || note.length > 500)) return send(422, { detail: 'note must be at most 500 characters' })
+
+  const done = (state: string, outcome: string | null, text: string | null) => {
+    ui.state = state
+    ui.outcome = outcome
+    const added = advanceInbox(c, text)
+    return send(200, { conversation: summary(c), user_message: null, assistant_messages: added, warning_code: null })
+  }
+
+  if (action === 'skip') {
+    inbox.skipped++
+    return done('skipped', null, 'Skipped. It stays in your bell.')
+  }
+  if (action === 'acknowledge') {
+    const n = notifications.find(x => x.id === current.notificationId)
+    if (n) n.read_at ??= iso()
+    inbox.handled++
+    return done('done', 'acknowledged', 'Marked as read.')
+  }
+  const r = requests.find(x => x.type === current.type && x.id === current.requestId)!
+  if (r.status !== 'pending_approval') {
+    // Decided elsewhere in the meantime: the card becomes stale, the next item is already shown, and the caller must reload.
+    markRequestRead(user, r)
+    ui.state = 'stale'
+    ui.outcome = null
+    advanceInbox(c, `${r.type === 'leave' ? 'Leave request' : 'Claim'} #${r.id} was already handled elsewhere, so nothing was changed.`)
+    return send(409, { detail: 'Request is no longer pending' })
+  }
+  decide(r, action as 'approve' | 'reject', note as string | null, user)
+  inbox.handled++
+  const who = userById(r.employeeId).display_name
+  return done('done', action === 'approve' ? 'approved' : 'rejected', `You ${action === 'approve' ? 'approved' : 'rejected'} ${r.type === 'leave' ? 'leave request' : 'claim'} #${r.id} from ${who}.${note ? ` Your note was sent to ${who}.` : ''}`)
 }
 
 seedAttachments()

@@ -6,7 +6,7 @@ Runs on port 9180 (`WEB_PORT`). Env is read from the repo-root `../.env` if pres
 - `bun run dev` - dev server at http://localhost:9180
 - `bun run lint` / `bun run lint:fix` - ESLint (`@nuxt/eslint`)
 - `bun run typecheck` - `nuxt typecheck` (vue-tsc)
-- `bun run test` - Vitest (theme, auth, access, approvals, notifications, chat and attachment utils, offline)
+- `bun run test` - Vitest (theme, auth, access, approvals, notifications, inbox, chat and attachment utils, offline)
 - `bun run build` then `bun run preview` (or `node .output/server/index.mjs` with `NITRO_PORT=9180`)
 
 ## Mock Google sign-in (Phase 1)
@@ -58,8 +58,10 @@ curl -X POST localhost:9181/__stub/reset
 ## Employee chat (Phase 2)
 
 Route `/` for users with `can_request` is one chat workspace (`ChatWorkspace`): conversation list on the left (a slide-over
-drawer below 768px), message thread and composer on the right. Users without `can_request` (Helen, Eva) never see the chat: the
-route rules send them to `/approvals` (the chat API would answer 403). Contract: `../docs/chat-api-contract.md`.
+drawer below 768px), message thread and composer on the right. Since the bell inbox the chat is open to users who file requests **or**
+approve something (`can_request` or `approves`); only a user with neither is sent away (`/no-access`). Helen and Eva (approve-only) see it as
+an "Inbox" tab with a lighter empty state (no filing chips, "Use the bell to see what needs your attention", the composer stays for status
+questions). Contract: `../docs/chat-api-contract.md`.
 
 - **State and calls:** `app/composables/useChat.ts` (all requests go through `useApi`: cookie, `X-Requested-With` on POSTs, 401 sign-out).
   Pure helpers (status badges, relative time, message merge, card-state reconciliation, `canSend`, error mapping) live in
@@ -127,11 +129,12 @@ Contract: `../docs/phase3-approval-design.md` (sections 1 to 5). The user object
 | --- | --- | --- | --- | --- | --- |
 | Amy Lau, Ben Chow (IT), Daniel Wong (HR) | employee | yes | - | My requests | `/` (chat) |
 | Cathy Ng (HR) | hr_approver | yes | leave | My requests, Approvals | `/` |
-| Helen Yeung (HR manager) | hr_approver | no | leave | Approvals | `/approvals` |
-| Eva Cheung (Finance) | finance_approver | no | claim | Approvals | `/approvals` |
+| Helen Yeung (HR manager) | hr_approver | no | leave | Inbox, Approvals | `/approvals` |
+| Eva Cheung (Finance) | finance_approver | no | claim | Inbox, Approvals | `/approvals` |
 
 Route rules are pure functions in `app/utils/access.ts` (`routeRedirect`, `homePath`, `navTabs`), used by the global middleware
-`app/middleware/auth.global.ts`: `/` needs `can_request` (else redirect to `/approvals`), `/approvals*` needs `approves` (else
+`app/middleware/auth.global.ts`: `/` needs `can_request` or `approves` (`canUseChat`; the tab reads "My requests" for requesters and "Inbox" for
+approve-only users), `/approvals*` needs `approves` (else
 back to `/`), and a user with neither capability lands on `/no-access` (a friendly page with the header, so they can sign out; it
 is used instead of `/login` because `/login` sends signed-in users home and would loop). The mock account chooser shows job title
 and department under each name and scrolls inside the viewport (max height) so six accounts stay tidy, also at 360px.
@@ -152,22 +155,64 @@ and department under each name and scrolls inside the viewport (max height) so s
   `{"decision","note"}` with the note trimmed and empty sent as `null`. Success -> back to the list with a success notice (the item is
   gone); 409 -> "This request was already decided or changed. The list was reloaded."; 404 -> "This request is no longer available";
   other errors inline with Retry.
-- **Notification bell** (`NotificationBell`, every signed-in user) - button with an unread badge (99+ cap), a polite live region with
-  the count, and an accessible name that includes it. The popover is a non-modal `role="dialog"` (focus moves in, Escape and click
-  outside close it and Escape returns focus to the bell, a route change closes it). Items show title, body (2 lines), relative time
-  and an unread dot with visually-hidden "Unread". Clicking marks the item read (optimistic, rolled back on error) and either
-  navigates to `link` (approvers) or opens a small dialog with the full title, body and time (requesters). "Mark all as read" calls
-  `POST /api/notifications/read-all`. Everything is rendered as text, never HTML, and only in-app `link` paths are followed.
+- **Notification bell** - see "Bell inbox" below (the old dropdown list, "Mark all as read" and the requester detail dialog are gone).
 - **Polling** - one poll in `AppHeader` (`usePolling`): every 30 s and when the window regains focus, paused while the tab is hidden,
-  never overlapping and never twice within 5 s. It refreshes the bell and, for approvers, the queue that feeds the Approvals tab
+  never overlapping and never twice within 5 s. It refreshes the bell's unread number (`GET /api/notifications?limit=1`, only `unread_count` is used) and, for approvers, the queue that feeds the Approvals tab
   badge and the list page (`useApprovalQueue`). A failed background poll keeps what is on screen. User-scoped state is cleared on
   sign-in and sign-out (`USER_SCOPED_STATE_KEYS`).
 - **Chat additions** - `balance_card` messages (`BalanceCard`: leave type, entitled, approved, pending, remaining, with a bar), optional
   `info: [{label, value, tone}]` lines on confirmation cards above the buttons (plain strings are tolerated; `warning` is amber with an
   icon), the trace label for the `documents` step ("Read attached documents") with a readable fallback for unknown step names.
 
-Code: pure helpers in `app/utils/{access,approvals,notifications,polling,chatExtras}.ts`, types in `app/types/{approvals,notifications}.ts`,
-tests in `tests/{access,approvals,notifications,chat-additions}.test.ts`.
+Code: pure helpers in `app/utils/{access,approvals,notifications,polling,chatExtras,inbox}.ts`, types in `app/types/{approvals,notifications}.ts`,
+tests in `tests/{access,approvals,notifications,chat-additions,inbox}.test.ts`.
+
+## Bell inbox (handle everything waiting, one card at a time)
+
+Spec: `../docs/inbox-design.md`. The bell (`NotificationBell`, every signed-in user) keeps its small unread number (99+ cap, polite live
+region, the count in the accessible name) and now **creates a new conversation** when clicked:
+
+- **Click:** `POST /api/chat/inbox` (CSRF header via `useApi`, `useInbox`). While it runs the bell is disabled with a spinner.
+  `{"empty": true}` creates nothing: a small anchored notice "You are all caught up" (`role="status"`) closes after about 3 s, on Escape or on a
+  click outside, with no navigation. Otherwise the conversation and its first assistant messages are handed to the chat (`useState('inbox-handoff')`,
+  cleared on sign-in/sign-out), the app goes to `/` (from any page, also for approve-only users) and opens THAT conversation without another
+  request; focus moves to the first card's heading. The badge is refreshed afterwards and after every handled card.
+- **`inbox_card` messages** (`InboxCard`, types in `app/types/chat.ts`, helpers in `app/utils/inbox.ts`): header "Item 2 of 3", the title, then
+  - kind `approval`: the same detail as the approvals screen through the shared `ApprovalDetailPanel` (also used by `/approvals/[type]/[id]`): warnings,
+    limits (leave balance or department budget with the over-limit notice), fields, attachments with the existing preview, team overlap. Then a
+    "Note for the employee (optional)" textarea (500 characters, counter) and **Approve / Reject / Skip**. Approve and Reject use an inline second step:
+    the buttons become **Confirm approve** (or **Confirm reject**) and **Back**, repeating the over-limit warning; focus moves to Confirm and back to the
+    button on Back. Only Confirm posts `{card_id, action, note, confirmed: true}` to `POST /api/chat/conversations/{id}/actions` (note trimmed, empty is
+    `null`); Skip posts `{card_id, action: "skip"}`.
+  - kind `notice`: title and body, **Got it** (`acknowledge`) and **Skip**.
+  - While posting, that card shows a spinner, all its controls and the composer are disabled. On success the returned messages (result text, the next card
+    or the closing summary) are appended, the acted card becomes `done` (badge Approved / Rejected / Got it) or `skipped`, `stale` shows "Already handled
+    elsewhere", and focus moves to the next card's heading (or the composer after the closing message). Only the newest open inbox card is active; older
+    cards are read-only (collapsed, "Show details" expands them).
+  - Errors: 409 -> "That card is out of date" and a quiet reload of the conversation (the stored states, incl. a stale card and the next card, are shown);
+    422 and 5xx inline with a fixed message; a network error keeps the note and offers Retry. Everything is plain text (no `v-html`).
+- **Reopening:** an old inbox conversation loads with its cards in their stored states (the open card is active). The conversation list marks conversations whose
+  title starts with "Items to handle" with an "Inbox" tag (and "Items waiting" instead of "Awaiting confirmation" while a card is open).
+- **Code:** `app/composables/{useInbox,useChat,useNotifications}.ts`, `app/components/{NotificationBell,InboxCard,ApprovalDetailPanel}.vue`, tests in `tests/inbox.test.ts`.
+
+### Stub scenarios: bell inbox
+
+`POST /api/chat/inbox`, the inbox actions (`approve` / `reject` need `confirmed: true` else 422, `skip`, `acknowledge`) and per-conversation state live in the stub
+(the chat API is open to approvers too; the scripted assistant refuses to file for Helen and Eva). The seed now has extra items so each user has something to see:
+
+| User | Bell number | Inbox |
+| --- | --- | --- |
+| Cathy | 3 | 2 approvals: leave #12 (over the balance by 2 days, team overlap, PDF booking) and leave #13 (Ben, plain) + 1 notice (her own request approved) |
+| Helen | 1 | 1 approval: sick leave #14 with a PDF |
+| Eva | 2 | 2 claims: #9 (over the IT budget, receipt image) and #11 (Daniel, within the HR budget) |
+| Amy | 1 | 1 notice (her leave #5 was rejected, with the note) |
+| Ben, Daniel | 0 | empty: "You are all caught up" |
+
+Deciding or acknowledging marks the related notifications read, so the number drops; skipped items stay unread and return on the next bell click. After the last
+item the closing message reads "You handled N items and skipped M ...". **Stale path:** click the bell as Cathy, run
+`curl -X POST "localhost:9191/__stub/decide?type=leave&id=12&decision=approve"`, then Approve and Confirm on the first card: the stub answers 409, marks the card
+`stale`, and the next card is already in the conversation (the UI reloads it). `POST /__stub/reset` re-seeds everything; `STUB_NEW_ITEM_AFTER_MS` still injects one more
+approval after 20 s (it appears at the next bell click).
 
 ### Stub scenarios (Phase 3)
 
@@ -175,13 +220,13 @@ tests in `tests/{access,approvals,notifications,chat-additions}.test.ts`.
 `GET/POST /api/approvals/{type}/{id}[/decision]`, `GET /api/notifications`, `POST /api/notifications/{id}/read`,
 `POST /api/notifications/read-all` and `GET /api/me/balances`, with the design's 403/404/409 rules.
 
-- **Cathy** (leave, IT staff): leave #12 from Amy, annual, 5 days, **over the balance by 2 days**, team overlap with Ben (one approved, one pending).
+- **Cathy** (leave, IT staff): leave #12 from Amy, annual, 5 days, **over the balance by 2 days**, team overlap with Ben (one approved, one pending), a PDF booking;
+  leave #13 from Ben, annual, 2 days, within the balance.
 - **Helen** (leave, HR staff): sick leave #14 from Daniel with a **PDF certificate**, within balance, nobody else away.
-- **Eva** (claims): claim #9 from Amy, HKD 246.50, **over the IT budget**, with a receipt **image**.
+- **Eva** (claims): claim #9 from Amy, HKD 246.50, **over the IT budget**, with a receipt **image**; claim #11 from Daniel, HKD 420.00, within the HR budget.
 - 20 s after an approver first looks (list or bell), one more item appears for them with a notification (Cathy: leave #15 from Ben; Helen: leave
   #16 from Cathy; Eva: claim #10 from Daniel). `STUB_NEW_ITEM_AFTER_MS` changes the delay.
 - A decision moves the item out of the list and gives the requester a notification that includes the note; a second decision answers 409. To
   see the 409 path in the UI: open a detail, then `curl -X POST "localhost:9191/__stub/decide?type=leave&id=12&decision=approve"`, then press Approve.
-- Notifications: Amy 1 unread (a rejection with a note), Ben 1 unread, Cathy 2 unread (one approver link, one requester message), Helen 1,
-  Eva 1, Daniel none (empty bell). `POST /__stub/reset` re-seeds everything.
+- Notifications: see the bell-inbox table above (Amy 1, Ben 0, Cathy 3, Helen 1, Eva 2, Daniel 0). `POST /__stub/reset` re-seeds everything.
 - Chat: "how many annual leave days do I have left?" -> `balance_card`; the leave card carries an info line and a warning line.

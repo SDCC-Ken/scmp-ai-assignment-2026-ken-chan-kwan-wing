@@ -3,9 +3,11 @@ import type {
   ConversationDetail,
   ConversationList,
   ConversationSummary,
+  InboxAction,
   Message,
   TurnResponse,
 } from '~/types/chat'
+import type { InboxHandoff } from '~/composables/useInbox'
 
 interface ChatError {
   text: string
@@ -20,6 +22,9 @@ interface ChatError {
  */
 export function useChat() {
   const api = useApi()
+  const notifications = useNotifications()
+  /** Set by the bell (`useInbox`): the new inbox conversation to open with its first messages. */
+  const handoff = useState<InboxHandoff | null>('inbox-handoff', () => null)
 
   const conversations = ref<ConversationSummary[]>([])
   const activeId = ref<number | null>(null)
@@ -32,6 +37,12 @@ export function useChat() {
   const sending = ref(false)
   /** The card whose action is in flight, with the decision (shows the card's loading state). */
   const acting = ref<{ cardId: string, decision: 'confirm' | 'discard' } | null>(null)
+  /** The inbox card whose action is in flight (that card shows its loading state; every control is disabled). */
+  const inboxActing = ref<{ cardId: string, action: InboxAction } | null>(null)
+  /** Inline error of the last failed inbox action; the note stays in the card so it can be retried. */
+  const inboxError = ref<{ cardId: string, action: InboxAction, text: string } | null>(null)
+  /** Counts up whenever an inbox conversation is opened from the bell, so the page can move focus to its first card. */
+  const inboxOpenedTick = ref(0)
 
   /** Files picked for the next message (uploaded as soon as they are added). */
   const staged = ref<StagedFile[]>([])
@@ -47,7 +58,8 @@ export function useChat() {
   let stagedSeq = 0
 
   const active = computed(() => conversations.value.find(c => c.id === activeId.value) ?? null)
-  const busy = computed(() => sending.value || acting.value !== null)
+  const busy = computed(() => sending.value || acting.value !== null || inboxActing.value !== null)
+  const activeInboxId = computed(() => activeInboxCardId(messages.value))
   const uploading = computed(() => isUploading(staged.value))
   const sendable = computed(() => canSendMessage(draft.value, staged.value, busy.value))
 
@@ -95,13 +107,32 @@ export function useChat() {
     return summary
   }
 
-  /** Fetches the list, opens the most recent conversation or creates the first one. */
+  /** Opens the conversation the bell just created, using the messages it returned (no extra request). */
+  function adoptInbox(incoming: InboxHandoff) {
+    handoff.value = null
+    ++loadToken // an older, slower load must not replace it
+    upsert(incoming.conversation)
+    activeId.value = incoming.conversation.id
+    messages.value = initialInboxMessages(incoming.messages)
+    loadingThread.value = false
+    draft.value = ''
+    discardStaged()
+    clearFeedback()
+    inboxError.value = null
+    inboxOpenedTick.value++
+  }
+
+  /** Fetches the list, opens the conversation from the bell, else the most recent one (or creates the first one). */
   async function init() {
     initialising.value = true
     error.value = null
     try {
       const list = await api<ConversationList>('/api/chat/conversations')
       conversations.value = sortConversations(list.items)
+      if (handoff.value) {
+        adoptInbox(handoff.value)
+        return
+      }
       const first = conversations.value[0] ?? await createConversation()
       await openConversation(first.id)
     }
@@ -133,6 +164,24 @@ export function useChat() {
   async function select(id: number) {
     if (id === activeId.value || busy.value) return
     await openConversation(id)
+  }
+
+  // The bell was clicked while the chat is already open: switch to the new inbox conversation.
+  watch(handoff, (incoming) => {
+    if (incoming && !initialising.value) adoptInbox(incoming)
+  })
+
+  /** Reloads the open conversation without clearing the screen (after a 409 the server's card states are the truth). */
+  async function reloadQuietly(id: number) {
+    try {
+      const detail = await api<ConversationDetail>(`/api/chat/conversations/${id}`)
+      if (activeId.value !== id) return
+      messages.value = reconcileCards(mergeMessages([], detail.messages), { hasPendingCard: detail.conversation.has_pending_card })
+      upsert(detail.conversation)
+    }
+    catch (cause) {
+      if (activeId.value === id) fail(cause, 'load', () => reloadQuietly(id))
+    }
   }
 
   function revokePreview(item: StagedFile) {
@@ -285,6 +334,47 @@ export function useChat() {
     }
   }
 
+  /**
+   * Posts an inbox card action (approve / reject need `confirmed`, which the card only sets after its second click).
+   * Returns true when the server accepted it. 409: the card is out of date, so the conversation is reloaded.
+   * Other errors stay inline on the card; nothing the user typed is lost.
+   */
+  async function inboxAction(cardId: string, action: InboxAction, note: string | null): Promise<boolean> {
+    if (busy.value || activeId.value === null) return false
+    const conversationId = activeId.value
+    clearFeedback()
+    inboxError.value = null
+    inboxActing.value = { cardId, action }
+    try {
+      const turn = await api<TurnResponse>(`/api/chat/conversations/${conversationId}/actions`, {
+        method: 'POST',
+        body: buildInboxActionBody(cardId, action, note),
+      })
+      upsert(turn.conversation)
+      if (activeId.value !== conversationId) return true
+      messages.value = applyInboxTurn(messages.value, cardId, action, turn)
+      warning.value = warningMessage(turn.warning_code)
+      void notifications.refresh() // the badge counts what is still unread
+      return true
+    }
+    catch (cause) {
+      if (activeId.value !== conversationId) return false
+      const status = extractStatus(cause)
+      if (status === 409) {
+        inboxActing.value = null
+        await reloadQuietly(conversationId)
+        notice.value = chatErrorMessage(409, 'card')
+        void notifications.refresh()
+        return false
+      }
+      inboxError.value = { cardId, action, text: inboxActionErrorMessage(status) }
+      return false
+    }
+    finally {
+      inboxActing.value = null
+    }
+  }
+
   function dismissWarning() {
     warning.value = null
   }
@@ -315,6 +405,10 @@ export function useChat() {
     loadingThread,
     sending,
     acting,
+    inboxActing,
+    inboxError,
+    inboxOpenedTick,
+    activeInboxId,
     busy,
     staged,
     attachmentErrors,
@@ -332,6 +426,7 @@ export function useChat() {
     retryUpload,
     dismissAttachmentErrors,
     cardAction,
+    inboxAction,
     retry,
     dismissWarning,
     dismissNotice,

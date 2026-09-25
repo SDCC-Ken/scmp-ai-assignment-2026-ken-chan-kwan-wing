@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import type { ApprovalDetail } from '~/types/approvals'
 
-const props = defineProps<{ limits: ApprovalDetail['limits'], requestType: string }>()
+const props = defineProps<{ limits: ApprovalDetail['limits'], requestType: string, compact?: boolean }>()
+
+const uid = useId()
 
 const leave = computed(() => props.limits.leave_balance)
 const budget = computed(() => props.limits.department_budget)
@@ -45,10 +47,10 @@ const view = computed(() => {
 </script>
 
 <template>
-  <section class="rounded-xl border border-secondary/40 p-4" aria-labelledby="limits-title">
-    <h2 id="limits-title" class="text-base font-semibold">
+  <section :class="compact ? 'rounded-lg border border-secondary/30 p-3' : 'rounded-xl border border-secondary/40 p-4'" :aria-labelledby="`${uid}-limits`">
+    <component :is="compact ? 'h4' : 'h2'" :id="`${uid}-limits`" :class="compact ? 'text-sm font-semibold' : 'text-base font-semibold'">
       Limits
-    </h2>
+    </component>
 
     <p v-if="!view" class="mt-2 text-sm">
       <template v-if="requestType === 'leave'">

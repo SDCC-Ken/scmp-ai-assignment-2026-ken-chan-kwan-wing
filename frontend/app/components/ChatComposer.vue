@@ -9,6 +9,8 @@ const props = defineProps<{
   unavailable?: boolean
   staged: StagedFile[]
   attachmentErrors: string[]
+  /** Users who cannot file requests (approve-only) get a status-only prompt. */
+  canRequest?: boolean
 }>()
 const emit = defineEmits<{
   'update:modelValue': [value: string]
@@ -200,7 +202,7 @@ defineExpose({ focus })
           :value="modelValue"
           rows="1"
           class="max-h-40 min-h-10 min-w-0 flex-1 resize-none bg-transparent px-1 py-2 text-sm outline-none placeholder:text-secondary/70 disabled:cursor-not-allowed disabled:opacity-60"
-          :placeholder="staged.length ? 'Add a message (optional)' : 'Ask for leave, submit a claim, or check a status'"
+          :placeholder="staged.length ? 'Add a message (optional)' : canRequest === false ? 'Ask about the status of a request' : 'Ask for leave, submit a claim, or check a status'"
           aria-describedby="chat-input-help chat-input-count"
           :aria-invalid="overLimit"
           :disabled="inputsDisabled"
