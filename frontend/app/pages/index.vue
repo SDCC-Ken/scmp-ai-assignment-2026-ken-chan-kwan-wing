@@ -5,8 +5,13 @@ const { user } = useAuth()
 const capabilities = computed(() => (user.value ? ROLE_CAPABILITIES[user.value.role] : null))
 </script>
 
+<!-- Employees get the chat; the chat API answers 403 for approvers, so they keep the capabilities panel. -->
 <template>
-  <main v-if="user && capabilities" class="mx-auto max-w-3xl space-y-6 px-4 py-8">
+  <main v-if="user?.role === 'employee'" class="h-full">
+    <ChatWorkspace />
+  </main>
+
+  <main v-else-if="user && capabilities" class="mx-auto max-w-3xl space-y-6 px-4 py-8">
     <section>
       <h1 class="text-2xl font-bold">
         Signed in as {{ user.display_name }} ({{ roleLabel(user.role) }})

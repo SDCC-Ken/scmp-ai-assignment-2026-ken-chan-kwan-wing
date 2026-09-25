@@ -212,3 +212,120 @@ body {
 [data-account-row]:focus-visible .one-tap-cta {
   text-decoration: underline;
 }
+
+/* ---- Chat (Phase 2) ---------------------------------------------------------------------------
+   Status tones for badges, notices and outcome icons. Fixed palettes (not env-driven) so contrast stays
+   verified (>= 4.5:1 text on background) in both themes. */
+:root {
+  --tone-amber-bg: #fef3c7;
+  --tone-amber-fg: #78350f;
+  --tone-amber-bd: #d97706;
+  --tone-green-bg: #dcfce7;
+  --tone-green-fg: #14532d;
+  --tone-green-bd: #16a34a;
+  --tone-red-bg: #fee2e2;
+  --tone-red-fg: #7f1d1d;
+  --tone-red-bd: #dc2626;
+  --tone-grey-bg: #f1f5f9;
+  --tone-grey-fg: #334155;
+  --tone-grey-bd: #94a3b8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --tone-amber-bg: #451a03;
+    --tone-amber-fg: #fde68a;
+    --tone-amber-bd: #f59e0b;
+    --tone-green-bg: #14532d;
+    --tone-green-fg: #dcfce7;
+    --tone-green-bd: #4ade80;
+    --tone-red-bg: #450a0a;
+    --tone-red-fg: #fecaca;
+    --tone-red-bd: #f87171;
+    --tone-grey-bg: #1e293b;
+    --tone-grey-fg: #e2e8f0;
+    --tone-grey-bd: #64748b;
+  }
+}
+
+:root[data-theme="dark"] {
+  --tone-amber-bg: #451a03;
+  --tone-amber-fg: #fde68a;
+  --tone-amber-bd: #f59e0b;
+  --tone-green-bg: #14532d;
+  --tone-green-fg: #dcfce7;
+  --tone-green-bd: #4ade80;
+  --tone-red-bg: #450a0a;
+  --tone-red-fg: #fecaca;
+  --tone-red-bd: #f87171;
+  --tone-grey-bg: #1e293b;
+  --tone-grey-fg: #e2e8f0;
+  --tone-grey-bd: #64748b;
+}
+
+.tone {
+  background-color: var(--tone-bg);
+  color: var(--tone-fg);
+  border: 1px solid var(--tone-bd);
+}
+
+.tone-amber {
+  --tone-bg: var(--tone-amber-bg);
+  --tone-fg: var(--tone-amber-fg);
+  --tone-bd: var(--tone-amber-bd);
+}
+
+.tone-green {
+  --tone-bg: var(--tone-green-bg);
+  --tone-fg: var(--tone-green-fg);
+  --tone-bd: var(--tone-green-bd);
+}
+
+.tone-red {
+  --tone-bg: var(--tone-red-bg);
+  --tone-fg: var(--tone-red-fg);
+  --tone-bd: var(--tone-red-bd);
+}
+
+.tone-grey {
+  --tone-bg: var(--tone-grey-bg);
+  --tone-fg: var(--tone-grey-fg);
+  --tone-bd: var(--tone-grey-bd);
+}
+
+/* Thinking dots (motion is removed for prefers-reduced-motion). */
+@keyframes chat-dot {
+  0%, 80%, 100% { opacity: 0.25; }
+  40% { opacity: 1; }
+}
+
+.chat-dot {
+  display: inline-block;
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: 9999px;
+  background-color: currentColor;
+  animation: chat-dot 1.2s infinite ease-in-out;
+}
+
+.chat-dot:nth-child(2) { animation-delay: 0.2s; }
+.chat-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-dot { animation: none; opacity: 0.6; }
+  .chat-drawer { transition: none !important; }
+}
+
+/* Long unbroken text (e.g. a pasted URL) must wrap instead of overflowing a bubble. */
+.chat-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.text-danger {
+  color: var(--tone-red-fg);
+}
+
+.border-danger {
+  border-color: var(--tone-red-bd);
+}

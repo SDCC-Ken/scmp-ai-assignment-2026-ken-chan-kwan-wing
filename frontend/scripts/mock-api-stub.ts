@@ -10,19 +10,40 @@
  *   Every POST/PUT/PATCH/DELETE needs `X-Requested-With: XMLHttpRequest` (else 403 "CSRF check failed").
  *   CORS: explicit allowed origin + Access-Control-Allow-Credentials: true (credentials are used, so no "*").
  *
+ * Chat endpoints (Phase 2, see docs/chat-api-contract.md; employees only, approvers get 403). A SCRIPTED flow, no LLM:
+ *   text with "leave"   -> asks once for the end date; the next text -> confirmation_card (+ trace)
+ *   text with "claim"/"taxi" -> confirmation_card for a claim;  "change"/"update" -> update card with a diff
+ *   text with "cancel"  -> cancel card;  "yes"/"ok" while a card is open -> reminder to press the button
+ *   text with "status"  -> status_card with 3 requests;  "fail" -> warning_code llm_unavailable
+ *   text with "stale"   -> a leave card whose next confirm answers 409
+ * Attachments (Phase 2b): POST /api/chat/conversations/{id}/attachments (multipart field "file", 5 MB, images or PDF; kept in memory),
+ *   GET /api/attachments/{id} (owner only, returns the stored bytes), `attachment_ids` on messages.
+ *   Attachment names drive the scripted reading: "sick"/"medical" -> asks once for the last day of rest, then a leave card with
+ *   `source: "document"` fields and attachments; "receipt" -> claim card with a name-mismatch warning; "blurry" -> asks the user to
+ *   type the details; any other file -> asks what to do with it. Upload names containing "flaky" fail once with 500 (Retry works),
+ *   "reject" answers 415. STUB_UPLOAD_DELAY_MS (default 700) slows uploads so the spinner is visible.
+ *   Message turns take STUB_TURN_DELAY_MS (default 900) and POST /actions confirm 1.5 s, so the loading states are visible.
+ *   Data lives in memory only (reset by /__stub/reset or a restart).
+ *
  * Extra dev endpoints (no CSRF header needed, so they work with plain curl):
  *   POST /__stub/expire  -> every later /api/auth/me returns 401 (cookie stays in the browser)
- *   POST /__stub/reset   -> clears that flag and the logout counter
+ *   POST /__stub/reset   -> clears that flag, the logout counter and all chat data
  *   GET  /__stub/state   -> { expired, logouts }
  */
 import { Buffer } from 'node:buffer'
 import { createServer } from 'node:http'
+import { setTimeout as sleep } from 'node:timers/promises'
+import type { IncomingMessage } from 'node:http'
 import process from 'node:process'
 
 const PORT = Number(process.env.API_PORT) || 9181
 const ORIGIN = process.env.STUB_ALLOWED_ORIGIN || 'http://localhost:9180'
 const COOKIE_NAME = 'scmp_session'
 const MAX_AGE = 3600
+const TURN_DELAY_MS = Number(process.env.STUB_TURN_DELAY_MS ?? 900)
+const UPLOAD_DELAY_MS = Number(process.env.STUB_UPLOAD_DELAY_MS ?? 700)
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf']
 
 const USERS = [
   { id: 1, email: 'amy.lau@example.com', display_name: 'Amy Lau', role: 'employee' },
@@ -43,6 +64,408 @@ function userFromCookie(header: string | undefined) {
   return USERS.find(u => u.email === email)
 }
 
+/* ---- Chat (scripted, in memory) ------------------------------------------------------------------ */
+
+type Json = Record<string, unknown>
+type Send = (status: number, body?: unknown, extraHeaders?: Record<string, string>) => void
+
+interface StubConversation {
+  id: number
+  owner: string
+  title: string
+  active_request_type: 'leave' | 'claim' | null
+  has_pending_card: boolean
+  created_at: string
+  updated_at: string
+  messages: Json[]
+  awaitingEnd: boolean
+  awaitingDocEnd: Json[] | null
+  stale: boolean
+  inFlight: Set<string>
+}
+
+const conversations: StubConversation[] = []
+let conversationSeq = 0
+let messageSeq = 0
+let cardSeq = 0
+let requestSeq = 20
+
+interface StoredAttachment {
+  id: number
+  owner: string
+  conversationId: number
+  filename: string
+  content_type: string
+  bytes: Buffer
+  created_at: string
+  used: boolean
+}
+
+const attachmentStore: StoredAttachment[] = []
+let attachmentSeq = 0
+const flakySeen = new Set<string>()
+
+const attachmentInfo = (a: StoredAttachment) => ({
+  id: a.id,
+  filename: a.filename,
+  content_type: a.content_type,
+  size_bytes: a.bytes.length,
+  url: `/api/attachments/${a.id}`,
+  created_at: a.created_at,
+})
+
+const iso = () => new Date().toISOString()
+const summary = (c: StubConversation) => ({
+  id: c.id,
+  title: c.title,
+  status: 'active',
+  active_request_type: c.active_request_type,
+  has_pending_card: c.has_pending_card,
+  created_at: c.created_at,
+  updated_at: c.updated_at,
+})
+
+function step(key: string, label: string, detail: string, ok = true, duration_ms = 80 + Math.round(Math.random() * 500)) {
+  return { step: key, label, detail, ok, duration_ms }
+}
+
+function push(c: StubConversation, sender: 'user' | 'assistant', content: string, ui: Json | null = null, trace: Json[] | null = null, attachments: Json[] = []): Json {
+  const message = { id: ++messageSeq, sender_type: sender, content, created_at: iso(), ui, trace, attachments }
+  c.messages.push(message)
+  c.updated_at = message.created_at
+  return message
+}
+
+function supersedeOpenCards(c: StubConversation) {
+  for (const m of c.messages) {
+    const ui = m.ui as Json | null
+    if (ui?.type === 'confirmation_card' && ui.state === 'open') ui.state = 'superseded'
+  }
+}
+
+function makeCard(c: StubConversation, kind: 'leave' | 'claim' | 'update' | 'cancel' | 'docleave' | 'docclaim', attachments: Json[] = []): Json {
+  supersedeOpenCards(c)
+  const base = { type: 'confirmation_card', card_id: `c_${(++cardSeq).toString(16).padStart(4, '0')}`, warnings: [] as string[], state: 'open', attachments }
+  c.has_pending_card = true
+  c.active_request_type = kind === 'claim' || kind === 'docclaim' ? 'claim' : 'leave'
+  if (kind === 'docleave') {
+    return { ...base, action: 'create', request_type: 'leave', request_id: null, title: 'Confirm leave application', confirm_label: 'Submit', fields: [
+      { key: 'employee_email', label: 'Employee', value: c.owner, old_value: null },
+      { key: 'leave_type', label: 'Leave type', value: 'Sick', old_value: null, source: 'document' },
+      { key: 'start_date', label: 'Start date', value: 'Mon 2026-09-21', old_value: null, source: 'document' },
+      { key: 'end_date', label: 'End date', value: 'Wed 2026-09-23 (3 working days)', old_value: null },
+    ] }
+  }
+  if (kind === 'docclaim') {
+    return { ...base, action: 'create', request_type: 'claim', request_id: null, title: 'Confirm staff claim', confirm_label: 'Submit',
+      warnings: ['The name on the receipt (Alex Chan) does not match your name (Amy Lau). Please check it is your receipt.'],
+      fields: [
+        { key: 'claim_type', label: 'Claim type', value: 'Meals', old_value: null, source: 'document' },
+        { key: 'amount', label: 'Amount', value: 'HKD 246.50', old_value: null, source: 'document' },
+        { key: 'receipt_date', label: 'Receipt date', value: 'Wed 2026-09-23', old_value: null, source: 'document' },
+      ] }
+  }
+  if (kind === 'claim') {
+    return { ...base, action: 'create', request_type: 'claim', request_id: null, title: 'Confirm staff claim', confirm_label: 'Submit', fields: [
+      { key: 'claim_type', label: 'Claim type', value: 'Transport', old_value: null },
+      { key: 'amount', label: 'Amount', value: 'HKD 180.00', old_value: null },
+      { key: 'receipt_date', label: 'Receipt date', value: 'Thu 2026-09-24', old_value: null },
+    ] }
+  }
+  if (kind === 'update') {
+    return { ...base, action: 'update', request_type: 'leave', request_id: 12, title: 'Confirm changes to leave request #12', confirm_label: 'Save changes', fields: [
+      { key: 'leave_type', label: 'Leave type', value: 'Sick', old_value: 'Annual' },
+      { key: 'start_date', label: 'Start date', value: 'Mon 2026-10-05', old_value: 'Mon 2026-10-05' },
+      { key: 'end_date', label: 'End date', value: 'Wed 2026-10-07', old_value: 'Tue 2026-10-06' },
+    ], warnings: ['No public-holiday data for 2028; only weekends were excluded'] }
+  }
+  if (kind === 'cancel') {
+    return { ...base, action: 'cancel', request_type: 'leave', request_id: 12, title: 'Cancel leave request #12?', confirm_label: 'Cancel request', fields: [
+      { key: 'summary', label: 'Request', value: 'Annual leave, Mon 2026-10-05 to Wed 2026-10-07', old_value: null },
+    ] }
+  }
+  return { ...base, action: 'create', request_type: 'leave', request_id: null, title: 'Confirm leave application', confirm_label: 'Submit', fields: [
+    { key: 'employee_email', label: 'Employee', value: c.owner, old_value: null },
+    { key: 'leave_type', label: 'Leave type', value: 'Annual', old_value: null },
+    { key: 'start_date', label: 'Start date', value: 'Mon 2026-10-05', old_value: null },
+    { key: 'end_date', label: 'End date', value: 'Tue 2026-10-06 (2 working days)', old_value: null },
+  ] }
+}
+
+const STATUS_REQUESTS = [
+  { request_type: 'leave', id: 12, status: 'pending_approval', status_label: 'Pending approval', summary: 'Annual leave, Mon 2026-10-05 to Wed 2026-10-07 (2.5 working days)', submitted_at: '2026-09-24T03:10:00Z', reviewed_at: null, reviewer_note: null, external_reference_id: '23' },
+  { request_type: 'claim', id: 8, status: 'approved', status_label: 'Approved', summary: 'Transport claim, HKD 95.00, receipt 2026-09-18', submitted_at: '2026-09-19T02:00:00Z', reviewed_at: '2026-09-21T08:30:00Z', reviewer_note: 'Approved. Thanks for the receipt.', external_reference_id: '17' },
+  { request_type: 'leave', id: 5, status: 'rejected', status_label: 'Rejected', summary: 'Sick leave, 2026-09-08', submitted_at: '2026-09-08T01:00:00Z', reviewed_at: '2026-09-09T02:00:00Z', reviewer_note: 'Please attach a medical certificate and resubmit.', external_reference_id: '9' },
+]
+
+function handleText(c: StubConversation, text: string, attachments: Json[] = []): string | null {
+  const lower = text.toLowerCase()
+  const names = attachments.map(a => String(a.filename).toLowerCase()).join(' ')
+  const has = (...words: string[]) => words.some(w => lower.includes(w))
+  const trace = (...steps: Json[]) => steps
+  const warning: string | null = null
+
+  if (has('fail')) {
+    push(c, 'assistant', 'Sorry, the AI service is not responding right now. Nothing was changed. Please try again.', null,
+      trace(step('understand', 'Intent detection', 'Gemini request timed out', false, 8000)))
+    return 'llm_unavailable'
+  }
+  if (has('status')) {
+    push(c, 'assistant', 'Here are your requests.', { type: 'status_card', requests: STATUS_REQUESTS, empty: false },
+      trace(step('understand', 'Intent detected', 'check_status (confidence 0.97)'), step('status', 'Looked up your requests', '3 found'), step('respond', 'Wrote the answer', 'status card')))
+    return warning
+  }
+  if (attachments.length) {
+    if (names.includes('blurry')) {
+      push(c, 'assistant', 'I could not read that document clearly. Could you type the details instead, for example the type of leave and the dates, or the claim type, amount and receipt date?', null,
+        trace(step('understand', 'Read the attachment', 'blurry-scan: text not legible', false, 2100), step('decide', 'Next step', 'ask the user to type the details')))
+      return warning
+    }
+    if (names.includes('sick') || names.includes('medical')) {
+      c.awaitingDocEnd = attachments
+      c.active_request_type = 'leave'
+      push(c, 'assistant', 'I read your medical certificate: sick leave starting Monday 2026-09-21. I could not find the last day of rest on the certificate. What is the last day of your leave?', null,
+        trace(step('understand', 'Read the attachment', 'medical certificate (confidence 0.9)', true, 1900), step('merge', 'Collected from the document', 'leave_type, start_date'), step('validate', 'Missing fields', 'end_date', false), step('decide', 'Next step', 'ask a follow-up question')))
+      return warning
+    }
+    if (names.includes('receipt')) {
+      push(c, 'assistant', 'I read your receipt. Please check the details below and confirm.', makeCard(c, 'docclaim', attachments),
+        trace(step('understand', 'Read the attachment', 'receipt: total, date, merchant', true, 1700), step('validate', 'Compared with your name', 'name on the receipt differs', false), step('decide', 'Next step', 'ask for confirmation')))
+      return warning
+    }
+    push(c, 'assistant', 'I received the file. What would you like to do with it: apply for leave or submit a staff claim?', null,
+      trace(step('understand', 'Read the attachment', 'unclear purpose', true, 900), step('decide', 'Next step', 'ask a follow-up question')))
+    return warning
+  }
+  if (c.awaitingDocEnd) {
+    const docs = c.awaitingDocEnd
+    c.awaitingDocEnd = null
+    push(c, 'assistant', 'Thanks. Here is the leave application, with the dates read from your certificate. Please check it and confirm.', makeCard(c, 'docleave', docs),
+      trace(step('understand', 'Read your answer', 'end_date'), step('merge', 'Merged with the document', 'leave_type, start_date, end_date'), step('validate', 'Validated the fields', '3 working days, no overlap'), step('decide', 'Next step', 'ask for confirmation')))
+    return warning
+  }
+  if (c.awaitingEnd) {
+    c.awaitingEnd = false
+    const card = makeCard(c, 'leave')
+    push(c, 'assistant', 'Thanks. Please check the details below and confirm.', card,
+      trace(step('understand', 'Intent detected', 'create_leave (confidence 0.92)'), step('merge', 'Merged with your earlier message', 'leave_type, start_date, end_date'), step('validate', 'Validated the fields', '2 working days, no overlap'), step('decide', 'Next step', 'ask for confirmation')))
+    return warning
+  }
+  if (has('stale')) {
+    c.stale = true
+    push(c, 'assistant', 'I prepared this leave application. (Stub: confirming it will answer 409.)', makeCard(c, 'leave'),
+      trace(step('understand', 'Intent detected', 'create_leave (confidence 0.9)'), step('decide', 'Next step', 'ask for confirmation')))
+    return warning
+  }
+  const cardOpen = c.messages.some(m => (m.ui as Json | null)?.type === 'confirmation_card' && (m.ui as Json).state === 'open')
+  if (cardOpen && /^\s*(yes|y|ok|okay|sure|confirm|submit)\b/.test(lower)) {
+    push(c, 'assistant', 'Typing "yes" does not submit anything. Please press the Submit button on the card, or keep typing to change something.', null,
+      trace(step('understand', 'Intent detected', 'confirm_by_text (ignored)'), step('decide', 'Next step', 'wait for the card button')))
+    return warning
+  }
+  if (has('change', 'update')) {
+    push(c, 'assistant', 'I can change request #12. Please review the highlighted differences.', makeCard(c, 'update'),
+      trace(step('understand', 'Intent detected', 'update_request (confidence 0.88)'), step('validate', 'Checked request #12', 'still pending approval'), step('decide', 'Next step', 'ask for confirmation')))
+    return warning
+  }
+  if (has('cancel')) {
+    push(c, 'assistant', 'Do you want to cancel request #12?', makeCard(c, 'cancel'),
+      trace(step('understand', 'Intent detected', 'cancel_request (confidence 0.9)'), step('decide', 'Next step', 'ask for confirmation')))
+    return warning
+  }
+  if (has('claim', 'taxi')) {
+    push(c, 'assistant', 'I have everything for this claim. Please check it and confirm.', makeCard(c, 'claim'),
+      trace(step('understand', 'Intent detected', 'create_claim (confidence 0.95)'), step('validate', 'Validated the fields', 'amount 180.00, date in the past'), step('decide', 'Next step', 'ask for confirmation')))
+    return warning
+  }
+  if (has('leave')) {
+    c.awaitingEnd = true
+    c.active_request_type = 'leave'
+    push(c, 'assistant', 'Sure. What is the last day of your leave?', null,
+      trace(step('understand', 'Intent detected', 'create_leave (confidence 0.92)'), step('merge', 'Collected so far', 'leave_type, start_date'), step('validate', 'Missing fields', 'end_date', false), step('decide', 'Next step', 'ask a follow-up question')))
+    return warning
+  }
+  push(c, 'assistant', 'I can help you apply for leave, submit a staff claim, or check the status of your requests. What would you like to do?', null,
+    trace(step('understand', 'Intent detected', 'unknown (confidence 0.4)'), step('respond', 'Wrote the answer', 'general help')))
+  return warning
+}
+
+async function readJson(req: IncomingMessage): Promise<Json | null> {
+  let raw = ''
+  for await (const chunk of req) raw += chunk
+  try {
+    const parsed = JSON.parse(raw || 'null')
+    return typeof parsed === 'object' && parsed !== null ? parsed as Json : null
+  }
+  catch {
+    return null
+  }
+}
+
+/** Reads the raw body, giving up (and draining) above `limit` bytes. */
+async function readBuffer(req: IncomingMessage, limit: number): Promise<Buffer | null> {
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of req) {
+    total += chunk.length
+    if (total > limit) continue // keep draining so the client gets our answer
+    chunks.push(chunk as Buffer)
+  }
+  return total > limit ? null : Buffer.concat(chunks)
+}
+
+/** Minimal multipart parser: returns the `file` part (name, type, bytes) or null. */
+function parseFilePart(body: Buffer, contentType: string): { filename: string, type: string, bytes: Buffer } | null {
+  const boundary = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType)
+  const token = boundary?.[1] ?? boundary?.[2]
+  if (!token) return null
+  const delimiter = Buffer.from(`--${token}`)
+  let start = body.indexOf(delimiter)
+  while (start !== -1) {
+    const headEnd = body.indexOf('\r\n\r\n', start)
+    if (headEnd === -1) return null
+    const head = body.subarray(start + delimiter.length, headEnd).toString('utf8')
+    const next = body.indexOf(delimiter, headEnd)
+    if (/name="file"/i.test(head) && next !== -1) {
+      const filename = /filename="([^"]*)"/i.exec(head)?.[1] ?? ''
+      const type = /content-type:\s*([^\r\n]+)/i.exec(head)?.[1]?.trim() ?? ''
+      return { filename, type, bytes: body.subarray(headEnd + 4, next - 2) } // strip the CRLF before the next boundary
+    }
+    start = next
+  }
+  return null
+}
+
+async function handleUpload(req: IncomingMessage, c: StubConversation, owner: string, send: Send) {
+  const body = await readBuffer(req, MAX_UPLOAD_BYTES + 64 * 1024)
+  await sleep(UPLOAD_DELAY_MS)
+  if (!body) return send(413, { detail: 'File too large' })
+  const part = parseFilePart(body, String(req.headers['content-type'] ?? ''))
+  if (!part || part.bytes.length === 0) return send(422, { detail: 'No file provided' })
+  if (part.bytes.length > MAX_UPLOAD_BYTES) return send(413, { detail: 'File too large' })
+  const name = part.filename.replace(/[\\/\r\n"]/g, '_').slice(0, 120) || 'file'
+  if (!ALLOWED_TYPES.includes(part.type) || name.toLowerCase().includes('reject')) return send(415, { detail: 'Unsupported file type' })
+  if (name.toLowerCase().includes('flaky') && !flakySeen.has(name)) {
+    flakySeen.add(name) // fails once, so Retry can be exercised
+    return send(500, { detail: 'Internal error' })
+  }
+  const stored: StoredAttachment = { id: ++attachmentSeq, owner, conversationId: c.id, filename: name, content_type: part.type, bytes: part.bytes, created_at: iso(), used: false }
+  attachmentStore.push(stored)
+  return send(201, { attachment: attachmentInfo(stored) })
+}
+
+/** Returns true when the request belonged to the chat API (and was answered). */
+function handleChat(req: IncomingMessage, path: string, send: Send): boolean {
+  const download = /^\/api\/attachments\/(\d+)$/.exec(path)
+  if (!path.startsWith('/api/chat/') && !download) return false
+  const user = expired ? undefined : userFromCookie(req.headers.cookie)
+  if (!user) return send(401, { detail: 'Not authenticated' }), true
+  if (download) {
+    const file = attachmentStore.find(a => a.id === Number(download[1]) && a.owner === user.email)
+    if (!file || req.method !== 'GET') return send(404, { detail: 'Not found' }), true
+    return send(200, file.bytes, {
+      'content-type': file.content_type,
+      'content-disposition': `inline; filename="${file.filename}"`,
+      'x-content-type-options': 'nosniff',
+      'cache-control': 'private, no-store',
+    }), true
+  }
+  if (user.role !== 'employee') return send(403, { detail: 'Forbidden' }), true
+
+  const own = () => conversations.filter(c => c.owner === user.email).sort((a, b) => b.id - a.id)
+  const method = req.method
+
+  if (path === '/api/chat/conversations') {
+    if (method === 'GET') return send(200, { items: own().sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at) || b.id - a.id).map(summary) }), true
+    if (method === 'POST') {
+      const now = iso()
+      const c: StubConversation = { id: ++conversationSeq, owner: user.email, title: 'New chat', active_request_type: null, has_pending_card: false, created_at: now, updated_at: now, messages: [], awaitingEnd: false, awaitingDocEnd: null, stale: false, inFlight: new Set() }
+      conversations.push(c)
+      return send(201, summary(c)), true
+    }
+    return send(405, { detail: 'Method not allowed' }), true
+  }
+
+  const match = /^\/api\/chat\/conversations\/(\d+)(\/messages|\/actions|\/attachments)?$/.exec(path)
+  if (!match) return send(404, { detail: 'Not found' }), true
+  const c = own().find(x => x.id === Number(match[1]))
+  if (!c) return send(404, { detail: 'Conversation not found' }), true
+
+  if (!match[2] && method === 'GET') return send(200, { conversation: summary(c), messages: c.messages }), true
+
+  if (match[2] === '/attachments' && method === 'POST') {
+    void handleUpload(req, c, user.email, send)
+    return true
+  }
+
+  if (match[2] === '/messages' && method === 'POST') {
+    void readJson(req).then(async (body) => {
+      await sleep(TURN_DELAY_MS) // makes the "Thinking..." indicator visible
+      const content = typeof body?.content === 'string' ? body.content.trim() : ''
+      const ids = Array.isArray(body?.attachment_ids) ? body.attachment_ids as unknown[] : []
+      const files = ids.map(id => attachmentStore.find(a => a.id === id && a.owner === user.email && a.conversationId === c.id && !a.used))
+      if (ids.length > 3 || files.some(f => !f)) return send(422, { detail: 'invalid attachment_ids' })
+      if ((!content && !files.length) || content.length > 1000) return send(422, { detail: 'content must be 1 to 1000 characters' })
+      const stored = files as StoredAttachment[]
+      for (const f of stored) f.used = true
+      const infos = stored.map(attachmentInfo)
+      const before = c.messages.length
+      const userMessage = push(c, 'user', content, null, null, infos)
+      if (before === 0) c.title = (content || `Attachment: ${infos[0]?.filename ?? 'file'}`).slice(0, 60)
+      const warning = handleText(c, content, infos)
+      return send(200, { conversation: summary(c), user_message: userMessage, assistant_messages: c.messages.slice(before + 1), warning_code: warning })
+    })
+    return true
+  }
+
+  if (match[2] === '/actions' && method === 'POST') {
+    void readJson(req).then(async (body) => {
+      const cardId = typeof body?.card_id === 'string' ? body.card_id : ''
+      const action = body?.action
+      if (!cardId || (action !== 'confirm' && action !== 'discard')) return send(422, { detail: 'invalid action' })
+      const holder = c.messages.find(m => (m.ui as Json | null)?.card_id === cardId)
+      const card = holder?.ui as Json | undefined
+      if (!card) return send(404, { detail: 'Card not found' })
+      if (c.stale && card.state === 'open') {
+        c.stale = false
+        card.state = 'superseded'
+        c.has_pending_card = false
+        c.active_request_type = null
+        return send(409, { detail: 'Card is no longer open' })
+      }
+      if (card.state !== 'open' || c.inFlight.has(cardId)) return send(409, { detail: 'Card is no longer open' })
+      if (action === 'discard') {
+        card.state = 'discarded'
+        c.has_pending_card = false
+        c.active_request_type = null
+        push(c, 'assistant', 'Okay, I discarded that. Nothing was submitted.')
+        return send(200, { conversation: summary(c), user_message: null, assistant_messages: c.messages.slice(-1), warning_code: null })
+      }
+      c.inFlight.add(cardId)
+      await sleep(1500) // stands in for the ReqRes call
+      c.inFlight.delete(cardId)
+      card.state = 'used'
+      c.has_pending_card = false
+      c.active_request_type = null
+      const requestType = card.request_type as string
+      const outcome = card.action === 'cancel' ? 'cancelled' : card.action === 'update' ? 'updated' : 'submitted'
+      const id = card.request_id ?? ++requestSeq
+      const message = outcome === 'submitted'
+        ? `Submitted to the ReqRes mock API (reference ${100 + id}).`
+        : outcome === 'updated' ? 'Your changes were saved.' : 'The request was cancelled.'
+      push(c, 'assistant', outcome === 'cancelled' ? 'Done, the request is cancelled.' : 'Done. Your request is with the approver now.', {
+        type: 'result_card', outcome, request_type: requestType, request_id: id,
+        status: outcome === 'cancelled' ? 'cancelled' : 'pending_approval', status_label: outcome === 'cancelled' ? 'Cancelled' : 'Pending approval',
+        message, external_reference_id: outcome === 'submitted' ? String(100 + id) : null,
+      }, [step('submit', 'Sent to ReqRes', 'POST /api/users 201', true, 1480), step('respond', 'Wrote the answer', 'result card')])
+      return send(200, { conversation: summary(c), user_message: null, assistant_messages: c.messages.slice(-1), warning_code: null })
+    })
+    return true
+  }
+
+  return send(405, { detail: 'Method not allowed' }), true
+}
+
 const sessionCookie = (value: string, maxAge: number) =>
   `${COOKIE_NAME}=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}`
 
@@ -57,7 +480,7 @@ createServer((req, res) => {
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       ...extraHeaders,
     })
-    res.end(body === undefined ? undefined : JSON.stringify(body))
+    res.end(body === undefined ? undefined : Buffer.isBuffer(body) ? body : JSON.stringify(body))
   }
   const path = (req.url || '').split('?')[0]
   if (req.method === 'OPTIONS') return send(204)
@@ -69,6 +492,9 @@ createServer((req, res) => {
   if (req.method === 'POST' && path === '/__stub/reset') {
     expired = false
     logouts = 0
+    conversations.length = 0
+    attachmentStore.length = 0
+    flakySeen.clear()
     return send(200, { expired, logouts })
   }
   if (req.method === 'GET' && path === '/__stub/state') return send(200, { expired, logouts })
@@ -78,6 +504,8 @@ createServer((req, res) => {
   if (unsafe && req.headers['x-requested-with'] !== 'XMLHttpRequest') {
     return send(403, { detail: 'CSRF check failed' })
   }
+
+  if (handleChat(req, path, send)) return
 
   if (req.method === 'GET' && path === '/api/auth/mock-users') return send(200, USERS)
 
