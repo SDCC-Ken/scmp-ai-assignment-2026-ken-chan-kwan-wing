@@ -15,6 +15,7 @@ WORKDIR /app
 COPY --from=build --chown=node:node /app/.output ./.output
 USER node
 EXPOSE 9180
-# Theme and API base stay overridable at runtime, e.g.
+# Theme and API bases stay overridable at runtime, e.g.
 #   -e NUXT_PUBLIC_THEME_LIGHT_PRIMARY='#ff0000' -e NUXT_PUBLIC_API_BASE=http://localhost:9181
+#   -e NUXT_API_BASE_SERVER=http://api:9181   (private; SSR-only, used inside the container network)
 CMD ["node", ".output/server/index.mjs"]

@@ -26,3 +26,156 @@ body {
   background-color: var(--theme-background);
   color: var(--theme-secondary);
 }
+
+/* ---- Mock-warning (fixed amber) and role-badge palettes -------------------------------------
+   Not env-driven: these are status colours whose contrast is verified, so they follow the same
+   light / prefers-color-scheme / data-theme switching as the theme tokens but stay constant. */
+:root {
+  --warn-bg: #fffbeb;
+  --warn-border: #d97706;
+  --warn-text: #451a03;
+  --warn-icon: #b45309;
+  --badge-employee-bg: #e0f2fe;
+  --badge-employee-fg: #075985;
+  --badge-hr-bg: #ede9fe;
+  --badge-hr-fg: #5b21b6;
+  --badge-finance-bg: #dcfce7;
+  --badge-finance-fg: #166534;
+  --gsi-bg: #ffffff;
+  --gsi-border: #747775;
+  --gsi-fg: #1f1f1f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --warn-bg: #451a03;
+    --warn-border: #f59e0b;
+    --warn-text: #fef3c7;
+    --warn-icon: #fbbf24;
+    --badge-employee-bg: #0c4a6e;
+    --badge-employee-fg: #e0f2fe;
+    --badge-hr-bg: #4c1d95;
+    --badge-hr-fg: #ede9fe;
+    --badge-finance-bg: #14532d;
+    --badge-finance-fg: #dcfce7;
+    --gsi-bg: #131314;
+    --gsi-border: #8e918f;
+    --gsi-fg: #e3e3e3;
+  }
+}
+
+:root[data-theme="dark"] {
+  --warn-bg: #451a03;
+  --warn-border: #f59e0b;
+  --warn-text: #fef3c7;
+  --warn-icon: #fbbf24;
+  --badge-employee-bg: #0c4a6e;
+  --badge-employee-fg: #e0f2fe;
+  --badge-hr-bg: #4c1d95;
+  --badge-hr-fg: #ede9fe;
+  --badge-finance-bg: #14532d;
+  --badge-finance-fg: #dcfce7;
+  --gsi-bg: #131314;
+  --gsi-border: #8e918f;
+  --gsi-fg: #e3e3e3;
+}
+
+.mock-warning {
+  background-color: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-left-width: 6px;
+  color: var(--warn-text);
+}
+
+.mock-warning-icon {
+  color: var(--warn-icon);
+}
+
+.role-badge {
+  display: inline-block;
+  border-radius: 9999px;
+  padding: 0.125rem 0.625rem;
+  font-size: 0.75rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.role-badge[data-role="employee"] {
+  background-color: var(--badge-employee-bg);
+  color: var(--badge-employee-fg);
+}
+
+.role-badge[data-role="hr_approver"] {
+  background-color: var(--badge-hr-bg);
+  color: var(--badge-hr-fg);
+}
+
+.role-badge[data-role="finance_approver"] {
+  background-color: var(--badge-finance-bg);
+  color: var(--badge-finance-fg);
+}
+
+/* "Sign in with Google" button: light (default) / dark themes per Google's branding guidelines
+   (fill #FFFFFF/#131314, 1px stroke #747775/#8E918F, text #1F1F1F/#E3E3E3, 12px left padding,
+   10px after the logo, 12px right padding). Font: Google Sans Medium where installed, then
+   Roboto, then the system stack; no web font is fetched from Google. */
+.gsi-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 40px;
+  min-width: 200px;
+  max-width: 100%;
+  padding: 0 12px;
+  border: 1px solid var(--gsi-border);
+  border-radius: 4px;
+  background-color: var(--gsi-bg);
+  color: var(--gsi-fg);
+  font-family: "Google Sans", "Roboto", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  letter-spacing: 0.25px;
+  cursor: pointer;
+  transition: box-shadow 0.15s;
+}
+
+.gsi-button:hover {
+  box-shadow: 0 1px 2px 0 rgb(60 64 67 / 30%), 0 1px 3px 1px rgb(60 64 67 / 15%);
+}
+
+.gsi-button > svg {
+  width: 20px;
+  height: 20px;
+  margin-right: 10px;
+  flex: none;
+}
+
+.gsi-button:focus-visible,
+.focus-ring:focus-visible {
+  outline: 2px solid var(--theme-secondary);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin {
+    animation: none;
+  }
+}
+
+/* Error panels: fixed light red on light theme, dark red on dark theme (contrast >= 4.5:1). */
+:root[data-theme="dark"] .dark-error {
+  background-color: #450a0a;
+  color: #fee2e2;
+  border-color: #f87171;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .dark-error {
+    background-color: #450a0a;
+    color: #fee2e2;
+    border-color: #f87171;
+  }
+}

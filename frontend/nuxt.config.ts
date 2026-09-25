@@ -11,7 +11,11 @@ export default defineNuxtConfig({
   devServer: { port: Number(process.env.WEB_PORT) || 9180 },
   vite: { plugins: [tailwindcss()] },
   runtimeConfig: {
+    // Private (server-only): API base used during SSR. In Docker, `localhost` is the web container
+    // itself, so compose sets NUXT_API_BASE_SERVER=http://api:9181. Empty falls back to public.apiBase.
+    apiBaseServer: '',
     public: {
+      // Browser-facing API base (NUXT_PUBLIC_API_BASE).
       apiBase: 'http://localhost:9181',
       theme: {
         lightPrimary: '#32a9e1',
