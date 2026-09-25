@@ -17,7 +17,7 @@ This is a fictional PoC. Do not use, infer, upload, or commit real SCMP, employe
 - Claim fields: `employee_email`, `claim_type`, `amount`, and `receipt_date`.
 - Ask focused follow-up questions for missing required fields.
 - Display an API loading state; submit only after an explicit confirmation.
-- Send Leave and Claim submissions to `POST https://reqres.in/api/users`.
+- Send Leave and Claim submissions to `POST https://reqres.in/api/users`. Wire format: leave `{email, leave_type, start_date, end_date}` (e.g. `"Annual"`), claim `{email, claim_type, amount, receipt_date}`; nothing else leaves the system.
 - Keep a local audit trail for request creation, confirmation, mock submission, approval, and rejection.
 
 ## Selected stack
@@ -56,7 +56,7 @@ The project is developed on macOS Apple Silicon. Use the following tools and com
 
 - Reserve `9180` for the Nuxt frontend and `9181` for the FastAPI backend. Configure both through environment variables such as `WEB_PORT=9180` and `API_PORT=9181`; do not use default ports that may conflict with Ken's other projects.
 - The assignment-required `https://reqres.in/api/users` is a hosted external mock API. The submitted app must use it through a `ReqresSubmissionAdapter`, not replace it with localhost.
-- ReqRes currently requires an `x-api-key` header for `/api/*` requests. Read `REQRES_API_KEY` from `.env`; never commit it.
+- ReqRes needs no API key at the moment (Ken confirmed; a live call on 2026-09-25 returned 201). Send an `x-api-key` header only when `REQRES_API_KEY` is set in `.env` (in case ReqRes starts requiring one); never commit it.
 - A localhost mock adapter is permitted only for deterministic unit tests, offline development, or a clearly labelled emergency demo fallback. It must not be presented as the required ReqRes integration.
 
 ## Architecture and safety boundaries
