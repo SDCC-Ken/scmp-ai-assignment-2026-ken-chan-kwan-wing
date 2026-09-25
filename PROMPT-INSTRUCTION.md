@@ -498,6 +498,91 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
 - **Verification commands and results:** backend 1403 passed and ruff clean; frontend lint, typecheck, 123 tests and build clean; browser checks as above. Not repeated in the browser: the claim approval as Eva, Helen's queue and the reject path (covered by backend and frontend tests).
 - **Commit:** `4ca8dfb` (README); log in the following commit.
 
+## Entry 28 - Bell inbox: design and backend (Ken → integrator, backend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), integrator and self-reported sub-agent.
+- **Actual prompt (Ken, condensed):**
+  ```text
+  One small thing before I test: when clicking the bell, create a new conversation and show all the items that need handling one by one, and add a small number to the bell.
+  You can test once, then clear the DB and make a small story for me to do one round from create to approval or reject.
+  ```
+- **Allowed scope:** integrator wrote `docs/inbox-design.md`; the backend sub-agent owned `backend/app/chat/inbox.py`, the chat route and service, the chat access rule, tests and docs appendices.
+- **Agent result:** `POST /api/chat/inbox` creates a new "Items to handle (N)" conversation from a snapshot (assigned pending approvals oldest first, then unread notices); actions approve/reject (needs `confirmed: true`), skip, acknowledge; the decision reuses the approvals logic with `via: inbox` in the audit; stale items are handled; chat access for users who file or approve. 79 new tests. Deviations reported: a stale item returns HTTP 200 with a `stale` card (the design text said 409); a compare-and-swap claims the card before deciding.
+- **Human review / changes requested:** none; the integrator confirmed it live (Entry 33).
+- **Verification commands and results:** `uv run pytest -q` 1482 passed; ruff clean; smoke on port 9199 (Cathy approves from the inbox, Amy acknowledges the notice).
+- **Commit:** `31cc040`.
+
+## Entry 29 - Bell inbox frontend (frontend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Clicking the bell creates a new conversation and shows the waiting items one card at a time; keep the unread number on the bell. Inbox cards for approvals (details, limits, team overlap,
+  attachments, optional note, Approve/Reject with a second confirm step, Skip) and notices (Got it, Skip); access for approve-only users; "all caught up" popover; stub scenarios; tests.
+  ```
+- **Allowed scope:** `frontend/` only.
+- **Agent result:** `InboxCard`, `ApprovalDetailPanel`, `useInbox`, rewritten bell, access changes, 21 new tests. Checked in the browser against the stub (skip, approve, reject, stale, reopen, keyboard, 360px).
+- **Human review / changes requested:** verified against the real backend by the integrator (Entry 33).
+- **Verification commands and results:** `bun run lint`, `typecheck` clean; `bun run test` 141 passed; `bun run build` complete.
+- **Commit:** `6579bdf`.
+
+## Entry 30 - Demo reset command, architecture diagram and troubleshooting guide (docs-and-tooling sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (Ken's Phase 4 points 5 and 6, condensed):**
+  ```text
+  Add a way to set the mock data back into the DB. Add a concise architecture diagram and a troubleshooting section to the README or docs.
+  ```
+- **Allowed scope:** `backend/app/cli.py` and its tests, `scripts/reset-demo.sh`, `docs/architecture.md`, `docs/troubleshooting.md`.
+- **Agent result:** `python -m app.cli reset-demo --yes` (drops, reseeds, and deletes uploaded files safely: never outside the upload directory, never following symlinks); `seed --reset` shares it; `scripts/reset-demo.sh [docker|local]`; four Mermaid diagrams plus trust boundaries and design trade-offs; a symptom-cause-fix guide. 13 new tests. It did not reset Ken's running stack (it ran only the cancel path).
+- **Human review / changes requested:** the integrator pointed the tests' upload directory at a temporary folder in `tests/conftest.py` so no test can empty a real `./data/uploads`.
+- **Verification commands and results:** 1482 backend tests passed; the script was run for real in local mode (confirmations, refusals, safety checks); the integrator later ran the docker mode and the reset worked (Entry 33).
+- **Commit:** `4c5a7bc`.
+
+## Entry 31 - Playwright end-to-end tests (e2e sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (Ken's Phase 4 points 1 to 3, condensed):**
+  ```text
+  E2E: mock login, employee Leave request, confirmation/submission, assigned HR approval. E2E role denial: Finance cannot access an assigned Leave approval and HR cannot access a Claim approval.
+  A test for one safe failure state: a fake LLM/API failure presents a retryable UI and does not crash.
+  ```
+- **Allowed scope:** new `e2e/` project; one small test-only trigger in `backend/app/llm/fake.py`.
+- **Agent result:** Playwright with system Chrome, two servers started by the config on ports 9280/9281 (fake LLM, fake submission adapter, temp database, reseed before every test), 7 tests in 3 specs. Denials observed: 404 `Request not found` for a wrong-type or unassigned request (identical to a nonexistent id), 403 for employees. Gaps found: no retry control for an AI outage; the result card called a fake reference "ReqRes reference".
+- **Human review / changes requested:** the two gaps were assigned to Entry 32.
+- **Verification commands and results:** `bunx tsc --noEmit`; `bun run test` 7 passed, run five times including a cold build and reversed file order; ports free afterwards.
+- **Commit:** `88aa9dd`.
+
+## Entry 32 - E2E gap fixes, bell inbox in the E2E flow, screenshots (e2e-and-frontend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (Ken's Phase 4 point 7, condensed):**
+  ```text
+  Capture 3 to 5 fictional-data screenshots: mock sign-in, employee confirmation, HR approval, notification bell, audit/trace.
+  ```
+  plus the two gap fixes from Entry 31 and the bell inbox in the approval flow.
+- **Allowed scope:** `e2e/`, two small frontend fixes with tests, `docs/screenshots/`.
+- **Agent result:** "Try again" on the AI-unavailable banner puts the failed message back in the composer and focuses it (a true resend would duplicate the stored bubble); the result card label is a neutral "Reference"; the approval flow now runs through the bell inbox (Cathy handles the new request with a note, Amy's notice and "Got it") plus an Approvals-page variant; inbox role-boundary tests including a cross-conversation denial; `bun run screenshots` writes five 1280x800 fictional-data PNGs (each under 145 KB).
+- **Human review / changes requested:** the integrator viewed screenshots 3 and 5 (correct content, fictional data only).
+- **Verification commands and results:** integrator re-ran `bun run test` in `e2e/` (10 passed in 13.8 s, ports free) and the frontend checks (lint, typecheck, 144 tests).
+- **Commit:** `5fc5eb0`.
+
+## Entry 33 - Live inbox test, documentation updates and demo reset (integrator)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`).
+- **Actual prompt:** Ken: test once, clear the DB, and write a story for one round from create to approval or reject; update README.md and AGENTS.md to confirm all the things changed.
+- **Allowed scope:** running the stack; `AGENTS.md`, `README.md`, `docs/limits-and-routing.md`, this log.
+- **Agent result:** rebuilt with the local Ollama override and tested once with the real backend, real Ollama and real reqres.in: as Amy an annual leave request became a card with the balance line and was submitted (ReqRes reference 525, "waiting for approval by Cathy Ng"); Cathy's bell showed 2 and opened "Items to handle (2)" with "Item 1 of 2"; she skipped the seeded item, approved the new one with a note through "Confirm approve", the closing message read "You handled 1 item and skipped 1", and the bell dropped to 1. The database showed the request approved with the note, an audit row with `via: inbox` and no note text, and Amy's unread notification. The demo data was then reset with `scripts/reset-demo.sh docker --yes` (6 users, 20 requests, 34 holidays). `AGENTS.md` and the README were rewritten for the six users, per-user approvers, the bell inbox, attachments, balances and limits, Ollama and Gemini, the reset command and the E2E tests.
+- **Human review / changes requested:** Pending. Ken will run the story.
+- **Verification commands and results:** as above; E2E 10 passed; backend 1482 passed; frontend 144 passed.
+- **Commit:** `8231026` (AGENTS.md), `a84cf7f` and the following README commit; the log is committed after this entry.
+
 ## Entry template
 
 ### Entry NN - [phase and short task name]
