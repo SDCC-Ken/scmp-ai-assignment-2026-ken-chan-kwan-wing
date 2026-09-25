@@ -1,0 +1,46 @@
+%PDF-1.4
+%‚„œ”
+% FAKE-DOC: {"doc_type": "receipt", "provider_name": "Sample Noodle House", "total_amount": 83.6, "currency": "HKD", "suggested_claim_type": "meal", "unreadable_fields": ["receipt_date"]}
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 595] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 815 >>
+stream
+BT
+/F1 11 Tf 1 0 0 1 36 560 Tm (SAMPLE - FICTIONAL  \(not a real receipt\)) Tj
+/F1 18 Tf 1 0 0 1 36 520 Tm (Sample Noodle House \(fictional\)) Tj
+/F1 10 Tf 1 0 0 1 36 504 Tm (1 Example Street, Sample District, Hong Kong) Tj
+/F1 12 Tf 1 0 0 1 36 470 Tm (RECEIPT No. 000123) Tj
+/F1 11 Tf 1 0 0 1 36 410 Tm (Beef brisket noodles          1 x   48.00) Tj
+/F1 11 Tf 1 0 0 1 36 394 Tm (Iced lemon tea                 1 x   28.00) Tj
+/F1 11 Tf 1 0 0 1 36 360 Tm (Subtotal                                   HK$ 76.00) Tj
+/F1 11 Tf 1 0 0 1 36 344 Tm (Service charge 10%                     HK$  7.60) Tj
+/F1 14 Tf 1 0 0 1 36 310 Tm (TOTAL PAID                              HK$ 83.60) Tj
+/F1 11 Tf 1 0 0 1 36 285 Tm (Payment: cash) Tj
+/F1 9 Tf 1 0 0 1 36 60 Tm (SAMPLE - FICTIONAL. Generated for software testing only.) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000203 00000 n 
+0000000252 00000 n 
+0000000309 00000 n 
+0000000435 00000 n 
+0000001301 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1371
+%%EOF

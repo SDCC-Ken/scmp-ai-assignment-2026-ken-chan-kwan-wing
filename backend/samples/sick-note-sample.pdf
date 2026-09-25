@@ -1,0 +1,46 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 595] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 980 >>
+stream
+BT
+/F1 11 Tf 1 0 0 1 36 560 Tm (SAMPLE - FICTIONAL  \(not a real medical document\)) Tj
+/F1 18 Tf 1 0 0 1 36 520 Tm (Sample Family Clinic \(fictional\)) Tj
+/F1 10 Tf 1 0 0 1 36 504 Tm (1 Example Road, Sample District, Hong Kong  |  Tel: 0000 0000) Tj
+/F1 16 Tf 1 0 0 1 36 460 Tm (MEDICAL CERTIFICATE) Tj
+/F1 11 Tf 1 0 0 1 36 420 Tm (Date of issue: 24 September 2026) Tj
+/F1 11 Tf 1 0 0 1 36 395 Tm (This is to certify that Amy Lau \(fictional patient\)) Tj
+/F1 11 Tf 1 0 0 1 36 378 Tm (attended this clinic on 24 September 2026 and is unfit for work) Tj
+/F1 11 Tf 1 0 0 1 36 361 Tm (from 24 September 2026 to 25 September 2026 \(both dates inclusive\),) Tj
+/F1 11 Tf 1 0 0 1 36 344 Tm (a total of 2 days of sick leave.) Tj
+/F1 11 Tf 1 0 0 1 36 300 Tm (Diagnosis: acute upper respiratory tract infection) Tj
+/F1 11 Tf 1 0 0 1 36 200 Tm (Dr. Sample Doctor \(fictional\)   Reg. No. 000000) Tj
+/F1 9 Tf 1 0 0 1 36 60 Tm (SAMPLE - FICTIONAL. Generated for software testing only.) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000001278 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1348
+%%EOF
