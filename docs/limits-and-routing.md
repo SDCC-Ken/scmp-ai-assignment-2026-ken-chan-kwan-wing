@@ -14,7 +14,7 @@ limits and approvers are plain database values that you change with a few CLI co
 | Claim approver | The one person who decides this user's claims (must be an active `finance_approver`, not the user). | column `users.claim_approver_user_id` |
 | Assigned approver of a request | The approver copied from the user when the request is created; only this person sees it in their queue and gets notified. | columns `leave_requests.approver_user_id`, `claim_requests.approver_user_id` |
 | Department, job title | Department is used for the claim limit and the "same team" overlap only (not for routing). Job title is display only. | columns `users.department_id`, `users.job_title` |
-| `can_request` | Derived: true when at least one approver is configured. A user without any (Helen and Eva in the seed) has no chat and no balance screen. | computed from the two approver columns |
+| `can_request` | Derived: true when at least one approver is configured. A user without any (Helen and Eva in the seed) cannot file requests and has no balance screen; approvers can still use the chat page for the bell inbox. | computed from the two approver columns |
 
 ## 2. The seed (a fresh database)
 

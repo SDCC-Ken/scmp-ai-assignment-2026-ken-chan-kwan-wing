@@ -30,18 +30,20 @@ All accounts, requests, dates, policies, and records are fictional demonstration
 - [Validation and business rules](docs/business-rules.md), [test cases](docs/test-cases.md)
 - [Chat API contract](docs/chat-api-contract.md), [Phase 3 approval design](docs/phase3-approval-design.md)
 - [Changing limits and approvers](docs/limits-and-routing.md)
+- [Architecture diagrams](docs/architecture.md) and [troubleshooting](docs/troubleshooting.md)
+- [Bell inbox design](docs/inbox-design.md), [end-to-end tests](e2e/README.md)
 
 ## Development status
 
-**Phases 0 to 3 are implemented:** foundation and Docker; database, seed data and mock Google sign-in with real JWT auth; the AI chat (leave and claims, confirmation cards, ReqRes submission, attachments and documents, status, change and cancel); and the approval workflow (departments, per-user approvers, leave balances, department claim limits, approver screens, reviewer note, audit events and the notification bell). Phase 4 is end-to-end testing and the live Gemini check.
+**The baseline is implemented (Phases 0 to 4):** foundation and Docker; database, seed data and mock Google sign-in with real JWT auth; the AI chat (leave and claims, confirmation cards, ReqRes submission, attachments and documents, status, change and cancel); the approval workflow (departments, per-user approvers, leave balances, department claim limits, approver screens, reviewer note, audit events); the notification bell that opens an inbox conversation; and Phase 4: Playwright end-to-end tests, a demo-data reset command, architecture and troubleshooting docs. The live Gemini check is the one opt-in step left, because the free quota is limited.
 
 ## What the assistant does
 
 - **Employees** (Amy, Ben, Daniel, and Cathy for her own requests) chat in plain English: leave and staff claims, half days, single days, status, balance ("how many annual leave days do I have left?"), change and cancel. Anything the AI reads is validated by the backend, and **nothing is saved or sent until the user presses Submit on a card**. The submission goes to `POST https://reqres.in/api/users` with only the specified fields (`email`, `leave_type` / `claim_type`, dates, `amount`); everything else stays in SQLite.
 - **Documents:** attach an image or PDF (5 MB, 3 files) such as a sick note or receipt; the AI fills the draft, tags values "from document", and asks for anything missing. Sample fictional files are in `backend/samples/`.
 - **Approvers** (Cathy and Helen for leave, Eva for claims) see only the pending requests assigned to them, with the requester's balance or the department budget, an over-limit warning, teammates on leave at the same time, attachments, and an optional note; approving or rejecting is confirmed and audited. Limits are shown but never block: the approver decides.
-- **Everyone** has a bell with unread notifications (new request, change or cancel for approvers; decision for requesters).
-- Rules and limits are listed in [docs/business-rules.md](docs/business-rules.md). Only the four employees can file requests; Helen and Eva have no approver configured, by design.
+- **Everyone** has a bell with a small unread number. Clicking it opens a **new chat conversation "Items to handle (N)"** that shows each waiting item one card at a time: approval cards for approvers (Approve / Reject with a second confirm click, an optional note, or Skip) and "Got it" notices for decisions on your own requests. Skipped items come back on the next click; with nothing waiting the bell says you are all caught up.
+- Rules and limits are listed in [docs/business-rules.md](docs/business-rules.md). Only Amy, Ben, Daniel and Cathy can file requests; Helen and Eva have no approver configured, by design, but they use the bell inbox to handle approvals.
 
 ## AI providers
 
@@ -124,8 +126,8 @@ Open <http://localhost:9180>. A Google One Tap-style prompt is always shown in t
 | Amy Lau, Ben Chow | IT | `employee` | Cathy Ng | Eva Cheung | Chat: leave and claims, status, balance, change, cancel |
 | Daniel Wong | HR | `employee` | Helen Yeung | Eva Cheung | Same as above |
 | Cathy Ng | HR | `hr_approver` | Helen Yeung | Eva Cheung | Chat for her own requests, and approves **IT department leave** |
-| Helen Yeung | HR (manager) | `hr_approver` | none | none | Approves **HR department leave** (Cathy, Daniel); no chat |
-| Eva Cheung | Finance | `finance_approver` | none | none | Approves **all claims**; no chat |
+| Helen Yeung | HR (manager) | `hr_approver` | none | none | Approves **HR department leave** (Cathy, Daniel) through the bell inbox and Approvals; cannot file |
+| Eva Cheung | Finance | `finance_approver` | none | none | Approves **all claims** through the bell inbox and Approvals; cannot file |
 
 Every requester has exactly one approver per request type, stored per user (see [docs/limits-and-routing.md](docs/limits-and-routing.md)). Emails are `firstname.lastname@example.com`.
 
@@ -146,13 +148,17 @@ SQLite (WAL mode, foreign keys enforced) through SQLAlchemy, stored in the `api-
 
 Also seeded: external-submission records, notifications for the pending and decided requests, department claim limits, leave entitlements (annual 15 and sick 10 days for 2026 and 2027, with small variations) and 2 feedback rows. Every seeded record is fictional.
 
-**Upgrading from an earlier phase:** Phase 3 changed the database schema (departments, approvers, and the reviewer note is now optional), so an existing database must be recreated once: `docker compose down -v` (or the reset command below). The API detects an old database, keeps running, and logs this instruction. Rebuild the demo data at any time:
+**Upgrading from an earlier phase:** Phase 3 changed the database schema (departments, approvers, and the reviewer note is now optional), so an existing database must be recreated once: `docker compose down -v` (or the reset command below). The API detects an old database, keeps running, and logs this instruction. **Set the mock data back to the start at any time** (drops every table, reseeds the fictional data, and deletes uploaded files):
 
 ```bash
-docker compose exec api python -m app.cli seed --reset --yes   # drops and reseeds the database
+./scripts/reset-demo.sh                 # Docker stack (asks y/N; add --yes to skip the question)
+./scripts/reset-demo.sh local --yes     # local run without Docker
+# equivalent: docker compose exec api python -m app.cli reset-demo --yes
 ```
 
-**Request status flow** (enforced in the backend): `draft` → `pending_approval` (after confirmation and API submission) or `submission_failed` (retry allowed) → `approved` or `rejected`; `draft` and `submission_failed` can also be `cancelled`. Rejecting needs a reviewer note, and a reviewer cannot act on their own request. HR reviews Leave only; Finance reviews Claims only.
+If you start the stack with the local-AI override, pass it to the script: `COMPOSE_ARGS="-f docker-compose.yml -f docker-compose.ollama.yml" ./scripts/reset-demo.sh --yes`.
+
+**Request status flow** (enforced in the backend): `draft` → `pending_approval` (after confirmation and API submission) or `submission_failed` (retry allowed) → `approved` or `rejected`; `draft`, `submission_failed` and `pending_approval` can also be `cancelled` by the owner. The reviewer note is optional for both approve and reject, and a reviewer cannot act on their own request; only the assigned approver can decide a pending request. HR reviews Leave only; Finance reviews Claims only.
 
 **Half-day leave.** `leave_requests` has `start_day_part` and `end_day_part` (`full`, `am`, `pm`), and `working_days` is a decimal in 0.5 steps.
 
@@ -185,13 +191,14 @@ Tests run locally, not inside Docker. Docker Compose is only used to run and dem
 
 | What | Command | Where |
 | --- | --- | --- |
-| Backend unit tests (1,403, offline) | `cd backend && uv run pytest -q` | local |
+| Backend unit tests (1,482, offline) | `cd backend && uv run pytest -q` | local |
 | Backend lint | `cd backend && uv run ruff check . && uv run ruff format --check .` | local |
-| Frontend lint, types, unit tests (123) | `cd frontend && bun run lint && bun run typecheck && bun run test` | local |
+| Frontend lint, types, unit tests (141+) | `cd frontend && bun run lint && bun run typecheck && bun run test` | local |
+| End-to-end (Playwright, offline, fake AI): employee to approval, role denial, safe failures | `cd e2e && bun install && bun run test` (ports 9280/9281, system Chrome; see [e2e/README.md](e2e/README.md)) | local |
 | Full-stack smoke check | `docker compose -f docker-compose.yml -f docker-compose.ollama.yml up --build`, then open both URLs above | Docker |
 | Live AI check (opt-in) | `cd backend && RUN_LIVE_LLM=1 uv run python scripts/live_llm_smoke.py --provider ollama` (Gemini also needs `ALLOW_LIVE_GEMINI=1`) | local |
 
-Backend tests use in-memory or temporary SQLite databases, never read `.env`, and never call ReqRes or Gemini.
+Backend tests use in-memory or temporary SQLite databases, never read `.env`, and never call ReqRes, Gemini or Ollama. The E2E tests use the fake AI and the fake submission adapter only, and reseed the data before every test.
 
 ## Local development (without Docker)
 
