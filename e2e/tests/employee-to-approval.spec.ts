@@ -1,14 +1,98 @@
 import { test, expect } from '../support/fixtures'
 import { signInAs, signOut } from '../support/auth'
+import { apiAs, approvalQueue } from '../support/api'
 import { sendMessage, startNewChat } from '../support/chat'
 import { auditEvents } from '../support/db'
 import { futureLeaveRange, weekdayLabel } from '../support/dates'
+import { bell, expectBell, submitLeaveInChat } from '../support/flows'
 
 /**
  * E2E test 1: an employee files leave in the chat, the assigned HR approver approves it, and the
- * employee sees the decision. Fake LLM and fake submission adapter: fully offline.
+ * employee sees the decision. Two variants of the approver's step: through the bell inbox (the
+ * primary flow) and through the Approvals page. Fake LLM and fake submission adapter: fully offline.
  */
-test('employee files leave, HR approver approves, employee sees the decision', async ({ page, unexpectedErrors }) => {
+test('employee files leave, HR approver approves it in the bell inbox, employee sees the notice', async ({ page, unexpectedErrors }) => {
+  const { start, end } = futureLeaveRange(6)
+  const note = 'Approved through the inbox. Please hand over your open items.'
+
+  // --- Amy files the request ------------------------------------------------------------------
+  await signInAs(page, 'Amy Lau')
+  const requestId = await submitLeaveInChat(page, { start, end })
+  await signOut(page)
+
+  // --- Cathy: the bell shows the queue size and opens a new "Items to handle" conversation -----
+  const cathyApi = await apiAs('Cathy Ng')
+  const queue = await approvalQueue(cathyApi)
+  const seedLeaveId = queue.map(i => i.id).find(id => id !== requestId)! // the older seed item comes first
+  expect(queue.map(i => i.id)).toEqual([seedLeaveId, requestId])
+  await cathyApi.dispose()
+
+  await signInAs(page, 'Cathy Ng')
+  await expectBell(page, queue.length) // 1 seed item + the new request
+  await bell(page).click()
+
+  await expect(page.getByRole('heading', { name: `Items to handle (${queue.length})`, level: 1 })).toBeVisible()
+  const messages = page.getByRole('list', { name: 'Messages' })
+  await expect(messages.getByText(`You have ${queue.length} items to handle.`)).toBeVisible()
+
+  // Card 1 of 2 is the older seed request: skip it (it stays unread), then card 2 is the new one.
+  const first = page.getByRole('region', { name: new RegExp(`^Leave request #${seedLeaveId} from Amy Lau`) })
+  await expect(first).toBeVisible()
+  await expect(first).toContainText('Item 1 of 2')
+  await first.getByRole('button', { name: 'Skip', exact: true }).click()
+  await expect(messages.getByText(/Skipped leave request #\d+ from Amy Lau\./i)).toBeVisible()
+
+  const card = page.getByRole('region', { name: new RegExp(`^Leave request #${requestId} from Amy Lau`) })
+  await expect(card).toBeVisible()
+  await expect(card).toContainText('Item 2 of 2')
+  await expect(card.getByRole('region', { name: 'Limits' })).toContainText('Annual leave balance')
+  await expect(card.getByRole('region', { name: 'Request details' })).toContainText(weekdayLabel(start))
+  await card.getByLabel('Note for the employee (optional)').fill(note)
+  await card.getByRole('button', { name: 'Approve', exact: true }).click()
+  // Second explicit step; nothing was decided yet.
+  await expect(card.getByRole('button', { name: 'Confirm approve' })).toBeVisible()
+  await expect(card.getByRole('button', { name: 'Back' })).toBeVisible()
+  expect(auditEvents('leave_request', requestId).some(e => e.event_type === 'request.approved')).toBe(false)
+  await card.getByRole('button', { name: 'Confirm approve' }).click()
+
+  await expect(messages.getByText(`You approved leave request #${requestId} from Amy Lau.`)).toBeVisible()
+  await expect(messages.getByText('All done. You handled 1 item and skipped 1.')).toBeVisible()
+  // The number drops by one: the skipped seed item is still unread.
+  await expectBell(page, queue.length - 1)
+
+  // Audit: one approval, recorded as made through the inbox.
+  const approved = auditEvents('leave_request', requestId).filter(e => e.event_type === 'request.approved')
+  expect(approved).toHaveLength(1)
+  expect([approved[0]!.from_status, approved[0]!.to_status]).toEqual(['pending_approval', 'approved'])
+  expect(approved[0]!.metadata.via).toBe('inbox')
+  await signOut(page)
+
+  // --- Amy: her bell shows 1; the inbox holds one notice with the approval and the note --------
+  await signInAs(page, 'Amy Lau')
+  await expectBell(page, 1)
+  await bell(page).click()
+  await expect(page.getByRole('heading', { name: 'Items to handle (1)', level: 1 })).toBeVisible()
+  const notice = page.getByRole('region', { name: `Your leave request #${requestId} was approved` })
+  await expect(notice).toBeVisible()
+  await expect(notice).toContainText('Item 1 of 1')
+  await expect(notice).toContainText('Approved by Cathy Ng.')
+  await expect(notice).toContainText(note)
+  await notice.getByRole('button', { name: 'Got it', exact: true }).click()
+  await expect(messages.getByText('Got it. I marked that notice as read.')).toBeVisible()
+  await expect(messages.getByText('All done. You handled 1 item.')).toBeVisible()
+  await expectBell(page, 0)
+
+  // A second click: nothing left, no new conversation.
+  const conversations = page.getByRole('navigation', { name: 'Conversations' })
+  const before = await conversations.getByRole('button').count()
+  await bell(page).click()
+  await expect(page.getByRole('status').filter({ hasText: 'You are all caught up' })).toBeVisible()
+  await expect(conversations.getByRole('button')).toHaveCount(before)
+
+  expect(unexpectedErrors()).toEqual([])
+})
+
+test('employee files leave, HR approver approves it on the Approvals page, employee sees the decision', async ({ page, unexpectedErrors }) => {
   const { start, end, workingDays } = futureLeaveRange(6)
   const dates = `${weekdayLabel(start)} to ${weekdayLabel(end)}` // as the UI words it
   const note = 'Approved. Enjoy the break and please hand over your open items.'
@@ -74,9 +158,6 @@ test('employee files leave, HR approver approves, employee sees the decision', a
   await expect(rows.filter({ hasText: dates })).toHaveCount(0)
   await expect(rows).toHaveCount(1)
 
-  // TODO(bell-inbox): after the bell inbox is redone, add here the steps for Amy's notification
-  // ("Your leave request #<id> was approved" with the note) and for Cathy's "new request" one.
-
   await signOut(page)
 
   // --- Amy again: the status card shows Approved with the reviewer's note ---------------------
@@ -103,6 +184,7 @@ test('employee files leave, HR approver approves, employee sees the decision', a
   ])
   const approved = events.find(e => e.event_type === 'request.approved')!
   expect([approved.from_status, approved.to_status]).toEqual(['pending_approval', 'approved'])
+  expect(approved.metadata.via).not.toBe('inbox') // decided on the Approvals page, not in the inbox
 
   expect(unexpectedErrors()).toEqual([])
 })

@@ -13,12 +13,14 @@ import {
   formatDuration,
   isEmptyConversation,
   isNearBottom,
+  isRetryableWarning,
   MAX_MESSAGE_LENGTH,
   mergeMessages,
   optimisticMessage,
   remainingChars,
   reconcileCards,
   relativeTime,
+  restoreDraft,
   statusMeta,
   upsertConversation,
   warningMessage,
@@ -244,6 +246,28 @@ describe('error and warning messages', () => {
     expect(warningMessage('stale_card')).toBe('That card is out of date.')
     expect(warningMessage(null)).toBeNull()
     expect(warningMessage('something_new')).toMatch(/needs your attention/)
+  })
+})
+
+describe('Try again after an AI warning', () => {
+  it('offers a retry only for warnings where the AI could not answer', () => {
+    expect(isRetryableWarning('llm_unavailable')).toBe(true)
+    expect(isRetryableWarning('llm_invalid_output')).toBe(true)
+    expect(isRetryableWarning('submission_failed')).toBe(false)
+    expect(isRetryableWarning('stale_card')).toBe(false)
+    expect(isRetryableWarning(null)).toBe(false)
+    expect(isRetryableWarning(undefined)).toBe(false)
+  })
+
+  it('puts the failed message back into an empty composer', () => {
+    expect(restoreDraft('', 'annual leave next week')).toBe('annual leave next week')
+    expect(restoreDraft('   ', 'annual leave next week')).toBe('annual leave next week')
+  })
+
+  it('never overwrites text the user typed since, or restores nothing', () => {
+    expect(restoreDraft('something else', 'annual leave next week')).toBe('something else')
+    expect(restoreDraft('', null)).toBe('')
+    expect(restoreDraft('typed', null)).toBe('typed')
   })
 })
 

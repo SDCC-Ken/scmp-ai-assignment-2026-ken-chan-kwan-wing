@@ -51,6 +51,8 @@ export function useChat() {
 
   const error = ref<ChatError | null>(null)
   const warning = ref<string | null>(null)
+  /** Text of the message whose turn ended with an AI warning (llm_unavailable / llm_invalid_output); enables "Try again". */
+  const failedText = ref<string | null>(null)
   const notice = ref<string | null>(null)
 
   let tempSeq = 0
@@ -66,6 +68,7 @@ export function useChat() {
   function clearFeedback() {
     error.value = null
     warning.value = null
+    failedText.value = null
     notice.value = null
   }
 
@@ -282,6 +285,7 @@ export function useChat() {
       if (activeId.value !== conversationId) return
       messages.value = reconcileCards(applyTurn(messages.value, tempId, turn), { hasPendingCard: turn.conversation.has_pending_card })
       warning.value = warningMessage(turn.warning_code)
+      failedText.value = isRetryableWarning(turn.warning_code) ? content : null
     }
     catch (cause) {
       if (activeId.value !== conversationId) {
@@ -377,6 +381,20 @@ export function useChat() {
 
   function dismissWarning() {
     warning.value = null
+    failedText.value = null
+  }
+
+  /**
+   * "Try again" after an AI outage: the server already stored the failed message as a normal user bubble, so a real
+   * re-send would show it twice. Instead the text goes back into the (empty) composer, ready for one press of Send.
+   * Returns true when the warning had a message to restore.
+   */
+  function tryAgain(): boolean {
+    if (failedText.value === null) return false
+    draft.value = restoreDraft(draft.value, failedText.value)
+    warning.value = null
+    failedText.value = null
+    return true
   }
 
   function dismissNotice() {
@@ -416,6 +434,7 @@ export function useChat() {
     sendable,
     error,
     warning,
+    failedText,
     notice,
     init,
     newChat,
@@ -429,6 +448,7 @@ export function useChat() {
     inboxAction,
     retry,
     dismissWarning,
+    tryAgain,
     dismissNotice,
     dismissError,
   }

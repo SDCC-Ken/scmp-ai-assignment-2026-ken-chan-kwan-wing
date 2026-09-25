@@ -17,6 +17,7 @@ export const API_PORT = 9281
 export const WEB_URL = `http://localhost:${WEB_PORT}`
 export const API_URL = `http://localhost:${API_PORT}`
 
+export const SCREENSHOT_DIR = path.join(REPO_DIR, 'docs', 'screenshots')
 export const TMP_DIR = path.join(E2E_DIR, '.tmp') // wiped on every run
 export const DB_PATH = path.join(TMP_DIR, 'e2e.db')
 export const UPLOAD_DIR = path.join(TMP_DIR, 'uploads')

@@ -19,7 +19,7 @@ const meta = computed(() => outcomeMeta(props.card.outcome))
         </p>
         <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
           <StatusBadge :status="card.status" :label="card.status_label" />
-          <span v-if="card.external_reference_id">ReqRes reference: <span class="font-semibold">{{ card.external_reference_id }}</span></span>
+          <span v-if="card.external_reference_id">Reference: <span class="font-semibold">{{ card.external_reference_id }}</span></span>
         </div>
       </div>
     </div>

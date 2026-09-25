@@ -322,3 +322,17 @@ export function warningMessage(code: string | null | undefined): string | null {
   if (!code) return null
   return (WARNING_MESSAGES as Record<string, string | undefined>)[code] ?? 'Something needs your attention. Please try again.'
 }
+
+/** Warning codes where the AI could not answer this message, so sending it again is meaningful. */
+export function isRetryableWarning(code: string | null | undefined): boolean {
+  return code === 'llm_unavailable' || code === 'llm_invalid_output'
+}
+
+/**
+ * The draft after "Try again": the failed message goes back into the composer, unless the user has already typed
+ * something new there (never overwrite their text).
+ */
+export function restoreDraft(currentDraft: string, failedText: string | null): string {
+  if (failedText === null || currentDraft.trim() !== '') return currentDraft
+  return failedText
+}

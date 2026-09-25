@@ -67,11 +67,11 @@ questions). Contract: `../docs/chat-api-contract.md`.
   Pure helpers (status badges, relative time, message merge, card-state reconciliation, `canSend`, error mapping) live in
   `app/utils/chat.ts`; contract types in `app/types/chat.ts`; tests in `tests/chat.test.ts`.
 - **Rendering:** every message is plain text (no `v-html`). Cards come from `message.ui`: `ConfirmationCard` (Submit/Discard, diff for
-  `old_value`, amber warnings, read-only with a state badge once it is not `open`), `StatusCard`, `ResultCard`. Each assistant message
+  `old_value`, amber warnings, read-only with a state badge once it is not `open`), `StatusCard`, `ResultCard` (its reference line reads a neutral "Reference: ...", since the offline fake adapter also returns one). Each assistant message
   with a `trace` has a native `<details>` "How I understood this".
 - **Loading states:** "Thinking..." while a message is in flight; the confirming card shows "Submitting to ReqRes..." with both buttons disabled.
 - **Errors:** network failure keeps the text in the composer and shows an inline error with Retry; `warning_code` shows a dismissible
-  banner; a 409 on a card action reloads the conversation and shows "That card is out of date".
+  banner (for `llm_unavailable` / `llm_invalid_output` it also has **Try again**, which puts the failed message back in the composer and focuses it; the backend already stored it, so a real re-send would duplicate the bubble); a 409 on a card action reloads the conversation and shows "That card is out of date".
 - **Keyboard:** Enter sends (not while an IME is composing), Shift+Enter adds a line, Escape closes the drawer, all controls have focus rings.
 
 ### Trying the chat without the backend

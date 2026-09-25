@@ -55,6 +55,13 @@ async function onRemoveFile(id: string) {
   composer.value?.focus()
 }
 
+/** Puts the message that hit the AI outage back in the composer and focuses it. */
+async function onTryAgain() {
+  if (!chat.tryAgain()) return
+  await nextTick()
+  composer.value?.focus()
+}
+
 async function onCreate() {
   closeDrawer()
   await chat.newChat()
@@ -208,6 +215,14 @@ const composerUnavailable = computed(() => chat.initialising.value || chat.loadi
           <p class="min-w-0 flex-1">
             {{ chat.warning.value }}
           </p>
+          <button
+            v-if="chat.failedText.value !== null"
+            type="button"
+            class="focus-ring shrink-0 rounded-md border border-current px-2 py-0.5 text-xs font-semibold hover:bg-white/20"
+            @click="onTryAgain"
+          >
+            Try again
+          </button>
           <button type="button" class="focus-ring shrink-0 rounded-md p-0.5 hover:bg-white/20" @click="chat.dismissWarning()">
             <IconGlyph name="close" class="h-4 w-4" />
             <span class="sr-only">Dismiss warning</span>

@@ -10,11 +10,12 @@ ReqRes, and nothing from the repo `.env` can take effect (explicit variables ove
 
 | Spec | Scenario |
 | --- | --- |
-| `tests/employee-to-approval.spec.ts` | Amy Lau signs in (mock Google) and asks for annual leave in the chat; the confirmation card shows type, dates, working days and the balance line; Submit gives a "Pending approval" result that says it used the offline fake adapter, not ReqRes. Cathy Ng (assigned HR approver) opens Approvals, picks the new request by its dates, sees the limits panel and team-overlap section, adds a note, approves in the confirmation dialog, and the item leaves her list. Amy asks "what is the status of my requests?" and the status card shows Approved with the note. The audit table holds exactly one `request.approved` event for it. |
-| `tests/role-denial.spec.ts` | Finance approver Eva cannot open or decide an assigned leave request; HR approver Cathy cannot open or decide a claim (UI shows "This request is no longer available" with no details; API 404 for GET and decision; the request stays pending, no approve/reject audit event; each queue holds only its own type). Employee Amy is bounced from `/approvals` and gets 403 from the API; HR manager Helen gets 404 for Amy's leave (not assigned to her). |
-| `tests/failure-retry.spec.ts` | Network failure on send (request aborted): inline error, typed text kept, Retry recovers, no uncaught page errors. HTTP 500 on send: same, server text never shown. LLM outage (test-only `[[llm-down]]` trigger of the fake LLM): warning banner and assistant message, earlier draft card still open and later submittable, composer usable, next message works. |
+| `tests/employee-to-approval.spec.ts` | **Inbox variant:** Amy Lau signs in (mock Google), asks for annual leave in the chat, the confirmation card shows type, dates, working days and the balance line, Submit gives a "Pending approval" result that says it used the offline fake adapter, not ReqRes. Cathy Ng (assigned HR approver) signs in: her bell shows a number equal to her queue size (the older seed request plus the new one); a bell click opens a NEW conversation "Items to handle (2)" with "Item 1 of 2" cards; she skips the seed item, adds a note to the new one, presses Approve, sees the second step ("Confirm approve" and "Back", nothing decided yet), confirms, and reads the closing message ("You handled 1 item and skipped 1"). Her bell number drops by one (the skipped item stays unread). The audit table has exactly one `request.approved` event with `via: inbox`. Amy signs in again: her bell shows 1, the bell opens "Items to handle (1)" with a notice card containing the approval and the note, "Got it" marks it read and the closing message appears, the bell badge is gone, and a second bell click shows "You are all caught up" without creating a conversation. **Approvals-page variant:** the same filing, but Cathy decides on the Approvals page (limits panel, team overlap, note, confirmation dialog); Amy's status card then shows Approved with the note; the audit has four events and the decision is not marked `via: inbox`. |
+| `tests/role-denial.spec.ts` | Finance approver Eva cannot open or decide an assigned leave request; HR approver Cathy cannot open or decide a claim (UI shows "This request is no longer available" with no details; API 404 for GET and decision; the request stays pending, no approve/reject audit event; each queue holds only its own type). Employee Amy is bounced from `/approvals` and gets 403 from the API; HR manager Helen gets 404 for Amy's leave (not assigned to her). **Inbox:** Eva's inbox holds only her claims and no leave item; Helen's only Daniel's leave; Cathy's only Amy's leave; Amy and Daniel have no unread notification (empty inbox, no conversation created); Ben has exactly two notices (rejected leave and rejected claim), matching the seed. A card of another user's inbox conversation cannot be read or acted on (Eva presents Cathy's conversation and card id: 404 for skip, approve and reject; the request stays pending, nothing audited; Cathy's own card still works). |
+| `tests/failure-retry.spec.ts` | Network failure on send (request aborted): inline error, typed text kept, Retry recovers, no uncaught page errors. HTTP 500 on send: same, server text never shown. LLM outage (test-only `[[llm-down]]` trigger of the fake LLM): warning banner and assistant message, earlier draft card still open and later submittable, composer usable; the banner offers **Try again** (next to Dismiss), which puts the failed message back in the composer and focuses it; the test edits the trigger out, sends, and the chat recovers; no page errors. |
+| `tests/screenshots.spec.ts` | Not part of `bun run test`: the five documentation screenshots, see below. |
 
-The bell inbox is not covered yet: `employee-to-approval.spec.ts` has a `TODO(bell-inbox)` marker where those steps belong.
+**What "Try again" does.** After an AI warning (`llm_unavailable` or `llm_invalid_output`) the banner shows **Try again**. The backend has already stored the failed message as a normal user bubble, so a real re-send would show it twice; instead the button puts that message text back into the (empty) composer, closes the banner, and focuses the composer, so one more press of Send retries. Text the user typed in the meantime is never overwritten. Attachments of the failed message are not re-attached (they stay on the stored message).
 
 ## Run
 
@@ -24,6 +25,7 @@ bun install
 bun run test            # headless
 bun run test:headed     # watch the browser
 bun run test:ui         # Playwright UI mode (pick, replay and time-travel tests)
+bun run screenshots     # rewrite the five PNGs in ../docs/screenshots (not part of `test`)
 bun run report          # open the HTML report of the last run
 bunx tsc --noEmit       # typecheck the test code
 ```
@@ -56,6 +58,22 @@ a frontend source file changed. Force a rebuild with `E2E_REBUILD=1 bun run test
 * Tests look ids up through the API (as an allowed user) and compute dates in the test (`support/dates.ts`:
   Tuesday-Wednesday ranges, six or more weeks ahead, never a Hong Kong public holiday and never clashing with the seed).
 * The only direct database access is a read-only `sqlite3 -readonly` query for the audit events (`support/db.ts`).
+
+## Documentation screenshots
+
+`bun run screenshots` runs `tests/screenshots.spec.ts` with `playwright.screenshots.config.ts` (same offline stack on 9280/9281,
+fixed 1280x800 viewport, light theme forced through the `theme-mode=light` cookie and a light colour scheme, fictional seed data,
+fake LLM). It waits for spinners and transitions to finish, then overwrites the same files in `docs/screenshots/`:
+
+| File | Shows |
+| --- | --- |
+| `01-mock-sign-in.png` | Login page with the MOCK warning and the six fictional accounts |
+| `02-employee-confirmation.png` | Amy's leave confirmation card with the balance info line |
+| `03-hr-approval.png` | Cathy's approval detail: limits panel, team overlap with Ben's approved leave, reviewer note |
+| `04-notification-bell.png` | Header with the bell badge (2) and the newly opened "Items to handle (2)" inbox conversation (Ben's notices) |
+| `05-ai-trace.png` | An assistant follow-up with "How I understood this" expanded (the trace steps) |
+
+The trace shows the offline fake LLM's rule names ("fake rules: ..."), which is accurate for this stack.
 
 ## Reports and traces
 

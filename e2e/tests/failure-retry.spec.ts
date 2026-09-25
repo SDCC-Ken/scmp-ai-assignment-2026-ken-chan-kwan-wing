@@ -1,6 +1,6 @@
 import { test, expect } from '../support/fixtures'
 import { signInAs } from '../support/auth'
-import { composer, sendMessage, startNewChat } from '../support/chat'
+import { composer, sendButton, sendMessage, startNewChat } from '../support/chat'
 import { futureLeaveRange, weekdayLabel } from '../support/dates'
 
 /**
@@ -99,13 +99,18 @@ test('LLM outage: banner, conversation and draft intact, chat keeps working', as
   // The composer stays usable.
   await expect(composer(page)).toBeEnabled()
 
-  // GAP (reported): the banner has only "Dismiss warning"; there is no "Try again" button and the
-  // message that hit the outage is not put back in the composer, so the user has to retype it.
-  await expect(banner.getByRole('button', { name: /retry|try again/i })).toHaveCount(0)
+  // The banner offers "Try again" next to Dismiss. It puts the message that hit the outage back in the
+  // composer (a real re-send would show the stored message twice) and focuses it; one press of Send follows.
+  await expect(banner.getByRole('button', { name: 'Dismiss warning' })).toBeVisible()
   await expect(composer(page)).toHaveValue('')
-
-  // Sending a normal message works again (the fake LLM is only down for the marker).
-  await sendMessage(page, 'what is the status of my requests?')
+  await banner.getByRole('button', { name: 'Try again' }).click()
+  await expect(banner).toHaveCount(0)
+  await expect(composer(page)).toHaveValue('please help [[llm-down]]')
+  await expect(composer(page)).toBeFocused()
+  // The fake LLM is only down for the trigger text: the test edits it out (as a person would when the
+  // service is back), and the very same conversation recovers.
+  await composer(page).fill('what is the status of my requests?')
+  await sendButton(page).click()
   await expect(page.getByRole('region', { name: 'Your requests' })).toBeVisible()
   await expect(banner).toHaveCount(0)
 

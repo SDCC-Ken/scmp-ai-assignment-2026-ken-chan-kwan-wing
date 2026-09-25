@@ -3,6 +3,7 @@ import { API_URL, WEB_URL } from './support/env.mjs'
 
 export default defineConfig({
   testDir: './tests',
+  testIgnore: 'screenshots.spec.ts', // documentation screenshots run only via `bun run screenshots`
   outputDir: './test-results',
   fullyParallel: false,
   workers: 1, // one shared API and database: tests run one after another

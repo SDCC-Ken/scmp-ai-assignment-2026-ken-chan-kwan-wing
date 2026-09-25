@@ -2,6 +2,8 @@ import { test, expect } from '../support/fixtures'
 import { apiAs, approvalQueue, type ApiClient } from '../support/api'
 import { signInAs } from '../support/auth'
 import { auditEvents } from '../support/db'
+import { bell, expectBell } from '../support/flows'
+import { openInbox, sweepInbox } from '../support/inbox'
 
 /**
  * E2E test 2: role and assignment boundaries, in the UI and in the API.
@@ -127,5 +129,94 @@ test.describe('role and assignment boundaries', () => {
     await assertStillPending(cathy, 'leave', leaveId)
 
     await Promise.all([cathy.dispose(), amy.dispose(), helen.dispose()])
+  })
+
+  test('bell inbox: each role sees only what belongs to them', async ({ page }) => {
+    // Helen (HR manager): only Daniel's leave. Eva (finance): only claims. No cross-over of data.
+    const eva = await apiAs('Eva Cheung')
+    const helen = await apiAs('Helen Yeung')
+    const cathy = await apiAs('Cathy Ng')
+
+    const evaQueue = await approvalQueue(eva)
+    const evaInbox = await sweepInbox(eva)
+    expect(evaInbox.title).toBe(`Items to handle (${evaQueue.length})`)
+    expect(evaInbox.cards).toHaveLength(evaQueue.length)
+    expect(evaInbox.cards.every(c => c.kind === 'approval' && c.request_type === 'claim')).toBe(true)
+    expect(evaInbox.cards.map(c => c.request_id).sort()).toEqual(evaQueue.map(i => i.id).sort())
+    expect(evaInbox.cards.some(c => /leave/i.test(c.title))).toBe(false)
+
+    const helenInbox = await sweepInbox(helen)
+    expect(helenInbox.cards).toHaveLength(1)
+    const [helenCard] = helenInbox.cards
+    expect(helenCard).toMatchObject({ kind: 'approval', request_type: 'leave' })
+    expect(helenCard!.title).toContain('Daniel Wong')
+    expect(helenCard!.title).not.toContain('Amy Lau')
+    expect(helenInbox.title).toBe('Items to handle (1)')
+
+    // Cathy (assigned to IT leave): Amy's leave only. Her own approved requests are already read: no notice.
+    const cathyInbox = await sweepInbox(cathy)
+    expect(cathyInbox.cards).toHaveLength(1)
+    expect(cathyInbox.cards[0]).toMatchObject({ kind: 'approval', request_type: 'leave' })
+    expect(cathyInbox.cards[0]!.title).toContain('Amy Lau')
+
+    // Seed truth for the requesters: Amy and Daniel have no unread notification (empty inbox, no conversation);
+    // Ben has exactly two notices (his rejected leave and his rejected claim).
+    for (const name of ['Amy Lau', 'Daniel Wong'] as const) {
+      const api = await apiAs(name)
+      const res = await api.post('/api/chat/inbox')
+      expect(res.status()).toBe(200)
+      expect(await res.json()).toMatchObject({ empty: true, unread_count: 0 })
+      expect((await api.json<{ items: unknown[] }>('/api/chat/conversations')).items.some(
+        (c: any) => String(c.title).startsWith('Items to handle'), // eslint-disable-line @typescript-eslint/no-explicit-any
+      )).toBe(false)
+      await api.dispose()
+    }
+    const ben = await apiAs('Ben Chow')
+    const benInbox = await sweepInbox(ben)
+    expect(benInbox.cards).toHaveLength(2)
+    expect(benInbox.cards.every(c => c.kind === 'notice')).toBe(true)
+    expect(benInbox.cards.map(c => c.title).sort()).toEqual([
+      expect.stringMatching(/^Your claim #\d+ was rejected$/),
+      expect.stringMatching(/^Your leave request #\d+ was rejected$/),
+    ])
+    await ben.dispose()
+
+    // UI: Eva's bell shows her two claims and the conversation contains no leave item; Amy's bell is empty.
+    await signInAs(page, 'Eva Cheung')
+    await expectBell(page, evaQueue.length)
+    await bell(page).click()
+    await expect(page.getByRole('heading', { name: `Items to handle (${evaQueue.length})`, level: 1 })).toBeVisible()
+    await expect(page.getByRole('region', { name: /^Claim #\d+ from /i })).toBeVisible()
+    await expect(page.getByRole('list', { name: 'Messages' })).not.toContainText(/leave request/i)
+
+    await Promise.all([eva.dispose(), helen.dispose(), cathy.dispose()])
+  })
+
+  test('bell inbox: a card from another user\'s conversation cannot be acted on', async () => {
+    const cathy = await apiAs('Cathy Ng')
+    const eva = await apiAs('Eva Cheung')
+    const leaveId = await pendingLeaveOf(cathy, 'Amy Lau')
+    const { conversationId, card } = await openInbox(cathy)
+    expect(card).toMatchObject({ kind: 'approval', request_type: 'leave', request_id: leaveId })
+
+    // Eva presents Cathy's conversation and card: 404 (the same answer as "does not exist"), for every action.
+    const readOther = await eva.get(`/api/chat/conversations/${conversationId}`)
+    expect(readOther.status()).toBe(404)
+    for (const body of [
+      { card_id: card.card_id, action: 'skip' },
+      { card_id: card.card_id, action: 'approve', note: 'not mine', confirmed: true },
+      { card_id: card.card_id, action: 'reject', note: 'not mine', confirmed: true },
+    ]) {
+      const res = await eva.post(`/api/chat/conversations/${conversationId}/actions`, body)
+      expect(res.status(), JSON.stringify(body)).toBe(404)
+    }
+    // Nothing changed: the request is still pending and no decision was audited.
+    await assertStillPending(cathy, 'leave', leaveId)
+    expect(auditEvents('leave_request', leaveId).filter(e => /^request\.(approved|rejected)$/.test(e.event_type))).toEqual([])
+    // Cathy's own card is still open and works.
+    const skip = await cathy.post(`/api/chat/conversations/${conversationId}/actions`, { card_id: card.card_id, action: 'skip' })
+    expect(skip.status()).toBe(200)
+
+    await Promise.all([cathy.dispose(), eva.dispose()])
   })
 })
