@@ -1,0 +1,7 @@
+# Local-only AI: use the Ollama on this machine and never call Gemini.
+#   docker compose -f docker-compose.yml -f docker-compose.ollama.yml up --build
+services:
+  api:
+    environment:
+      LLM_PROVIDER: ollama
+      LLM_FALLBACK_PROVIDER: ""

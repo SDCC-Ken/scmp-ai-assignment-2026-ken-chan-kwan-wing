@@ -309,7 +309,7 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
 - **Agent result:** Gemini and Fake providers, ReqRes and fake adapters, factories, document-aware prompts and fake fixtures, four fictional sample documents, and (later, partly finished) Ollama provider, fallback wrapper and PDF renderer. Live checks: 1 of 12 Gemini cases completed before the free quota ran out (429) after 503 "high demand" errors, although the agent ran the smoke script four times against an instruction to run it once; two live ReqRes POSTs returned 201.
 - **Human review / changes requested:** The agent was cut off by the account session limit while running the live Ollama comparison. The Ollama provider, fallback, PDF renderer and factory existed without tests. The integrator's live check of `qwen2.5:7b` then found it dropped explicit fields, so a follow-up agent was launched (Entry 18).
 - **Verification commands and results:** the agent reported 181 tests passing in `tests/llm` and `tests/integrations` before the Ollama work; the whole suite was 599 passing and ruff clean when the integrator re-ran it after the interruption.
-- **Commit:** pending (backend commit).
+- **Commit:** `0d2e238` feat(backend): add LLM providers (Gemini, Ollama, fake) and the ReqRes adapter.
 
 ## Entry 15 - Phase 2 chat engine and business rules (backend sub-agent B2)
 
@@ -326,7 +326,7 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
 - **Agent result:** LangGraph pipeline in `app/agent/graph.py`, `app/chat/*` (policy, validation, state, cards, actions), additive migrator, chat routes, new state transition `pending_approval` -> `cancelled` for the owner, and 3,395 lines of chat tests. The agent was cut off by the account session limit while updating tests for Ken's rule decisions and before writing the two documents.
 - **Human review / changes requested:** The integrator confirmed the single-date question and the past-leave rule were already implemented and tested, then wrote `docs/business-rules.md` and `docs/test-cases.md` from the code and verified by script that every cited test exists.
 - **Verification commands and results (integrator):** `uv run pytest -q` 599 passed; `ruff check` and `ruff format --check` clean (before the later agents began editing).
-- **Commit:** pending (backend commit).
+- **Commit:** `11480f6` feat(backend): add chat engine, attachments, documents and Phase 3 organisation data.
 
 ## Entry 16 - Phase 2 chat UI and attachment upload UI (frontend sub-agent)
 
@@ -363,8 +363,97 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
 - **Allowed scope:** live experiments only (no code committed from them); two new sub-agents with separate file ownership.
 - **Agent result:** The integrator ran live tests of the local models on five text cases. `qwen2.5:7b` always returned valid JSON but skipped fields such as leave type; `llama3.1:8b` was more accurate on the leave type but returned invalid JSON on 2 of 5 cases (about 60 s each); `gemma3:12b` failed most cases and took over 100 s. A flat schema with a compact prompt scored 9 of 12 on `qwen2.5:7b`; the remaining failures were a cold-model timeout, the one-day reply and "next Monday" date arithmetic. Two sub-agents were then launched: one to finish the Ollama provider (flat schema, calendar table, tests, live comparison, smoke script) and one to build attachment storage and the upload/download API.
 - **Human review / changes requested:** Ken asked for delegation to small agents rather than the integrator continuing the work.
-- **Verification commands and results:** pending the two agents' reports.
-- **Commit:** pending.
+- **Verification commands and results:** see Entries 19 and 20.
+- **Commit:** see Entries 19 and 20.
+
+## Entry 19 - Finish the local Ollama provider (backend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 2c. Finish the local Ollama LLM provider and its fallback (a previous agent was cut off). Fix small-model accuracy (flat schema, compact prompt, calendar table),
+  write the missing tests, make the smoke script provider-agnostic. No Gemini calls. Follow-ups from Ken: gemma4:latest (not bigger) is acceptable; then "no need to compare,
+  select one": both defaults are gemma4:latest for text and vision.
+  ```
+- **Allowed scope:** `backend/app/llm/*`, `backend/tests/llm`, `backend/scripts`, `backend/samples`.
+- **Agent result:** flat schema and a ~2.5 KB prompt with a Python-computed calendar, backend-resolved date and type hints, output guards (bare `$` means HKD, numeric-string ids), documents read as a transcribe-then-extract step, a fix for transparent PNGs (composited onto white without Pillow), long first-call timeouts, and `live_llm_smoke.py` (Gemini needs an extra opt-in). Live run with `gemma4:latest`: 23 of 23 cases (19 text, 4 documents), typical text turn 1.4 to 2.7 s, documents 6 to 8 s. Earlier runs: `qwen2.5:7b` 18 of 19 text; `llama3.1:8b` 19 of 19 text but 2 of 4 documents wrong; `gemma3:12b` slow and misread the blurry image.
+- **Human review / changes requested:** Ken decided the model (no further comparison). Known limits reported: handwriting and real photographs untested; the offline fake provider fails two smoke cases.
+- **Verification commands and results:** `uv run pytest -q tests/llm tests/integrations` 323 passed; the whole suite 1088 passed at that point; ruff clean.
+- **Commit:** `0d2e238`.
+
+## Entry 20 - Attachment storage and upload API (backend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 2b storage. Employees upload an image or PDF to a conversation; store on disk safely (real signature check, 5 MB streamed limit, random names, no path tricks);
+  a message can reference staged uploads; download for the owner and, once linked to a submitted request, the approver role that reviews it; conversation title and
+  Message.attachments; link attachments at confirm.
+  ```
+- **Allowed scope:** `backend/app/services/attachments.py`, `app/api/routes/attachments.py`, models, chat plumbing, `tests/attachments`.
+- **Agent result:** 137 new tests. Deviations reported: the upload is parsed with the low-level multipart parser (not `UploadFile`) so the size limit stops the read early; approvers can open a file only while the linked request is pending, approved or rejected; every invalid attachment id gives the same 422; one new dependency (`python-multipart`).
+- **Human review / changes requested:** none; the later org agent also required the approver to be the assigned one.
+- **Verification commands and results:** full suite 736 passed at that point; smoke on port 9199 (upload, streamed 413, 415, permissions, download headers, other users 404).
+- **Commit:** `11480f6`.
+
+## Entry 21 - Documents in the chat flow (backend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 2b documents. When a user attaches an image or PDF, read it through the provider, work out leave (sick note) or claim (receipt), fill the draft, tag document-sourced
+  fields, ask in text for anything missing or unreadable, warn on a name mismatch, keep typed values over document values, link attachments at Confirm; text inside documents is data.
+  ```
+- **Allowed scope:** `backend/app/agent/graph.py`, `backend/app/chat/*`, chat schemas, chat tests, docs appendices.
+- **Agent result:** new `app/chat/documents.py`, a `documents` graph node and trace step, card `source` tags and `attachments`, 66 new tests, business rules D-01 to D-15. Deviations reported: the `documents` trace step is new (contract updated by the integrator); rationale is left out of the trace when files are attached.
+- **Human review / changes requested:** the integrator noticed a bare `$` would be treated as non-HKD; assigned to Entry 25.
+- **Verification commands and results:** the agent reported 1059 passed with ruff clean.
+- **Commit:** `11480f6`.
+
+## Entry 22 - Phase 3 organisation data, routing, balances and limits (backend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 3-A per docs/phase3-approval-design.md: departments, per-user leave/claim approvers, leave entitlements, department claim limits, balance/budget/team-overlap services,
+  six-user seed with showcase pending items, optional reviewer note (remove the DB check), schema-version check with a clear reset message, the requester gate by can_request,
+  /api/me/balances, and CLI commands (set-entitlement, set-claim-limit, set-approvers, show-org) with docs/limits-and-routing.md.
+  ```
+- **Allowed scope:** `backend/app/db`, `seed.py`, `cli.py`, `domain`, new services and schemas, auth, `chat/actions.py` (routing only), tests, two docs.
+- **Agent result:** six users (Amy, Ben, Daniel employees; Cathy, Helen HR approvers; Eva Finance approver), IT/HR/Finance departments (limits 60,000 / 30,000 / 30,000), entitlements 15/10 days (Ben annual 18, Daniel sick 12), routing (Amy and Ben to Cathy; Cathy and Daniel to Helen; all claims to Eva; Helen and Eva have none). Showcase items: Amy's leave overlaps Ben's approved leave; Daniel's leave exceeds his annual balance; Daniel's HKD 9,800 claim pushes HR over its limit. Deviations reported: `require_roles` special-cases `employee` (the chat routers were off limits); `main.py` skips auto-seed on an old schema; `can_download` also requires the assigned approver.
+- **Human review / changes requested:** the no-approver refusal only happens at Confirm; moved to the start of a request in Entry 25.
+- **Verification commands and results:** the agent and the integrator re-ran `uv run pytest -q` (1105 passed), ruff check and format clean; smoke on port 9199 (Cathy's `/me` and `/me/balances`, Eva's 403).
+- **Commit:** `11480f6` (code), `4ae5480` (docs).
+
+## Entry 23 - Phase 3 frontend: approvals, bell and role-aware navigation (frontend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 3-F. Six-user login card with department and title; header tabs and route guards by can_request / approves; approvals list (pending only) and detail (limit or budget bars,
+  over-limit warning, team overlap, attachments, optional note, confirmation dialog); notification bell for every user with 30 s polling; chat balance card and info lines; extend the stub.
+  ```
+- **Allowed scope:** `frontend/` only.
+- **Agent result:** new pages (`/approvals`, `/approvals/[type]/[id]`, `/no-access`), 12 components, composables and utilities, 53 new tests. Deviation reported: users with neither capability go to `/no-access` (redirecting to `/login` would loop).
+- **Human review / changes requested:** integrator re-ran the checks; not yet tested against the real backend APIs (the approvals and notifications endpoints are still being built).
+- **Verification commands and results:** `bun run lint` clean; `bun run typecheck` clean; `bun run test` 123 passed; `bun run build` complete.
+- **Commit:** `dbb2ffb`.
+
+## Entry 24 - Phase 2 test round for Ken (integrator)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`).
+- **Actual prompt:** Ken: test Phase 2, give some text to test with, then continue with sub-agents.
+- **Allowed scope:** running the stack; no code changes.
+- **Agent result:** added `docker-compose.ollama.yml` (local-only AI without editing `.env`), reset the database (`docker compose down -v`, needed by the Phase 3 schema) and rebuilt. Live checks: a text leave request became a card in about 3 s; the claim flow and reply worked; the sick-note PDF was read in about 10 s (Sick, 24 to 25 Sep, fields tagged from the document). Earlier, one full submission to the real reqres.in returned 201 (reference 247) and the database showed the body sent had exactly `email, leave_type, start_date, end_date`, the day parts and working days kept in SQLite, and the expected audit events. Found: "Claim HKD 180 for a taxi" with no date silently filled today's date instead of asking.
+- **Human review / changes requested:** Ken received a test script (leave, one-day question, rules, claims, status/change/cancel, safety, documents).
+- **Verification commands and results:** described above.
+- **Commit:** `docker-compose.ollama.yml` is committed in the next docs commit.
 
 ## Entry template
 
