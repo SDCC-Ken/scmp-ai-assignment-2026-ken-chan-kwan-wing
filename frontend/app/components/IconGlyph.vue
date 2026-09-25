@@ -1,5 +1,5 @@
 <script setup lang="ts">
-type GlyphName = IconName | 'plus' | 'menu' | 'send' | 'info' | 'chevron' | 'close' | 'spinner' | 'chat' | 'down' | 'paperclip' | 'file' | 'image'
+type GlyphName = IconName | 'plus' | 'menu' | 'send' | 'info' | 'chevron' | 'close' | 'spinner' | 'chat' | 'down' | 'paperclip' | 'file' | 'image' | 'bell' | 'users' | 'refresh' | 'back' | 'inbox'
 
 defineProps<{ name: GlyphName }>()
 </script>
@@ -41,5 +41,18 @@ defineProps<{ name: GlyphName }>()
       <rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="9" cy="10" r="1.5" /><path d="M21 16l-5-5-8 8" />
     </template>
     <path v-else-if="name === 'spinner'" d="M21 12a9 9 0 1 1-6.2-8.55" />
+    <template v-else-if="name === 'bell'">
+      <path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 7.5 2.5 7.5h-17S6 15 6 9z" /><path d="M10 20a2 2 0 0 0 4 0" />
+    </template>
+    <template v-else-if="name === 'users'">
+      <circle cx="9" cy="8" r="3.2" /><path d="M2.5 20a6.5 6.5 0 0 1 13 0" /><circle cx="17.5" cy="9" r="2.5" /><path d="M17 14.2a5.2 5.2 0 0 1 4.5 5.8" />
+    </template>
+    <template v-else-if="name === 'refresh'">
+      <path d="M20 12a8 8 0 1 1-2.6-5.9" /><path d="M20 4v5h-5" />
+    </template>
+    <path v-else-if="name === 'back'" d="M15 6l-6 6 6 6" />
+    <template v-else-if="name === 'inbox'">
+      <path d="M4 13l2.5-8h11L20 13v6H4z" /><path d="M4 13h5l1 2h4l1-2h5" />
+    </template>
   </svg>
 </template>

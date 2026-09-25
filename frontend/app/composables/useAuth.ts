@@ -53,6 +53,7 @@ export function useAuth() {
   function clearSession(message: string | null = null) {
     user.value = null
     notice.value = message
+    withContext(() => clearNuxtState([...USER_SCOPED_STATE_KEYS]))
   }
 
   async function listMockUsers(): Promise<AuthUser[]> {
@@ -66,12 +67,14 @@ export function useAuth() {
       body: { email },
       timeout: 8000,
     })
-    if (!isAuthUser(data.user)) throw new Error('Malformed login response')
-    user.value = data.user
+    const signedIn = normalizeUser(data.user)
+    if (!signedIn) throw new Error('Malformed login response')
+    withContext(() => clearNuxtState([...USER_SCOPED_STATE_KEYS])) // nothing of a previous account survives
+    user.value = signedIn
     notice.value = null
     checked.value = true
-    await withContext(() => navigateTo('/'))
-    return data.user
+    await withContext(() => navigateTo(homePath(signedIn)))
+    return signedIn
   }
 
   /**
@@ -87,9 +90,10 @@ export function useAuth() {
     const hadSession = user.value !== null || hasSessionCookie(ssrCookie)
     try {
       const me = await request<unknown>('/api/auth/me', { timeout: 8000 })
-      if (!isAuthUser(me)) throw new Error('Malformed /me response')
-      user.value = me
-      return me
+      const current = normalizeUser(me)
+      if (!current) throw new Error('Malformed /me response')
+      user.value = current
+      return current
     }
     catch (error) {
       const status = extractStatus(error)

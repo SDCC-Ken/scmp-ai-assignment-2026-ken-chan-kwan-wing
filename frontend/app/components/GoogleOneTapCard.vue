@@ -133,7 +133,7 @@ defineExpose({ focus: () => root.value?.focus() })
         No mock accounts are available. Check that the backend has seeded its fictional users.
       </p>
 
-      <div v-else class="mt-1 space-y-2.5">
+      <div v-else class="mt-1 space-y-2">
         <section v-for="group in groups" :key="group.role" :aria-labelledby="`one-tap-group-${group.role}`">
           <h3 :id="`one-tap-group-${group.role}`" class="text-[11px] font-semibold uppercase tracking-wide opacity-90">
             {{ group.label }}
@@ -154,10 +154,13 @@ defineExpose({ focus: () => root.value?.focus() })
                   aria-hidden="true"
                 >{{ getInitials(u.display_name, u.email) }}</span>
                 <span class="min-w-0 flex-1">
-                  <span class="block truncate text-sm font-medium leading-tight">{{ u.display_name }}</span>
-                  <span class="block truncate text-xs opacity-90">{{ u.email }}</span>
-                  <span class="mt-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
-                    <RoleBadge :role="u.role" />
+                  <span class="flex items-center justify-between gap-x-2">
+                    <span class="block min-w-0 truncate text-sm font-medium leading-tight">{{ u.display_name }}</span>
+                    <RoleBadge :role="u.role" class="shrink-0" />
+                  </span>
+                  <span v-if="userSubtitle(u)" class="mt-0.5 block truncate text-xs font-medium leading-tight">{{ userSubtitle(u) }}</span>
+                  <span class="block truncate text-xs leading-tight opacity-90">{{ u.email }}</span>
+                  <span class="mt-0.5 flex items-center justify-end gap-x-2">
                     <span v-if="signingInEmail === u.email" class="flex items-center gap-1 text-xs font-semibold">
                       <svg class="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                         <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" opacity="0.25" />

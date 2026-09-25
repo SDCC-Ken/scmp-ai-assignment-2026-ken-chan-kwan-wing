@@ -54,6 +54,7 @@ defineEmits<{ action: [cardId: string, decision: 'confirm' | 'discard'] }>()
       />
       <StatusCard v-else-if="message.ui.type === 'status_card'" :card="message.ui" />
       <ResultCard v-else-if="message.ui.type === 'result_card'" :card="message.ui" />
+      <BalanceCard v-else-if="message.ui.type === 'balance_card'" :card="message.ui" />
     </div>
     <TraceDisclosure v-if="message.trace && message.trace.length" :steps="message.trace" />
     <p class="mt-0.5 px-1 text-xs opacity-80">

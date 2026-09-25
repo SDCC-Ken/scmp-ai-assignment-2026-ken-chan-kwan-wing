@@ -2,11 +2,20 @@
 
 export type Role = 'employee' | 'hr_approver' | 'finance_approver'
 
+/** Which approval queue a user decides (Phase 3): HR approvers decide Leave, the Finance approver decides Claims. */
+export type ApprovalScope = 'leave' | 'claim'
+
 export interface AuthUser {
   id: number
   email: string
   display_name: string
   role: Role
+  /** Phase 3 fields; an older API may omit them (see `normalizeUser`). */
+  department: { id: number, name: string } | null
+  job_title: string | null
+  /** Has an approver configured: may use the chat. */
+  can_request: boolean
+  approves: ApprovalScope | null
 }
 
 /** Body of POST /api/auth/mock-google/login. The session JWT is NOT in the body: it travels only in the httpOnly cookie. */
@@ -54,7 +63,7 @@ export interface RoleCapabilities {
   items: readonly string[]
 }
 
-/** Product scope from AGENTS.md; every item ships in a later phase. */
+/** Product scope from AGENTS.md (reference only; the screens are role-aware via `app/utils/access.ts`). */
 export const ROLE_CAPABILITIES: Readonly<Record<Role, RoleCapabilities>> = {
   employee: {
     summary: 'Submit your own requests and follow their status.',
@@ -90,6 +99,7 @@ export function roleLabel(role: unknown): string {
   return isRole(role) ? ROLE_LABELS[role] : 'Unknown role'
 }
 
+/** True when the base fields (the Phase 1 shape) are present and valid; the Phase 3 fields are optional here. */
 export function isAuthUser(value: unknown): value is AuthUser {
   if (typeof value !== 'object' || value === null) return false
   const v = value as Record<string, unknown>
@@ -99,9 +109,39 @@ export function isAuthUser(value: unknown): value is AuthUser {
     && isRole(v.role)
 }
 
-/** Keeps only well-formed users from an untrusted API payload. */
+/**
+ * Turns an untrusted user payload into an `AuthUser`, or null when the base fields are malformed. The Phase 3
+ * fields are tolerated when missing (older API): department/job_title/approves become null, can_request false.
+ */
+export function normalizeUser(value: unknown): AuthUser | null {
+  if (!isAuthUser(value)) return null
+  const v = value as unknown as Record<string, unknown>
+  const dept = v.department as Record<string, unknown> | null | undefined
+  const department = dept && typeof dept === 'object' && typeof dept.id === 'number' && typeof dept.name === 'string'
+    ? { id: dept.id, name: dept.name }
+    : null
+  const jobTitle = typeof v.job_title === 'string' && v.job_title.trim() ? v.job_title.trim() : null
+  return {
+    id: v.id as number,
+    email: v.email as string,
+    display_name: v.display_name as string,
+    role: v.role as Role,
+    department,
+    job_title: jobTitle,
+    can_request: v.can_request === true,
+    approves: v.approves === 'leave' || v.approves === 'claim' ? v.approves : null,
+  }
+}
+
+/** Keeps only well-formed users from an untrusted API payload (new fields defaulted when absent). */
 export function parseMockUsers(payload: unknown): AuthUser[] {
-  return Array.isArray(payload) ? payload.filter(isAuthUser) : []
+  if (!Array.isArray(payload)) return []
+  return payload.map(normalizeUser).filter((u): u is AuthUser => u !== null)
+}
+
+/** "Job title · Department" for the account chooser; empty when neither is known. */
+export function userSubtitle(user: Pick<AuthUser, 'job_title' | 'department'>): string {
+  return [user.job_title, user.department?.name].filter(Boolean).join(' · ')
 }
 
 export interface RoleGroup {

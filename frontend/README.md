@@ -6,7 +6,7 @@ Runs on port 9180 (`WEB_PORT`). Env is read from the repo-root `../.env` if pres
 - `bun run dev` - dev server at http://localhost:9180
 - `bun run lint` / `bun run lint:fix` - ESLint (`@nuxt/eslint`)
 - `bun run typecheck` - `nuxt typecheck` (vue-tsc)
-- `bun run test` - Vitest (theme, auth, chat and attachment utils, offline)
+- `bun run test` - Vitest (theme, auth, access, approvals, notifications, chat and attachment utils, offline)
 - `bun run build` then `bun run preview` (or `node .output/server/index.mjs` with `NITRO_PORT=9180`)
 
 ## Mock Google sign-in (Phase 1)
@@ -57,9 +57,9 @@ curl -X POST localhost:9181/__stub/reset
 
 ## Employee chat (Phase 2)
 
-Route `/` for the `employee` role is one chat workspace (`ChatWorkspace`): conversation list on the left (a slide-over
-drawer below 768px), message thread and composer on the right. HR and Finance approvers keep the "what you can do" panel;
-the chat API answers 403 for them, so the chat is never rendered for them. Contract: `../docs/chat-api-contract.md`.
+Route `/` for users with `can_request` is one chat workspace (`ChatWorkspace`): conversation list on the left (a slide-over
+drawer below 768px), message thread and composer on the right. Users without `can_request` (Helen, Eva) never see the chat: the
+route rules send them to `/approvals` (the chat API would answer 403). Contract: `../docs/chat-api-contract.md`.
 
 - **State and calls:** `app/composables/useChat.ts` (all requests go through `useApi`: cookie, `X-Requested-With` on POSTs, 401 sign-out).
   Pure helpers (status badges, relative time, message merge, card-state reconciliation, `canSend`, error mapping) live in
@@ -113,3 +113,75 @@ file name: "sick" or "medical" asks once for the last day of rest, then shows a 
 "receipt" shows a claim card with a name-mismatch warning; "blurry" asks the user to type the details; any other file asks what to do with it.
 A name containing "flaky" fails once with 500 (exercise Retry), "reject" answers 415. `STUB_UPLOAD_DELAY_MS` (default 700) and
 `STUB_TURN_DELAY_MS` (default 900) keep the spinners visible.
+
+
+## Phase 3: role-aware screens, approvals and the notification bell
+
+Contract: `../docs/phase3-approval-design.md` (sections 1 to 5). The user object now carries `department {id,name}|null`,
+`job_title|null`, `can_request` and `approves` (`"leave"|"claim"|null`); a missing field (older API) is read as null / false
+(`normalizeUser` in `app/utils/auth.ts`).
+
+### Who sees what
+
+| Account (stub) | Role | `can_request` | `approves` | Header tabs | Lands on |
+| --- | --- | --- | --- | --- | --- |
+| Amy Lau, Ben Chow (IT), Daniel Wong (HR) | employee | yes | - | My requests | `/` (chat) |
+| Cathy Ng (HR) | hr_approver | yes | leave | My requests, Approvals | `/` |
+| Helen Yeung (HR manager) | hr_approver | no | leave | Approvals | `/approvals` |
+| Eva Cheung (Finance) | finance_approver | no | claim | Approvals | `/approvals` |
+
+Route rules are pure functions in `app/utils/access.ts` (`routeRedirect`, `homePath`, `navTabs`), used by the global middleware
+`app/middleware/auth.global.ts`: `/` needs `can_request` (else redirect to `/approvals`), `/approvals*` needs `approves` (else
+back to `/`), and a user with neither capability lands on `/no-access` (a friendly page with the header, so they can sign out; it
+is used instead of `/login` because `/login` sends signed-in users home and would loop). The mock account chooser shows job title
+and department under each name and scrolls inside the viewport (max height) so six accounts stay tidy, also at 360px.
+
+### Screens
+
+- **`/approvals`** - heading by scope ("Leave approvals" / "Claim approvals"); cards from `GET /api/approvals` (oldest first): employee,
+  department, summary, submitted time, and flags "Over limit" (amber, icon), "N on leave in the team", "Has attachment". Empty state
+  "Nothing waiting for you", loading, error with Retry, manual Refresh. Each card is one link to the detail (stretched link).
+- **`/approvals/[type]/[id]`** - header (employee, department, status), amber `warnings`, request fields, attachments (reuses
+  `AttachmentItem`/`AttachmentPreview`: image thumbnails and preview dialog, PDF opens in a new tab), a **Limits** panel
+  (`ApprovalLimits`: leave balance lines or department budget with currency formatting, a labelled stacked bar (`LimitBar`,
+  role="img" with the numbers in its label) and an over-limit notice; "No balance applies to personal or unpaid leave" when
+  `leave_balance` is null), "Team on leave at the same time" (or "Nobody else in the team is on leave then"), and a **Reviewer note**
+  textarea (max 500 characters with a counter, "Note for the employee (optional)"). **Approve** / **Reject** open a native-`<dialog>`
+  confirmation (`role="alertdialog"`, focus starts on Cancel, Escape cancels, focus returns to the button) that summarises employee,
+  request, decision and note and repeats the over-limit warning; while posting everything is disabled ("Approving..."). Body:
+  `{"decision","note"}` with the note trimmed and empty sent as `null`. Success -> back to the list with a success notice (the item is
+  gone); 409 -> "This request was already decided or changed. The list was reloaded."; 404 -> "This request is no longer available";
+  other errors inline with Retry.
+- **Notification bell** (`NotificationBell`, every signed-in user) - button with an unread badge (99+ cap), a polite live region with
+  the count, and an accessible name that includes it. The popover is a non-modal `role="dialog"` (focus moves in, Escape and click
+  outside close it and Escape returns focus to the bell, a route change closes it). Items show title, body (2 lines), relative time
+  and an unread dot with visually-hidden "Unread". Clicking marks the item read (optimistic, rolled back on error) and either
+  navigates to `link` (approvers) or opens a small dialog with the full title, body and time (requesters). "Mark all as read" calls
+  `POST /api/notifications/read-all`. Everything is rendered as text, never HTML, and only in-app `link` paths are followed.
+- **Polling** - one poll in `AppHeader` (`usePolling`): every 30 s and when the window regains focus, paused while the tab is hidden,
+  never overlapping and never twice within 5 s. It refreshes the bell and, for approvers, the queue that feeds the Approvals tab
+  badge and the list page (`useApprovalQueue`). A failed background poll keeps what is on screen. User-scoped state is cleared on
+  sign-in and sign-out (`USER_SCOPED_STATE_KEYS`).
+- **Chat additions** - `balance_card` messages (`BalanceCard`: leave type, entitled, approved, pending, remaining, with a bar), optional
+  `info: [{label, value, tone}]` lines on confirmation cards above the buttons (plain strings are tolerated; `warning` is amber with an
+  icon), the trace label for the `documents` step ("Read attached documents") with a readable fallback for unknown step names.
+
+Code: pure helpers in `app/utils/{access,approvals,notifications,polling,chatExtras}.ts`, types in `app/types/{approvals,notifications}.ts`,
+tests in `tests/{access,approvals,notifications,chat-additions}.test.ts`.
+
+### Stub scenarios (Phase 3)
+
+`scripts/mock-api-stub.ts` (ports 9190/9191 in the commands above) now serves the six users, `GET /api/approvals`,
+`GET/POST /api/approvals/{type}/{id}[/decision]`, `GET /api/notifications`, `POST /api/notifications/{id}/read`,
+`POST /api/notifications/read-all` and `GET /api/me/balances`, with the design's 403/404/409 rules.
+
+- **Cathy** (leave, IT staff): leave #12 from Amy, annual, 5 days, **over the balance by 2 days**, team overlap with Ben (one approved, one pending).
+- **Helen** (leave, HR staff): sick leave #14 from Daniel with a **PDF certificate**, within balance, nobody else away.
+- **Eva** (claims): claim #9 from Amy, HKD 246.50, **over the IT budget**, with a receipt **image**.
+- 20 s after an approver first looks (list or bell), one more item appears for them with a notification (Cathy: leave #15 from Ben; Helen: leave
+  #16 from Cathy; Eva: claim #10 from Daniel). `STUB_NEW_ITEM_AFTER_MS` changes the delay.
+- A decision moves the item out of the list and gives the requester a notification that includes the note; a second decision answers 409. To
+  see the 409 path in the UI: open a detail, then `curl -X POST "localhost:9191/__stub/decide?type=leave&id=12&decision=approve"`, then press Approve.
+- Notifications: Amy 1 unread (a rejection with a note), Ben 1 unread, Cathy 2 unread (one approver link, one requester message), Helen 1,
+  Eva 1, Daniel none (empty bell). `POST /__stub/reset` re-seeds everything.
+- Chat: "how many annual leave days do I have left?" -> `balance_card`; the leave card carries an info line and a warning line.

@@ -22,7 +22,7 @@ defineProps<{ steps: TraceStep[] }>()
           <span class="sr-only">{{ step.ok ? 'Succeeded' : 'Failed' }}</span>
         </span>
         <span class="min-w-0 flex-1">
-          <span class="block text-xs font-semibold">{{ step.label }}</span>
+          <span class="block text-xs font-semibold">{{ traceStepLabel(step) }}</span>
           <span v-if="step.detail" class="chat-text block text-xs opacity-90">{{ step.detail }}</span>
         </span>
         <span class="shrink-0 text-xs tabular-nums opacity-90">{{ formatDuration(step.duration_ms) }}</span>

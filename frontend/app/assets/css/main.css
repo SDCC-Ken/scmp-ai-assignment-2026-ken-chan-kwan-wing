@@ -329,3 +329,89 @@ body {
 .border-danger {
   border-color: var(--tone-red-bd);
 }
+
+/* ---- Phase 3: dialogs, limit bars, bell ----------------------------------------------------- */
+.modal-dialog::backdrop {
+  background-color: rgb(2 6 23 / 70%);
+}
+
+/* Limit bar: a track with stacked segments (approved, this request, other pending) and a limit marker. */
+.limit-track {
+  position: relative;
+  display: flex;
+  height: 0.75rem;
+  overflow: hidden;
+  border-radius: 9999px;
+  border: 1px solid var(--theme-secondary);
+  background-color: color-mix(in srgb, var(--theme-secondary) 12%, transparent);
+}
+
+.limit-seg-approved {
+  background-color: var(--theme-secondary);
+}
+
+.limit-seg-requested {
+  background-color: var(--tone-amber-bd);
+  min-width: 4px; /* stays visible when it is a sliver of a large budget */
+}
+
+.limit-seg-requested.is-over {
+  background-color: var(--tone-red-bd);
+}
+
+.limit-seg-pending {
+  background-image: repeating-linear-gradient(45deg, var(--theme-secondary) 0 3px, transparent 3px 6px);
+  opacity: 0.55;
+}
+
+.limit-marker {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background-color: var(--theme-secondary);
+  box-shadow: 0 0 0 1px var(--theme-background);
+}
+
+.limit-swatch {
+  display: inline-block;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 0.2rem;
+  border: 1px solid var(--theme-secondary);
+  vertical-align: -1px;
+}
+
+.bell-badge {
+  background-color: #b91c1c;
+  color: #ffffff;
+}
+
+.unread-dot {
+  display: inline-block;
+  width: 0.625rem;
+  height: 0.625rem;
+  flex-shrink: 0;
+  border-radius: 9999px;
+  background-color: #b91c1c;
+}
+
+:root[data-theme="dark"] .bell-badge,
+:root[data-theme="dark"] .unread-dot {
+  background-color: #f87171;
+}
+
+:root[data-theme="dark"] .bell-badge {
+  color: #450a0a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .bell-badge,
+  :root:not([data-theme="light"]) .unread-dot {
+    background-color: #f87171;
+  }
+
+  :root:not([data-theme="light"]) .bell-badge {
+    color: #450a0a;
+  }
+}

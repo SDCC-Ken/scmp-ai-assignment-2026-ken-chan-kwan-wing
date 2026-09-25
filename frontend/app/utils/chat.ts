@@ -255,6 +255,9 @@ export function announcementFor(message: Message): string {
   else if (message.ui?.type === 'result_card') {
     parts.push(message.ui.message)
   }
+  else if (message.ui?.type === 'balance_card') {
+    parts.push(`Leave balance for ${message.ui.year}: ${message.ui.lines.length} leave type(s) shown.`)
+  }
   return parts.filter(Boolean).join(' ')
 }
 

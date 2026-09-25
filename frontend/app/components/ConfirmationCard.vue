@@ -13,6 +13,7 @@ defineEmits<{ action: [cardId: string, decision: 'confirm' | 'discard'] }>()
 const isOpen = computed(() => props.card.state === 'open')
 const stateMeta = computed(() => cardStateMeta(props.card.state))
 const disabled = computed(() => props.locked || props.pending !== null)
+const infoLines = computed(() => normalizeInfoLines(props.card.info))
 const titleId = computed(() => `card-title-${props.card.card_id}`)
 </script>
 
@@ -85,6 +86,18 @@ const titleId = computed(() => `card-title-${props.card.card_id}`)
       <IconGlyph name="alert" class="mt-0.5 h-4 w-4 shrink-0" />
       <span class="chat-text"><span class="font-semibold">Note: </span>{{ warning }}</span>
     </div>
+
+    <ul v-if="infoLines.length" class="mt-2 space-y-1.5" aria-label="More information">
+      <li
+        v-for="(line, index) in infoLines"
+        :key="index"
+        class="flex items-start gap-2 rounded-lg px-2.5 py-2 text-xs"
+        :class="toneClass(line.tone === 'warning' ? 'amber' : 'grey')"
+      >
+        <IconGlyph :name="line.tone === 'warning' ? 'alert' : 'info'" class="mt-0.5 h-4 w-4 shrink-0" />
+        <span class="chat-text"><span v-if="line.label" class="font-semibold">{{ line.label }}: </span>{{ line.value }}</span>
+      </li>
+    </ul>
 
     <template v-if="isOpen">
       <div class="mt-3 flex flex-wrap items-center gap-2">

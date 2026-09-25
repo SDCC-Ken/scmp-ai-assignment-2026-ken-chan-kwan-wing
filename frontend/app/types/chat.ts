@@ -16,7 +16,8 @@ export interface ConversationSummary {
   updated_at: string
 }
 
-export type TraceStepKey = 'understand' | 'merge' | 'validate' | 'decide' | 'submit' | 'status' | 'respond'
+/** `(string & {})` keeps autocomplete for the known steps while tolerating names added by a newer backend. */
+export type TraceStepKey = 'understand' | 'documents' | 'merge' | 'validate' | 'decide' | 'submit' | 'status' | 'respond' | (string & {})
 
 export interface TraceStep {
   step: TraceStepKey
@@ -49,6 +50,14 @@ export interface CardField {
   source?: 'document' | null
 }
 
+/** A line of context on a confirmation card (Phase 3), for example the leave balance. A plain string is tolerated. */
+export type InfoTone = 'info' | 'warning'
+export interface InfoLine {
+  label: string
+  value: string
+  tone: InfoTone
+}
+
 export interface ConfirmationCardData {
   type: 'confirmation_card'
   card_id: string
@@ -60,6 +69,8 @@ export interface ConfirmationCardData {
   warnings: string[]
   state: CardState
   confirm_label: string
+  /** Extra context lines (Phase 3): shown above the buttons. Objects per the design doc; plain strings are tolerated. */
+  info?: (InfoLine | string)[] | null
   /** Documents that will be linked to the request (Phase 2b). */
   attachments?: AttachmentInfo[]
 }
@@ -97,7 +108,22 @@ export interface ResultCardData {
   external_reference_id: string | null
 }
 
-export type MessageUi = ConfirmationCardData | StatusCardData | ResultCardData
+/** One leave type's balance for a year (days in 0.5 steps). */
+export interface BalanceLine {
+  leave_type: string
+  entitled_days: number
+  approved_days: number
+  pending_days: number
+  remaining_days: number
+}
+
+export interface BalanceCardData {
+  type: 'balance_card'
+  year: number
+  lines: BalanceLine[]
+}
+
+export type MessageUi = ConfirmationCardData | StatusCardData | ResultCardData | BalanceCardData
 
 export interface Message {
   id: number

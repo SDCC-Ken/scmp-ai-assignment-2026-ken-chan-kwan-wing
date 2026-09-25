@@ -10,7 +10,7 @@
  *   Every POST/PUT/PATCH/DELETE needs `X-Requested-With: XMLHttpRequest` (else 403 "CSRF check failed").
  *   CORS: explicit allowed origin + Access-Control-Allow-Credentials: true (credentials are used, so no "*").
  *
- * Chat endpoints (Phase 2, see docs/chat-api-contract.md; employees only, approvers get 403). A SCRIPTED flow, no LLM:
+ * Chat endpoints (Phase 2, see docs/chat-api-contract.md; users with can_request only, others get 403). A SCRIPTED flow, no LLM:
  *   text with "leave"   -> asks once for the end date; the next text -> confirmation_card (+ trace)
  *   text with "claim"/"taxi" -> confirmation_card for a claim;  "change"/"update" -> update card with a diff
  *   text with "cancel"  -> cancel card;  "yes"/"ok" while a card is open -> reminder to press the button
@@ -25,13 +25,26 @@
  *   Message turns take STUB_TURN_DELAY_MS (default 900) and POST /actions confirm 1.5 s, so the loading states are visible.
  *   Data lives in memory only (reset by /__stub/reset or a restart).
  *
+ * Phase 3 (see docs/phase3-approval-design.md, section 5). Six users: Amy Lau, Ben Chow (IT employees), Cathy Ng (HR approver for
+ *   leave AND a requester), Daniel Wong (HR employee), Helen Yeung (HR manager, approves leave, no chat), Eva Cheung (Finance,
+ *   approves claims, no chat). The chat needs `can_request`; /api/approvals* needs `approves` (else 403); the request must be assigned
+ *   to the caller and pending (else 404; a second decision answers 409).
+ *   GET  /api/approvals, GET /api/approvals/{type}/{id}, POST /api/approvals/{type}/{id}/decision {decision, note}
+ *   GET  /api/notifications?limit=20, POST /api/notifications/{id}/read, POST /api/notifications/read-all, GET /api/me/balances
+ *   Seeded pending items: leave #12 (Amy, over the annual balance, team overlap with Ben) -> Cathy; sick leave #14 (Daniel, PDF
+ *   certificate) -> Helen; claim #9 (Amy, over the IT budget, receipt image) -> Eva. 20 s after an approver's first list or
+ *   notification call one more item appears for them (with a notification). A decision creates a notification for the requester.
+ *   Chat: "how many annual leave days do I have left?" -> balance_card; leave cards carry `info` lines (one with tone warning).
+ *
  * Extra dev endpoints (no CSRF header needed, so they work with plain curl):
  *   POST /__stub/expire  -> every later /api/auth/me returns 401 (cookie stays in the browser)
- *   POST /__stub/reset   -> clears that flag, the logout counter and all chat data
+ *   POST /__stub/reset   -> clears that flag, the logout counter, all chat data, and re-seeds requests and notifications
+ *   POST /__stub/decide?type=leave&id=12&decision=approve -> decide a request "elsewhere" (to see the 409 path in the UI)
  *   GET  /__stub/state   -> { expired, logouts }
  */
 import { Buffer } from 'node:buffer'
 import { createServer } from 'node:http'
+import { deflateSync } from 'node:zlib'
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { IncomingMessage } from 'node:http'
 import process from 'node:process'
@@ -45,12 +58,29 @@ const UPLOAD_DELAY_MS = Number(process.env.STUB_UPLOAD_DELAY_MS ?? 700)
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf']
 
-const USERS = [
-  { id: 1, email: 'amy.lau@example.com', display_name: 'Amy Lau', role: 'employee' },
-  { id: 2, email: 'ben.wong@example.com', display_name: 'Ben Wong', role: 'employee' },
-  { id: 3, email: 'chloe.cheung@example.com', display_name: 'Chloe Cheung', role: 'employee' },
-  { id: 4, email: 'henry.ho@example.com', display_name: 'Henry Ho', role: 'hr_approver' },
-  { id: 5, email: 'fiona.fung@example.com', display_name: 'Fiona Fung', role: 'finance_approver' },
+type Role = 'employee' | 'hr_approver' | 'finance_approver'
+interface StubUser {
+  id: number
+  email: string
+  display_name: string
+  role: Role
+  department: { id: number, name: string }
+  job_title: string
+  can_request: boolean
+  approves: 'leave' | 'claim' | null
+}
+
+const IT = { id: 1, name: 'IT' }
+const HR = { id: 2, name: 'HR' }
+const FINANCE = { id: 3, name: 'Finance' }
+
+const USERS: StubUser[] = [
+  { id: 1, email: 'amy.lau@example.com', display_name: 'Amy Lau', role: 'employee', department: IT, job_title: 'Senior Software Engineer', can_request: true, approves: null },
+  { id: 2, email: 'ben.chow@example.com', display_name: 'Ben Chow', role: 'employee', department: IT, job_title: 'Frontend Developer', can_request: true, approves: null },
+  { id: 3, email: 'cathy.ng@example.com', display_name: 'Cathy Ng', role: 'hr_approver', department: HR, job_title: 'HR Business Partner (IT)', can_request: true, approves: 'leave' },
+  { id: 4, email: 'daniel.wong@example.com', display_name: 'Daniel Wong', role: 'employee', department: HR, job_title: 'HR Coordinator', can_request: true, approves: null },
+  { id: 5, email: 'helen.yeung@example.com', display_name: 'Helen Yeung', role: 'hr_approver', department: HR, job_title: 'HR Manager', can_request: false, approves: 'leave' },
+  { id: 6, email: 'eva.cheung@example.com', display_name: 'Eva Cheung', role: 'finance_approver', department: FINANCE, job_title: 'Finance Manager', can_request: false, approves: 'claim' },
 ]
 
 let expired = false
@@ -149,7 +179,9 @@ function makeCard(c: StubConversation, kind: 'leave' | 'claim' | 'update' | 'can
   c.has_pending_card = true
   c.active_request_type = kind === 'claim' || kind === 'docclaim' ? 'claim' : 'leave'
   if (kind === 'docleave') {
-    return { ...base, action: 'create', request_type: 'leave', request_id: null, title: 'Confirm leave application', confirm_label: 'Submit', fields: [
+    return { ...base, action: 'create', request_type: 'leave', request_id: null, title: 'Confirm leave application', confirm_label: 'Submit',
+      info: [{ label: 'Sick leave balance 2026', value: '10 days, 1 used, 9 left; 6 left after this request (pending requests not counted)', tone: 'info' }],
+      fields: [
       { key: 'employee_email', label: 'Employee', value: c.owner, old_value: null },
       { key: 'leave_type', label: 'Leave type', value: 'Sick', old_value: null, source: 'document' },
       { key: 'start_date', label: 'Start date', value: 'Mon 2026-09-21', old_value: null, source: 'document' },
@@ -184,7 +216,12 @@ function makeCard(c: StubConversation, kind: 'leave' | 'claim' | 'update' | 'can
       { key: 'summary', label: 'Request', value: 'Annual leave, Mon 2026-10-05 to Wed 2026-10-07', old_value: null },
     ] }
   }
-  return { ...base, action: 'create', request_type: 'leave', request_id: null, title: 'Confirm leave application', confirm_label: 'Submit', fields: [
+  return { ...base, action: 'create', request_type: 'leave', request_id: null, title: 'Confirm leave application', confirm_label: 'Submit',
+    info: [
+      { label: 'Annual leave balance 2026', value: '15 days, 3 used, 12 left; 10 left after this request (pending requests not counted)', tone: 'info' },
+      { label: 'Heads-up', value: 'Ben Chow is also on leave on Tue 2026-10-06. Your approver will decide.', tone: 'warning' },
+    ],
+    fields: [
     { key: 'employee_email', label: 'Employee', value: c.owner, old_value: null },
     { key: 'leave_type', label: 'Leave type', value: 'Annual', old_value: null },
     { key: 'start_date', label: 'Start date', value: 'Mon 2026-10-05', old_value: null },
@@ -215,22 +252,32 @@ function handleText(c: StubConversation, text: string, attachments: Json[] = [])
       trace(step('understand', 'Intent detected', 'check_status (confidence 0.97)'), step('status', 'Looked up your requests', '3 found'), step('respond', 'Wrote the answer', 'status card')))
     return warning
   }
+  if (!attachments.length && !c.awaitingEnd && !c.awaitingDocEnd && (has('balance', 'how many') || (has('left') && has('leave')))) {
+    push(c, 'assistant', 'Here is your leave balance for 2026.', {
+      type: 'balance_card', year: 2026,
+      lines: [
+        { leave_type: 'annual', entitled_days: 15, approved_days: 3, pending_days: 2.5, remaining_days: 12 },
+        { leave_type: 'sick', entitled_days: 10, approved_days: 1, pending_days: 0, remaining_days: 9 },
+      ],
+    }, trace(step('understand', 'Intent detected', 'check_balance (confidence 0.96)'), step('status', 'Looked up your balance', 'annual, sick'), step('respond', 'Wrote the answer', 'balance card')))
+    return warning
+  }
   if (attachments.length) {
     if (names.includes('blurry')) {
       push(c, 'assistant', 'I could not read that document clearly. Could you type the details instead, for example the type of leave and the dates, or the claim type, amount and receipt date?', null,
-        trace(step('understand', 'Read the attachment', 'blurry-scan: text not legible', false, 2100), step('decide', 'Next step', 'ask the user to type the details')))
+        trace(step('documents', 'Read attached documents', 'blurry-scan: text not legible', false, 2100), step('decide', 'Next step', 'ask the user to type the details')))
       return warning
     }
     if (names.includes('sick') || names.includes('medical')) {
       c.awaitingDocEnd = attachments
       c.active_request_type = 'leave'
       push(c, 'assistant', 'I read your medical certificate: sick leave starting Monday 2026-09-21. I could not find the last day of rest on the certificate. What is the last day of your leave?', null,
-        trace(step('understand', 'Read the attachment', 'medical certificate (confidence 0.9)', true, 1900), step('merge', 'Collected from the document', 'leave_type, start_date'), step('validate', 'Missing fields', 'end_date', false), step('decide', 'Next step', 'ask a follow-up question')))
+        trace(step('documents', 'Read attached documents', 'medical certificate (confidence 0.9)', true, 1900), step('merge', 'Collected from the document', 'leave_type, start_date'), step('validate', 'Missing fields', 'end_date', false), step('decide', 'Next step', 'ask a follow-up question')))
       return warning
     }
     if (names.includes('receipt')) {
       push(c, 'assistant', 'I read your receipt. Please check the details below and confirm.', makeCard(c, 'docclaim', attachments),
-        trace(step('understand', 'Read the attachment', 'receipt: total, date, merchant', true, 1700), step('validate', 'Compared with your name', 'name on the receipt differs', false), step('decide', 'Next step', 'ask for confirmation')))
+        trace(step('documents', 'Read attached documents', 'receipt: total, date, merchant', true, 1700), step('validate', 'Compared with your name', 'name on the receipt differs', false), step('decide', 'Next step', 'ask for confirmation')))
       return warning
     }
     push(c, 'assistant', 'I received the file. What would you like to do with it: apply for leave or submit a staff claim?', null,
@@ -361,7 +408,7 @@ function handleChat(req: IncomingMessage, path: string, send: Send): boolean {
   const user = expired ? undefined : userFromCookie(req.headers.cookie)
   if (!user) return send(401, { detail: 'Not authenticated' }), true
   if (download) {
-    const file = attachmentStore.find(a => a.id === Number(download[1]) && a.owner === user.email)
+    const file = attachmentStore.find(a => a.id === Number(download[1]) && (a.owner === user.email || approverMaySee(user, a.id)))
     if (!file || req.method !== 'GET') return send(404, { detail: 'Not found' }), true
     return send(200, file.bytes, {
       'content-type': file.content_type,
@@ -370,7 +417,7 @@ function handleChat(req: IncomingMessage, path: string, send: Send): boolean {
       'cache-control': 'private, no-store',
     }), true
   }
-  if (user.role !== 'employee') return send(403, { detail: 'Forbidden' }), true
+  if (!user.can_request) return send(403, { detail: 'Forbidden' }), true
 
   const own = () => conversations.filter(c => c.owner === user.email).sort((a, b) => b.id - a.id)
   const method = req.method
@@ -466,6 +513,341 @@ function handleChat(req: IncomingMessage, path: string, send: Send): boolean {
   return send(405, { detail: 'Method not allowed' }), true
 }
 
+/* ---- Phase 3: approvals, notifications, balances (in memory, re-seeded by /__stub/reset) -------------------------- */
+
+interface StubRequest {
+  type: 'leave' | 'claim'
+  id: number
+  employeeId: number
+  approverId: number
+  status: 'pending_approval' | 'approved' | 'rejected'
+  submitted_at: string
+  summary: string
+  fields: { key: string, label: string, value: string }[]
+  attachmentIds: number[]
+  external_reference_id: string
+  limits: Json
+  team_overlap: Json[]
+  warnings: string[]
+  over_limit: boolean
+  reviewer_note: string | null
+  reviewed_at: string | null
+}
+
+interface StubNotification {
+  id: number
+  userId: number
+  event_type: string
+  title: string
+  body: string
+  request_type: 'leave' | 'claim' | null
+  request_id: number | null
+  read_at: string | null
+  created_at: string
+  link: string | null
+}
+
+const requests: StubRequest[] = []
+const notifications: StubNotification[] = []
+const firstSeen = new Map<string, number>()
+const injected = new Set<string>()
+let notificationSeq = 0
+const NEW_ITEM_AFTER_MS = Number(process.env.STUB_NEW_ITEM_AFTER_MS ?? 20_000)
+
+const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString()
+const userById = (id: number) => USERS.find(u => u.id === id)!
+const employeeOf = (r: StubRequest) => {
+  const u = userById(r.employeeId)
+  return { id: u.id, display_name: u.display_name, department: u.department.name }
+}
+
+/** A tiny PNG "receipt" (drawn with zlib + a hand-made CRC) and a one-page PDF certificate, so thumbnails and the PDF tab work. */
+function crc32(buf: Buffer): number {
+  let c = ~0
+  for (const byte of buf) {
+    c ^= byte
+    for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xEDB88320 : c >>> 1
+  }
+  return ~c >>> 0
+}
+
+function makePng(width: number, height: number): Buffer {
+  const chunk = (type: string, data: Buffer) => {
+    const head = Buffer.alloc(4)
+    head.writeUInt32BE(data.length)
+    const body = Buffer.concat([Buffer.from(type), data])
+    const tail = Buffer.alloc(4)
+    tail.writeUInt32BE(crc32(body))
+    return Buffer.concat([head, body, tail])
+  }
+  const rows: Buffer[] = []
+  for (let y = 0; y < height; y++) {
+    const row = Buffer.alloc(1 + width * 3, 0xFF)
+    row[0] = 0
+    const line = y > 24 && y < height - 16 && y % 14 < 3
+    const banner = y < 20
+    for (let x = 0; x < width; x++) {
+      const inside = x > 16 && x < width - 16
+      const value = banner ? [30, 64, 175] : line && inside ? [148, 163, 184] : [255, 255, 255]
+      row[1 + x * 3] = value[0]!
+      row[2 + x * 3] = value[1]!
+      row[3 + x * 3] = value[2]!
+    }
+    rows.push(row)
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8
+  ihdr[9] = 2
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(Buffer.concat(rows))), chunk('IEND', Buffer.alloc(0))])
+}
+
+function makePdf(text: string): Buffer {
+  const stream = `BT /F1 16 Tf 30 130 Td (${text}) Tj 0 -24 Td (Fictional demo document) Tj ET`
+  const objects = [
+    '<</Type/Catalog/Pages 2 0 R>>',
+    '<</Type/Pages/Kids[3 0 R]/Count 1>>',
+    '<</Type/Page/Parent 2 0 R/MediaBox[0 0 320 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>',
+    `<</Length ${stream.length}>>\nstream\n${stream}\nendstream`,
+    '<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>',
+  ]
+  let out = '%PDF-1.4\n'
+  const offsets: number[] = []
+  objects.forEach((body, i) => {
+    offsets.push(out.length)
+    out += `${i + 1} 0 obj\n${body}\nendobj\n`
+  })
+  const xref = out.length
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map(o => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}`
+  out += `trailer\n<</Size ${objects.length + 1}/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF\n`
+  return Buffer.from(out)
+}
+
+const SEED_PDF_ID = 901
+const SEED_PNG_ID = 902
+
+function seedAttachments() {
+  const seeds: [number, string, string, string, Buffer][] = [
+    [SEED_PDF_ID, 'daniel.wong@example.com', 'clinic-medical-certificate.pdf', 'application/pdf', makePdf('Medical certificate: 2 days rest')],
+    [SEED_PNG_ID, 'amy.lau@example.com', 'team-dinner-receipt.png', 'image/png', makePng(240, 160)],
+  ]
+  for (const [id, owner, filename, type, bytes] of seeds) {
+    if (!attachmentStore.some(a => a.id === id)) {
+      attachmentStore.push({ id, owner, conversationId: 0, filename, content_type: type, bytes, created_at: ago(60), used: true })
+    }
+  }
+}
+
+function approverMaySee(user: StubUser, attachmentId: number): boolean {
+  return requests.some(r => r.approverId === user.id && r.attachmentIds.includes(attachmentId))
+}
+
+function notify(userId: number, eventType: string, title: string, body: string, request: StubRequest | null, link: string | null, read = false, createdAgo = 0) {
+  notifications.push({
+    id: ++notificationSeq, userId, event_type: eventType, title, body,
+    request_type: request?.type ?? null, request_id: request?.id ?? null,
+    read_at: read ? ago(createdAgo) : null, created_at: ago(createdAgo), link,
+  })
+}
+
+function seedRequests() {
+  requests.length = 0
+  notifications.length = 0
+  notificationSeq = 0
+  firstSeen.clear()
+  injected.clear()
+
+  const leave12: StubRequest = {
+    type: 'leave', id: 12, employeeId: 1, approverId: 3, status: 'pending_approval', submitted_at: ago(2 * 24 * 60),
+    summary: 'Annual leave, Mon 2026-10-12 to Fri 2026-10-16 (5 working days)',
+    fields: [
+      { key: 'leave_type', label: 'Leave type', value: 'Annual' },
+      { key: 'start_date', label: 'Start date', value: 'Mon 2026-10-12' },
+      { key: 'end_date', label: 'End date', value: 'Fri 2026-10-16' },
+      { key: 'working_days', label: 'Working days', value: '5' },
+    ],
+    attachmentIds: [], external_reference_id: '531',
+    limits: { leave_balance: { leave_type: 'annual', year: 2026, entitled_days: 15, approved_days: 12, pending_other_days: 0, requested_days: 5, remaining_after_days: -2, over_limit: true }, department_budget: null },
+    team_overlap: [
+      { employee: 'Ben Chow', leave_type: 'annual', start_date: '2026-10-14', end_date: '2026-10-15', status: 'approved', working_days: 2 },
+      { employee: 'Ben Chow', leave_type: 'personal', start_date: '2026-10-16', end_date: '2026-10-16', status: 'pending_approval', working_days: 1 },
+    ],
+    warnings: ['Over the annual leave balance by 2 days. You decide.'],
+    over_limit: true, reviewer_note: null, reviewed_at: null,
+  }
+  const leave14: StubRequest = {
+    type: 'leave', id: 14, employeeId: 4, approverId: 5, status: 'pending_approval', submitted_at: ago(6 * 60),
+    summary: 'Sick leave, Thu 2026-09-24 to Fri 2026-09-25 (2 working days)',
+    fields: [
+      { key: 'leave_type', label: 'Leave type', value: 'Sick' },
+      { key: 'start_date', label: 'Start date', value: 'Thu 2026-09-24' },
+      { key: 'end_date', label: 'End date', value: 'Fri 2026-09-25' },
+      { key: 'working_days', label: 'Working days', value: '2' },
+    ],
+    attachmentIds: [SEED_PDF_ID], external_reference_id: '540',
+    limits: { leave_balance: { leave_type: 'sick', year: 2026, entitled_days: 10, approved_days: 1, pending_other_days: 0, requested_days: 2, remaining_after_days: 7, over_limit: false }, department_budget: null },
+    team_overlap: [], warnings: [], over_limit: false, reviewer_note: null, reviewed_at: null,
+  }
+  const claim9: StubRequest = {
+    type: 'claim', id: 9, employeeId: 1, approverId: 6, status: 'pending_approval', submitted_at: ago(26 * 60),
+    summary: 'Meals claim, HKD 246.50, receipt 2026-09-23',
+    fields: [
+      { key: 'claim_type', label: 'Claim type', value: 'Meals' },
+      { key: 'amount', label: 'Amount', value: 'HKD 246.50' },
+      { key: 'receipt_date', label: 'Receipt date', value: 'Wed 2026-09-23' },
+    ],
+    attachmentIds: [SEED_PNG_ID], external_reference_id: '533',
+    limits: { leave_balance: null, department_budget: { department: 'IT', year: 2026, limit_amount: '60000.00', approved_amount: '59900.00', pending_other_amount: '300.00', requested_amount: '246.50', remaining_after_amount: '-146.50', over_limit: true, currency: 'HKD' } },
+    team_overlap: [], warnings: ['Over the IT department claim limit by HKD 146.50. You decide.'],
+    over_limit: true, reviewer_note: null, reviewed_at: null,
+  }
+  requests.push(leave12, leave14, claim9)
+
+  notify(3, 'request.submitted', 'New leave request from Amy Lau', leave12.summary, leave12, '/approvals/leave/12', false, 2 * 24 * 60)
+  notify(3, 'request.approved', 'Your leave request #3 was approved', 'Annual leave, Mon 2026-08-03 to Tue 2026-08-04. Note from Helen Yeung: "Enjoy the break."', null, null, false, 5 * 60)
+  notify(5, 'request.submitted', 'New leave request from Daniel Wong', leave14.summary, leave14, '/approvals/leave/14', false, 6 * 60)
+  notify(6, 'request.submitted', 'New claim from Amy Lau', claim9.summary, claim9, '/approvals/claim/9', false, 26 * 60)
+  notify(6, 'request.submitted', 'New claim from Ben Chow', 'Transport claim, HKD 95.00, receipt 2026-09-18', null, null, true, 5 * 24 * 60)
+  notify(1, 'request.rejected', 'Your leave request #5 was rejected', 'Sick leave, 2026-09-08. Note from Cathy Ng: "Please attach a medical certificate and resubmit."', null, null, false, 90)
+  notify(1, 'request.approved', 'Your claim #8 was approved', 'Transport claim, HKD 95.00, receipt 2026-09-18', null, null, true, 3 * 24 * 60)
+  notify(2, 'request.approved', 'Your leave request #7 was approved', 'Annual leave, Mon 2026-09-14 to Tue 2026-09-15. Note from Cathy Ng: "Approved, have a good trip."', null, null, false, 30)
+  // Daniel (4) has none on purpose: the bell's empty state.
+}
+
+const leaveFields = (type: string, start: string, end: string, days: number) => [
+  { key: 'leave_type', label: 'Leave type', value: type },
+  { key: 'start_date', label: 'Start date', value: start },
+  { key: 'end_date', label: 'End date', value: end },
+  { key: 'working_days', label: 'Working days', value: String(days) },
+]
+
+/** 20 s after an approver first looks, one more request lands in their queue (with a notification). */
+function tick(user: StubUser) {
+  if (!user.approves) return
+  if (!firstSeen.has(user.email)) firstSeen.set(user.email, Date.now())
+  if (injected.has(user.email) || Date.now() - firstSeen.get(user.email)! < NEW_ITEM_AFTER_MS) return
+  injected.add(user.email)
+  const now = iso()
+  const none = { attachmentIds: [] as number[], reviewer_note: null, reviewed_at: null, team_overlap: [] as Json[], warnings: [] as string[], over_limit: false, status: 'pending_approval' as const, submitted_at: now }
+  const balance = (approved: number, requested: number) => ({ leave_balance: { leave_type: 'annual', year: 2026, entitled_days: 15, approved_days: approved, pending_other_days: 0, requested_days: requested, remaining_after_days: 15 - approved - requested, over_limit: false }, department_budget: null })
+  let item: StubRequest | undefined
+  if (user.id === 3) {
+    item = { ...none, type: 'leave', id: 15, employeeId: 2, approverId: 3, summary: 'Annual leave, Mon 2026-11-02 to Tue 2026-11-03 (2 working days)', fields: leaveFields('Annual', 'Mon 2026-11-02', 'Tue 2026-11-03', 2), external_reference_id: '551', limits: balance(4, 2) }
+  }
+  else if (user.id === 5) {
+    item = { ...none, type: 'leave', id: 16, employeeId: 3, approverId: 5, summary: 'Annual leave, Mon 2026-10-19 to Tue 2026-10-20 (2 working days)', fields: leaveFields('Annual', 'Mon 2026-10-19', 'Tue 2026-10-20', 2), external_reference_id: '552', limits: balance(6, 2) }
+  }
+  else if (user.id === 6) {
+    item = {
+      ...none, type: 'claim', id: 10, employeeId: 4, approverId: 6, summary: 'Transport claim, HKD 180.00, receipt 2026-09-24', external_reference_id: '553',
+      fields: [{ key: 'claim_type', label: 'Claim type', value: 'Transport' }, { key: 'amount', label: 'Amount', value: 'HKD 180.00' }, { key: 'receipt_date', label: 'Receipt date', value: 'Thu 2026-09-24' }],
+      limits: { leave_balance: null, department_budget: { department: 'HR', year: 2026, limit_amount: '30000.00', approved_amount: '12000.00', pending_other_amount: '0.00', requested_amount: '180.00', remaining_after_amount: '17820.00', over_limit: false, currency: 'HKD' } },
+    }
+  }
+  if (!item) return
+  requests.push(item)
+  const who = userById(item.employeeId).display_name
+  notify(user.id, 'request.submitted', item.type === 'leave' ? `New leave request from ${who}` : `New claim from ${who}`, item.summary, item, `/approvals/${item.type}/${item.id}`)
+}
+
+const listItem = (r: StubRequest) => ({
+  request_type: r.type, id: r.id, employee: employeeOf(r), summary: r.summary, submitted_at: r.submitted_at,
+  flags: { over_limit: r.over_limit, team_overlap_count: r.team_overlap.length, has_attachments: r.attachmentIds.length > 0 },
+})
+
+const detailOf = (r: StubRequest) => ({
+  request: {
+    request_type: r.type, id: r.id, status: r.status, submitted_at: r.submitted_at, employee: employeeOf(r), fields: r.fields,
+    attachments: r.attachmentIds.map(id => attachmentInfo(attachmentStore.find(a => a.id === id)!)), external_reference_id: r.external_reference_id,
+  },
+  limits: r.limits, team_overlap: r.team_overlap, warnings: r.warnings,
+})
+
+function decide(r: StubRequest, decision: 'approve' | 'reject', note: string | null, by: StubUser) {
+  r.status = decision === 'approve' ? 'approved' : 'rejected'
+  r.reviewed_at = iso()
+  r.reviewer_note = note
+  const noun = r.type === 'leave' ? 'leave request' : 'claim'
+  notify(r.employeeId, `request.${r.status}`, `Your ${noun} #${r.id} was ${r.status}`,
+    `${r.summary}.${note ? ` Note from ${by.display_name}: "${note}"` : ''}`, null, null)
+}
+
+/** Returns true when the request belonged to the Phase 3 API (and was answered). */
+function handleApprovals(req: IncomingMessage, path: string, query: URLSearchParams, send: Send): boolean {
+  const isApprovals = path === '/api/approvals' || path.startsWith('/api/approvals/')
+  const isNotifications = path === '/api/notifications' || path.startsWith('/api/notifications/')
+  const isBalances = path === '/api/me/balances'
+  if (!isApprovals && !isNotifications && !isBalances) return false
+  const user = expired ? undefined : userFromCookie(req.headers.cookie)
+  if (!user) return send(401, { detail: 'Not authenticated' }), true
+  const method = req.method
+
+  if (isBalances) {
+    if (!user.can_request) return send(403, { detail: 'Forbidden' }), true
+    return send(200, { year: 2026, leave: [
+      { leave_type: 'annual', entitled_days: 15, approved_days: 3, pending_days: 2.5, remaining_days: 12 },
+      { leave_type: 'sick', entitled_days: 10, approved_days: 1, pending_days: 0, remaining_days: 9 },
+    ] }), true
+  }
+
+  if (isNotifications) {
+    tick(user)
+    const mine = notifications.filter(n => n.userId === user.id).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id)
+    if (path === '/api/notifications' && method === 'GET') {
+      const limit = Math.min(100, Math.max(1, Number(query.get('limit')) || 20))
+      const view = (n: StubNotification) => ({ id: n.id, event_type: n.event_type, title: n.title, body: n.body, request_type: n.request_type, request_id: n.request_id, read_at: n.read_at, created_at: n.created_at, link: n.link })
+      return send(200, { items: mine.slice(0, limit).map(view), unread_count: mine.filter(n => !n.read_at).length }), true
+    }
+    if (path === '/api/notifications/read-all' && method === 'POST') {
+      for (const n of mine) n.read_at ??= iso()
+      return send(204), true
+    }
+    const one = /^\/api\/notifications\/(\d+)\/read$/.exec(path)
+    if (one && method === 'POST') {
+      const n = mine.find(x => x.id === Number(one[1]))
+      if (!n) return send(404, { detail: 'Not found' }), true
+      n.read_at ??= iso()
+      return send(204), true
+    }
+    return send(404, { detail: 'Not found' }), true
+  }
+
+  if (!user.approves) return send(403, { detail: 'Forbidden' }), true
+  tick(user)
+  if (path === '/api/approvals' && method === 'GET') {
+    const queue = requests.filter(r => r.approverId === user.id && r.type === user.approves && r.status === 'pending_approval')
+      .sort((a, b) => Date.parse(a.submitted_at) - Date.parse(b.submitted_at) || a.id - b.id)
+    return send(200, { items: queue.map(listItem), count: queue.length }), true
+  }
+  const match = /^\/api\/approvals\/(leave|claim)\/(\d+)(\/decision)?$/.exec(path)
+  if (!match) return send(404, { detail: 'Not found' }), true
+  const found = requests.find(r => r.type === match[1] && r.id === Number(match[2]) && r.approverId === user.id && r.type === user.approves)
+  if (!found) return send(404, { detail: 'Not found' }), true
+
+  if (!match[3] && method === 'GET') {
+    return found.status === 'pending_approval' ? send(200, detailOf(found)) : send(404, { detail: 'Not found' }), true
+  }
+  if (match[3] && method === 'POST') {
+    void readJson(req).then(async (body) => {
+      await sleep(600) // keeps the "posting" state visible
+      const decision = body?.decision
+      const note = body?.note ?? null
+      if ((decision !== 'approve' && decision !== 'reject') || (note !== null && (typeof note !== 'string' || note.length > 500))) {
+        return send(422, { detail: 'invalid decision' })
+      }
+      if (found.status !== 'pending_approval') return send(409, { detail: 'Request is no longer pending' })
+      decide(found, decision, note, user)
+      return send(200, { request_type: found.type, id: found.id, status: found.status, reviewed_at: found.reviewed_at })
+    })
+    return true
+  }
+  return send(405, { detail: 'Method not allowed' }), true
+}
+
+seedAttachments()
+seedRequests()
+
 const sessionCookie = (value: string, maxAge: number) =>
   `${COOKIE_NAME}=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}`
 
@@ -482,7 +864,8 @@ createServer((req, res) => {
     })
     res.end(body === undefined ? undefined : Buffer.isBuffer(body) ? body : JSON.stringify(body))
   }
-  const path = (req.url || '').split('?')[0]
+  const [path = '', queryString = ''] = (req.url || '').split('?')
+  const query = new URLSearchParams(queryString)
   if (req.method === 'OPTIONS') return send(204)
 
   if (req.method === 'POST' && path === '/__stub/expire') {
@@ -495,7 +878,16 @@ createServer((req, res) => {
     conversations.length = 0
     attachmentStore.length = 0
     flakySeen.clear()
+    seedAttachments()
+    seedRequests()
     return send(200, { expired, logouts })
+  }
+  if (req.method === 'POST' && path === '/__stub/decide') {
+    // Decide a request "elsewhere" (as its approver), so the UI's 409 path can be tried.
+    const found = requests.find(r => r.type === query.get('type') && r.id === Number(query.get('id')))
+    if (!found) return send(404, { detail: 'Not found' })
+    decide(found, query.get('decision') === 'reject' ? 'reject' : 'approve', 'Decided elsewhere (stub)', userById(found.approverId))
+    return send(200, { status: found.status })
   }
   if (req.method === 'GET' && path === '/__stub/state') return send(200, { expired, logouts })
 
@@ -505,6 +897,7 @@ createServer((req, res) => {
     return send(403, { detail: 'CSRF check failed' })
   }
 
+  if (handleApprovals(req, path, query, send)) return
   if (handleChat(req, path, send)) return
 
   if (req.method === 'GET' && path === '/api/auth/mock-users') return send(200, USERS)
