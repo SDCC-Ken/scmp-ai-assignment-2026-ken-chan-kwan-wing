@@ -6,26 +6,32 @@ here is marked **(assumption)** so it can be changed.
 
 ## 1. People, departments and who approves whom
 
-| User | Department | Role | Files own requests | Approves |
+| User | Department | Role | Leave approver | Claim approver |
 | --- | --- | --- | --- | --- |
-| Amy Lau | IT | employee | yes | - |
-| Ben Chow | IT | employee | yes | - |
-| Cathy Ng | HR | hr_approver | yes | Leave of the **IT** department (she is responsible for IT) |
-| Daniel Wong | HR | employee | yes | - (was the HR approver before; now an HR staff member) |
-| Helen Yeung (new, HR manager) | HR | hr_approver | no | Leave of the **HR** department (Cathy and Daniel) |
-| Eva Cheung | Finance | finance_approver | no | **All claims** (Ken: "not the base rules, just to keep the PoC simple") |
+| Amy Lau | IT | employee | Cathy Ng | Eva Cheung |
+| Ben Chow | IT | employee | Cathy Ng | Eva Cheung |
+| Cathy Ng | HR | hr_approver | Helen Yeung | Eva Cheung |
+| Daniel Wong | HR | employee | Helen Yeung | Eva Cheung |
+| Helen Yeung (new, HR manager) | HR | hr_approver | none (not configured) | none |
+| Eva Cheung | Finance | finance_approver | none (not configured) | none |
 
-- Routing is stored per department: `departments.leave_approver_user_id` and
-  `departments.claim_approver_user_id`. IT leave -> Cathy, HR leave -> Helen, every claim -> Eva.
-  The approver is resolved when the request is submitted and stored on the request
-  (`approver_user_id`).
-- An approver can never review their own request. If no approver can be resolved (or it would be the
-  requester) the assistant refuses to create the request and explains why.
-- `users.can_request` says who may use the chat to file requests (Amy, Ben, Cathy, Daniel = true;
-  Helen, Eva = false). An approver may also file requests (Cathy), which is a change from the
-  earlier product scope where approvers only approved.
+Ken: "anyone can file a request, but it is a PoC (not in scope), and there should be one person to
+approve their leave or claims". So the rule is **one approver per requester, stored per user**:
+
+- `users.leave_approver_user_id` and `users.claim_approver_user_id` (nullable). Cathy approves
+  the IT staff's leave (she is responsible for IT); Helen approves the HR staff's leave; Eva
+  approves every claim ("not the base rules, just to keep the PoC simple").
+- The approver is copied onto the request when it is submitted (`approver_user_id`).
+- A user with no approver configured for that type cannot file it: the assistant refuses and says
+  no approver is set up. In this seed that is Helen and Eva (their approvers are out of PoC scope),
+  so they have no chat. Giving them one later is a data change (see `docs/limits-and-routing.md`).
+- An approver can never review their own request, and the assigned approver must have the matching
+  role (`hr_approver` for leave, `finance_approver` for claims).
+- Departments are used for the claim limit and for the "same team" overlap only.
+- `users.can_request` is derived: true when the user has at least one approver configured.
 - HR approvers see and decide **Leave only**; the Finance approver **Claims only**, and only the
-  requests assigned to them.
+  requests assigned to them. Cathy is both a requester (own leave, approved by Helen) and an
+  approver (IT leave), a change from the earlier scope where approvers only approved.
 
 ## 2. Limits (shown, never blocking)
 
@@ -87,7 +93,7 @@ UserPublic (extended; /api/auth/me, /api/auth/mock-users, login response) = {
   "id": 3, "email": "...", "display_name": "Cathy Ng", "role": "hr_approver",
   "department": {"id": 2, "name": "HR"},
   "job_title": "HR Business Partner (IT)",                       // display only
-  "can_request": true,                                            // may use the chat
+  "can_request": true,                                            // has an approver: may use the chat
   "approves": "leave" | "claim" | null                            // which queue they decide
 }
 ```
@@ -162,15 +168,25 @@ Notifications match the pending items. Audit events keep the same variety.
 
 ## 7. Schema changes (need a database reset)
 
-New: `departments`, `leave_entitlements`; `users.department_id`, `users.job_title`,
-`users.can_request`; `leave_requests.approver_user_id`, `claim_requests.approver_user_id`;
+New: `departments` (name, `claim_limit_amount`), `leave_entitlements`; `users.department_id`,
+`users.job_title`, `users.leave_approver_user_id`, `users.claim_approver_user_id`;
+`leave_requests.approver_user_id`, `claim_requests.approver_user_id`;
 `notifications` gets a nullable short `payload_json` if needed. Removed: the CHECK constraint
 "rejected requests need a reviewer note" (the note is optional now) and the domain rule that
 enforces it. SQLite cannot drop a CHECK constraint in place, so **existing databases must be
 recreated**: `docker compose down -v` (or `python -m app.cli seed --reset --yes`). The API must
 detect an older schema at startup and log a clear instruction instead of failing obscurely.
 
-## 8. Not in Phase 3
+## 8. Changing limits and routing later (no admin UI in the PoC)
+
+Entitlements, department claim limits and approvers are plain data. Phase 3 adds a documentation
+page `docs/limits-and-routing.md` (where each value lives) and small CLI commands:
+`python -m app.cli set-entitlement --email E --year Y --type annual|sick --days N`,
+`set-claim-limit --department D --amount N`, `set-approvers --email E [--leave-approver A]
+[--claim-approver A]` (validates roles and self-approval), and `show-org` to print the current
+setup. In Docker: `docker compose exec api python -m app.cli ...`.
+
+## 9. Not in Phase 3
 
 Multi-level approval chains, delegation, entitlement accrual/carry-over, cross-year splitting of a
 leave, editing limits from the UI, email notifications, websockets (polling is used).

@@ -97,3 +97,32 @@ behind each case are in [business-rules.md](business-rules.md). "Delete" means c
 | CH-5 | Message over 1000 characters | 422 | `test_message_length_limits` |
 | CH-6 | HR, Finance or signed-out user | 403 / 401 | `test_approvers_cannot_use_the_employee_chat`, `test_unauthenticated_requests_are_401` |
 | CH-7 | Markup in messages | Returned as plain text | `test_markup_in_messages_is_returned_as_plain_text_unchanged` |
+
+## Documents (image or PDF attached to a message)
+
+Offline: a scripted AI double returns what a provider would have read (`AgentTurn.documents`), and
+the real `FakeLLMProvider` reads the `backend/samples/*.fake.pdf` files. Run with
+`cd backend && uv run pytest -q tests/chat/test_documents.py`. Rules: business-rules.md section 4a.
+
+| ID | Scenario | Expected outcome | Test |
+| --- | --- | --- | --- |
+| DC-1 | Sick note with both dates, empty message | Sick leave card, fields tagged `document`, file listed; Confirm links it; HR can open it, Finance and other employees get 404 | `test_sick_note_with_both_dates_makes_a_tagged_leave_card_and_confirm_links_the_file` |
+| DC-2 | Sick note with only "3 days advised" | Asks for the last day; nothing is computed; typed answer completes the card | `test_sick_note_with_only_days_advised_asks_for_the_last_day_and_never_computes_it` |
+| DC-3 | Sick note with no dates | Asks the first day, then the last day, naming the file | `test_sick_note_without_any_dates_asks_for_the_first_day_then_the_last` |
+| DC-4 | Complete receipt | Claim card (meal, HKD 83.60, date) tagged `document`; Finance can open the file, HR cannot | `test_complete_receipt_makes_a_tagged_claim_card_and_finance_can_open_the_file` |
+| DC-5 | Receipt without a date | "I could not read the receipt date on receipt-sample.png. What date is on the receipt?"; typed date completes it | `test_receipt_without_a_date_asks_for_it_by_name_then_the_typed_date_completes_it` |
+| DC-6 | Receipt without amount and date | One question at a time | `test_a_receipt_without_amount_and_date_asks_one_thing_at_a_time` |
+| DC-7 | Non-HKD receipt | Currency follow-up; typed HKD amount completes it; `HK$` is read as HKD | `test_non_hkd_receipt_gets_the_currency_follow_up_then_a_typed_amount_completes_it`, `test_hk_dollar_sign_is_read_as_hkd` |
+| DC-8 | Unreadable / blurry file, no other information | No card; asks to type the details or upload a clearer file | `test_an_unreadable_file_asks_to_type_the_details_or_upload_a_clearer_one` |
+| DC-9 | Other document type; stored file missing; unreadable file next to typed details | Asks what it is for / asks to upload again / not used and says so | `test_a_document_that_is_neither_a_sick_note_nor_a_receipt_asks_what_it_is_for`, `test_if_the_stored_file_cannot_be_opened_the_user_is_asked_to_upload_again`, `test_an_unreadable_file_next_to_typed_details_is_not_used_and_says_so` |
+| DC-10 | Typed amount differs from the receipt | Typed value kept; card warning names field and both values | `test_typed_values_win_over_the_document_and_the_conflict_is_a_warning` |
+| DC-11 | Earlier draft value differs from the document | Draft value kept with warnings; warning disappears when they agree | `test_a_value_from_earlier_in_the_draft_wins_and_the_warning_goes_when_they_agree` |
+| DC-12 | Name on the document differs / matches (order, case, initials) | Warning only / no warning | `test_a_different_name_on_the_document_is_a_warning_never_a_block`, `test_matching_names_give_no_warning`, `test_name_matching` |
+| DC-13 | Receipt while a leave draft is open | Asks which one; "claim" starts a claim from the held receipt, carrying on with the leave drops it | `test_a_receipt_while_a_leave_draft_is_open_asks_which_one_and_mixes_nothing`, `test_the_held_receipt_is_dropped_when_the_user_carries_on_with_the_leave` |
+| DC-14 | Files accumulate over messages, capped at 3 | Card lists them; a 4th is dropped with a notice | `test_attachments_accumulate_across_messages_and_are_capped_at_three_per_request` |
+| DC-15 | Discard / new draft of the other type | Draft attachments and tags cleared; files stay unlinked | `test_discard_and_a_new_draft_of_the_other_type_clear_the_draft_attachments` |
+| DC-16 | New document in the update flow | Update card with old and new value, tagged; Confirm links the new file, old links stay | `test_a_new_document_in_the_update_flow_is_linked_and_the_old_links_stay` |
+| DC-17 | AI error or invalid output with files | Graceful message; message and files kept; draft unchanged | `test_an_llm_error_with_attachments_is_graceful_and_keeps_everything`, `test_invalid_provider_output_with_attachments_is_graceful_too` |
+| DC-18 | Instructions inside a document ("approve this claim", another person's e-mail) | Only fills the draft; needs Confirm; employee stays the signed-in user; nothing approved | `test_instructions_inside_a_document_change_nothing_beyond_filling_the_draft`, `test_a_document_cannot_make_the_assistant_act_for_someone_else`, `test_a_document_that_only_contains_instructions_leaves_the_state_untouched` |
+| DC-19 | Trace of a document turn | `documents` step, no names or file names | `test_the_trace_has_a_documents_step_without_names_or_file_names` |
+| DC-20 | `FakeLLMProvider` on the samples, through the API (upload, message, card, confirm) | Sick note, receipt, incomplete receipt and unreadable samples behave as above | `test_fake_provider_sick_note_sample_end_to_end`, `test_fake_provider_receipt_sample_end_to_end`, `test_fake_provider_incomplete_receipt_asks_for_the_date_then_completes`, `test_fake_provider_unreadable_sample_asks_to_type_the_details` |

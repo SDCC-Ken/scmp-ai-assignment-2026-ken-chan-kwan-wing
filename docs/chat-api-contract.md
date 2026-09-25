@@ -48,7 +48,7 @@ TurnResponse = {
   "warning_code": null | "llm_unavailable" | "llm_invalid_output" | "submission_failed" | "stale_card"
 }
 
-TraceStep = { "step": "understand" | "merge" | "validate" | "decide" | "submit" | "status" | "respond",
+TraceStep = { "step": "understand" | "documents" | "merge" | "validate" | "decide" | "submit" | "status" | "respond",
               "label": "Intent detected", "detail": "create_leave (confidence 0.92)",
               "ok": true, "duration_ms": 640 }
 
