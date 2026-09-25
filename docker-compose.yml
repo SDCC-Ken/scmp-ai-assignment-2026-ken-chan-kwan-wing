@@ -1,0 +1,54 @@
+name: scmp-ai-assignment
+
+# One-command deployment:  docker compose up --build
+# Secrets and theme come from ./.env (copy .env.example first). The file is optional
+# so `docker compose config` works on a fresh clone; the app then runs with defaults.
+
+services:
+  api:
+    build:
+      context: ./backend
+    image: scmp-ai-assignment-api:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      API_PORT: "9181"
+      # Persist SQLite in the named volume below; /app/data is created and chowned
+      # to the non-root user in backend/Dockerfile, so the volume inherits write access.
+      DATABASE_URL: sqlite:////app/data/app.db
+    ports:
+      - "${API_PORT:-9181}:9181"
+    volumes:
+      - api-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9181/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+    image: scmp-ai-assignment-web:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      NITRO_PORT: "9180"
+    ports:
+      - "${WEB_PORT:-9180}:9180"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  api-data:
