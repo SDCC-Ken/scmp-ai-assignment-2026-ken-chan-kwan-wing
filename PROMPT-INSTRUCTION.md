@@ -455,6 +455,49 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
 - **Verification commands and results:** described above.
 - **Commit:** `docker-compose.ollama.yml` is committed in the next docs commit.
 
+## Entry 25 - Phase 3 chat balances, approver awareness and input fixes (backend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 3-C. Leave cards show annual/sick balance lines and an over-balance warning (never blocking); new check_balance intent answered with a balance card; refuse a new
+  request up front when the user has no approver and name the approver after submit; add approver_name to status items. Fix A: never accept a leave date or receipt date the
+  user did not state (found live: "Claim HKD 180 for a taxi" filled today's date). Fix B: a bare $, HK$ or "dollars" means HKD, explicit USD stays rejected.
+  ```
+- **Allowed scope:** `backend/app/agent/graph.py`, `backend/app/chat/*`, chat schemas, the whole `backend/app/llm/*` package, chat and llm tests, docs appendices.
+- **Agent result:** new `app/chat/balance.py`, `app/llm/dates.py`, `app/llm/currency.py`; three new test files (about 169 tests). Live Ollama smoke (`gemma4:latest`, 4 cases, no Gemini): balance question, leave with dates, claim without a date (receipt date left empty), and `$65.5` as HKD all passed. Deviations reported: `check_balance` with no entitlement answers with text only; a scripted test double can switch the date guard off (real providers are always guarded); the fake provider learned "yesterday".
+- **Human review / changes requested:** none; the integrator verified the balance question in the browser (Entry 27).
+- **Verification commands and results:** full suite 1403 passed; ruff clean.
+- **Commit:** `eece179`.
+
+## Entry 26 - Phase 3 approver queue, decisions, audit and notifications API (backend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported.
+- **Actual prompt (condensed):**
+  ```text
+  Phase 3-B per docs/phase3-approval-design.md. GET /api/approvals (pending, assigned to the caller, oldest first, flags), detail with limit context, team overlap and attachments
+  (404 unless pending and assigned), POST decision with optional note (single winner under concurrency, audit with the numbers the approver saw and no note text), notifications
+  list/read/read-all with composed titles and links, requester notified, approver's own notifications marked read, interaction tests with balances and the chat.
+  ```
+- **Allowed scope:** new approvals and notifications routes, services, schemas and tests; small registration and docs edits.
+- **Agent result:** 108 new tests. Deviations reported: no `payload_json` column (approver name and note are read at display time); a non-pending request gives 404 on detail and 409 on decision; the audit snapshot sits under one `snapshot` key. The agent found that the seed stored note text in two audit rows.
+- **Human review / changes requested:** the integrator removed the note text from the seeded audit metadata (one line in `seed.py`) and re-ran the seed and approvals tests (128 passed).
+- **Verification commands and results:** full suite 1403 passed; ruff clean; smoke on port 9199 (Cathy lists, opens and approves with a note; second decision 409; Amy sees the notification; Cathy's own notification marked read).
+- **Commit:** `b8edf5a`.
+
+## Entry 27 - Phase 3 end-to-end verification in Docker and the browser (integrator)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`).
+- **Actual prompt:** verify Phase 3 against the real backend, then bring Ken a test script.
+- **Allowed scope:** running the stack; README and log updates.
+- **Agent result:** rebuilt from a fresh database with the local Ollama override. As Cathy: both tabs (My requests, Approvals with a badge of 1), the queue showed Amy's pending leave with a "1 on leave in the team" flag; the detail page showed Amy's annual balance (15 entitled, 1.5 approved, 4 requested, 9.5 remaining), Ben's overlapping approved leave, no attachments, and a note field; approving with a note showed the confirmation dialog, then a success message and an empty queue. The database showed the request approved with the note, an audit row with the numbers seen and no note text, Amy's unread notification and Cathy's own notification read. As Amy: the bell showed "Your leave request #1 was approved. Approved by Cathy Ng. Note: ..."; the balance question returned a card with annual 15 entitled, 5.5 approved, 9.5 left. The README was rewritten for Phases 2 and 3.
+- **Human review / changes requested:** Pending. Ken will run the Phase 3 test script.
+- **Verification commands and results:** backend 1403 passed and ruff clean; frontend lint, typecheck, 123 tests and build clean; browser checks as above. Not repeated in the browser: the claim approval as Eva, Helen's queue and the reject path (covered by backend and frontend tests).
+- **Commit:** `4ca8dfb` (README); log in the following commit.
+
 ## Entry template
 
 ### Entry NN - [phase and short task name]
