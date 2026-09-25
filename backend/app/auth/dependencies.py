@@ -76,13 +76,47 @@ def get_optional_user(
         raise
 
 
+REQUESTER_FORBIDDEN_DETAIL = (
+    "This account cannot file requests: no approver is configured for it yet "
+    "(out of the PoC scope). Please contact HR or Finance."
+)
+
+
+def user_can_request(user: User) -> bool:
+    """True when at least one approver (leave or claim) is configured for the user."""
+    return user.can_request
+
+
+def require_requester(user: User = Depends(get_current_user)) -> User:
+    """403 unless the user can file requests (has an approver configured), whatever their role.
+
+    Phase 3: Cathy (HR approver) and Daniel (HR officer) may use the chat like Amy and Ben;
+    Helen and Eva have no approver configured, so they get a clear 403 instead.
+    """
+    if not user_can_request(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=REQUESTER_FORBIDDEN_DETAIL
+        )
+    return user
+
+
 def require_roles(*roles: UserRole) -> Callable[..., User]:
-    """Dependency factory: 403 unless the current user's (DB) role is one of ``roles``."""
+    """Dependency factory: 403 unless the current user's (DB) role is one of ``roles``.
+
+    Phase 3 special case: the ``employee`` role in a gate means the *requester capability*
+    (``require_requester``), because approvers such as Cathy also file requests. So
+    ``require_roles(UserRole.EMPLOYEE)`` lets in every user with an approver configured, and
+    nobody else; any other role in ``roles`` still matches by role as before.
+    """
     allowed = frozenset(UserRole(r) for r in roles)
+    by_role = allowed - {UserRole.EMPLOYEE}
+    requesters = UserRole.EMPLOYEE in allowed
 
     def dependency(user: User = Depends(get_current_user)) -> User:
-        if user.role not in allowed:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
-        return user
+        if user.role in by_role:
+            return user
+        if requesters:
+            return require_requester(user)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
     return dependency

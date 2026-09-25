@@ -20,8 +20,8 @@ def test_lifespan_creates_tables_and_seeds_when_enabled() -> None:
     db = Database("sqlite:///:memory:")
     app = create_app(make_settings(db_auto_seed=True), database=db)
     with TestClient(app) as client:
-        assert user_count(db) == 5
-        assert len(client.get("/api/auth/mock-users").json()) == 5
+        assert user_count(db) == 6
+        assert len(client.get("/api/auth/mock-users").json()) == 6
 
 
 def test_lifespan_does_not_seed_when_disabled() -> None:

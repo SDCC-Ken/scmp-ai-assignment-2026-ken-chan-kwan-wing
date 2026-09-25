@@ -17,6 +17,11 @@ services:
       # Persist SQLite in the named volume below; /app/data is created and chowned
       # to the non-root user in backend/Dockerfile, so the volume inherits write access.
       DATABASE_URL: sqlite:////app/data/app.db
+      UPLOAD_DIR: /app/data/uploads
+      # Reach the Ollama running on the host machine from inside the container.
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${API_PORT:-9181}:9181"
     volumes:

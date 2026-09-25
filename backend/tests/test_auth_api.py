@@ -22,8 +22,19 @@ from tests.conftest import (
     make_settings,
 )
 
+USER_KEYS = {
+    "id",
+    "email",
+    "display_name",
+    "role",
+    "department",
+    "job_title",
+    "can_request",
+    "approves",
+}
+
 AMY = "amy.lau@example.com"
-HR = "daniel.wong@example.com"
+HR = "cathy.ng@example.com"  # an hr_approver (she also files her own leave)
 FIN = "eva.cheung@example.com"
 ISSUER = "scmp-ai-assignment"
 
@@ -71,15 +82,25 @@ def test_mock_users_lists_active_users_in_role_order_without_google_subject(
     response = client.get("/api/auth/mock-users")
     assert response.status_code == 200
     users = response.json()
-    assert [u["role"] for u in users] == ["employee"] * 3 + ["hr_approver", "finance_approver"]
-    assert all(set(u) == {"id", "email", "display_name", "role"} for u in users)
+    assert [u["role"] for u in users] == (
+        ["employee"] * 3 + ["hr_approver"] * 2 + ["finance_approver"]
+    )
+    assert [u["display_name"] for u in users] == [
+        "Amy Lau",
+        "Ben Chow",
+        "Daniel Wong",
+        "Cathy Ng",
+        "Helen Yeung",
+        "Eva Cheung",
+    ]
+    assert all(set(u) == USER_KEYS for u in users)
     assert "google_subject" not in response.text and "mock-google-sub" not in response.text
 
 
 def test_mock_users_hides_inactive(client: TestClient, seeded: Database) -> None:
     set_user(seeded, "ben.chow@example.com", is_active=False)
     emails = [u["email"] for u in client.get("/api/auth/mock-users").json()]
-    assert "ben.chow@example.com" not in emails and len(emails) == 4
+    assert "ben.chow@example.com" not in emails and len(emails) == 5
 
 
 def test_sso_disabled_returns_404(app_factory) -> None:
@@ -101,7 +122,7 @@ def test_login_success_for_each_role(client: TestClient, email: str, role: str) 
     assert set(body) == {"expires_in", "user"}  # the JWT is never in the body
     assert "access_token" not in response.text and "token" not in body
     assert body["expires_in"] == 3600
-    assert set(body["user"]) == {"id", "email", "display_name", "role"}
+    assert set(body["user"]) == USER_KEYS
     assert body["user"]["email"] == email and body["user"]["role"] == role
     token = client.cookies.get(COOKIE_NAME)
     assert token and token not in response.text
@@ -161,8 +182,12 @@ def test_me_returns_current_user(client: TestClient) -> None:
     assert response.json() == {
         "id": response.json()["id"],
         "email": HR,
-        "display_name": "Daniel Wong",
+        "display_name": "Cathy Ng",
         "role": "hr_approver",
+        "department": {"id": response.json()["department"]["id"], "name": "HR"},
+        "job_title": "HR Business Partner (IT)",
+        "can_request": True,
+        "approves": "leave",
     }
 
 

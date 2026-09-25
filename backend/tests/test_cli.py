@@ -42,7 +42,7 @@ def test_init_db(tmp_db: Database, capsys: pytest.CaptureFixture[str]) -> None:
 def test_seed_is_idempotent(tmp_db: Database, capsys: pytest.CaptureFixture[str]) -> None:
     assert run(["seed"], tmp_db) == 0
     first = counts(tmp_db)
-    assert first["users"] == 5 and first["public_holidays"] == 34
+    assert first["users"] == 6 and first["public_holidays"] == 34
     capsys.readouterr()
     assert run(["seed"], tmp_db) == 0
     assert "already exist" in capsys.readouterr().out
@@ -84,7 +84,7 @@ def test_import_holidays_overwrites_seed_source(tmp_db: Database) -> None:
     run(["seed"], tmp_db)
     assert run(["import-holidays", "--file", str(BUNDLED), "--year", "2026", "2027"], tmp_db) == 0
     with tmp_db.session_factory() as s:
-        assert s.scalar(select(func.count(User.id))) == 5
+        assert s.scalar(select(func.count(User.id))) == 6
         sources = {h.source for h in s.scalars(select(PublicHoliday))}
         assert sources == {HolidaySource.ICS_1823}
         assert s.scalar(select(func.count(PublicHoliday.id))) == 34

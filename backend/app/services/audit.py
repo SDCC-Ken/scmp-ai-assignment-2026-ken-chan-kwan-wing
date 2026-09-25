@@ -52,6 +52,7 @@ def record_external_submission(
     error_message: str | None = None,
     submitted_at: datetime | None = None,
     provider: str = "reqres",
+    request_payload: dict[str, Any] | None = None,
 ) -> ExternalSubmission:
     ensure_request_exists(session, request_type, request_id)
     row = ExternalSubmission(
@@ -62,6 +63,7 @@ def record_external_submission(
         http_status=http_status,
         external_reference_id=external_reference_id,
         response_summary_json=_jsonable(response_summary or {}),
+        request_payload_json=_jsonable(request_payload) if request_payload is not None else None,
         error_message=error_message,
     )
     if submitted_at is not None:

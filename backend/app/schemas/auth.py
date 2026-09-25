@@ -1,10 +1,20 @@
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.domain.enums import UserRole
 
 
+class DepartmentPublic(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+
+
 class UserPublic(BaseModel):
-    """Never includes ``google_subject``."""
+    """Never includes ``google_subject``. ``can_request`` (has an approver configured: may use
+    the chat) and ``approves`` (which queue the user decides) are derived from the user."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -12,6 +22,10 @@ class UserPublic(BaseModel):
     email: str
     display_name: str
     role: UserRole
+    department: DepartmentPublic | None = None
+    job_title: str | None = None
+    can_request: bool
+    approves: Literal["leave", "claim"] | None = None
 
 
 class LoginRequest(BaseModel):

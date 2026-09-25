@@ -16,6 +16,7 @@ class UserLike(Protocol):
 class RequestLike(Protocol):
     request_type: RequestType
     employee_id: int
+    approver_user_id: int | None
 
 
 _APPROVER_BY_TYPE: dict[RequestType, UserRole] = {
@@ -30,19 +31,35 @@ def required_approver_role(request_type: RequestType) -> UserRole:
 
 
 def can_review(user: UserLike, request_type: RequestType) -> bool:
-    """Only the matching approver role may approve/reject; employees never; inactive never."""
+    """Role check only: the matching approver role, active. Employees never review.
+
+    Phase 3 adds the assignment check (``can_decide``): the role alone is not enough.
+    """
     if not user.is_active:
         return False
     return user.role == required_approver_role(request_type)
 
 
+def can_decide(user: UserLike, request: RequestLike) -> bool:
+    """May ``user`` approve or reject this request (status is checked by the state machine)?
+
+    The user must be active, have the matching approver role, be the approver assigned to this
+    request (``approver_user_id``) and not be the request's own employee.
+    """
+    return (
+        can_review(user, request.request_type)
+        and request.approver_user_id == user.id
+        and request.employee_id != user.id
+    )
+
+
 def can_view_request(user: UserLike, request: RequestLike) -> bool:
-    """Employees see only their own requests; approvers see only their request type."""
+    """A user sees their own requests, and an approver also those assigned to them."""
     if not user.is_active:
         return False
-    if user.role == UserRole.EMPLOYEE:
-        return request.employee_id == user.id
-    return can_review(user, request.request_type)
+    if request.employee_id == user.id:
+        return True
+    return can_review(user, request.request_type) and request.approver_user_id == user.id
 
 
 def resolve_role[U: UserLike](email: str, users: Iterable[U]) -> U | None:

@@ -40,8 +40,32 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.8-flash"
     gemini_thinking_level: str = "low"
 
+    # Ollama (local models): a development provider and the automatic fallback when the
+    # primary provider fails (bad key, quota, outage). "" = no fallback.
+    llm_fallback_provider: str = ""
+    llm_fallback_cooldown_seconds: int = Field(default=300, ge=0)
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "gemma4:latest"
+    ollama_vision_model: str = "gemma4:latest"
+    ollama_timeout_seconds: float = Field(default=90.0, gt=0)
+
     reqres_base_url: str = "https://reqres.in/api/users"
     reqres_api_key: SecretStr = SecretStr("")
+    # "reqres" = the hosted mock API required by the assignment. "fake" is for offline
+    # development and automated tests only and must never be presented as ReqRes.
+    submission_provider: str = "reqres"
+    submission_timeout_seconds: float = Field(default=10.0, gt=0)
+
+    chat_max_message_chars: int = Field(default=1000, gt=0)
+
+    # Attachments (Phase 2b): stored on the server's disk (the Docker volume) in the PoC.
+    upload_dir: str = "./data/uploads"
+    max_upload_mb: int = Field(default=5, gt=0)
+    max_attachments_per_message: int = Field(default=3, gt=0)
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return self.max_upload_mb * 1024 * 1024
 
     @property
     def is_production(self) -> bool:

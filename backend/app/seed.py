@@ -4,6 +4,12 @@ Everything here is invented (``@example.com`` addresses, made-up names, short no
 contains no real SCMP, employee, HR or financial data. Requests reviewed long ago have an
 ``external_submissions`` row but no audit rows: the audit trail is populated for a
 representative subset (see ``_seed_audit``) so the demo stays small.
+
+Phase 3 organisation (see docs/limits-and-routing.md): three departments with a claim limit,
+six users with a department, a job title and one configured approver per request type, and
+leave entitlements for this year and next. The pending requests are chosen to show the new
+features: a team overlap, a leave above the annual balance and a claim above its department's
+limit.
 """
 
 from dataclasses import dataclass, field
@@ -19,7 +25,9 @@ from app.db.models import (
     ClaimRequest,
     Conversation,
     ConversationMessage,
+    Department,
     Feedback,
+    LeaveEntitlement,
     LeaveRequest,
     User,
 )
@@ -37,8 +45,10 @@ from app.domain.enums import (
     UserRole,
 )
 from app.domain.leave import calculate_leave_days, is_working_day
+from app.domain.roles import required_approver_role
 from app.services.audit import create_notification, record_audit, record_external_submission
 from app.services.holidays import latest_stamp, parse_ics, upsert_holidays
+from app.services.routing import ApproverProblem, resolve_approver
 
 BUNDLED_ICS = Path(__file__).parent / "data" / "hk_public_holidays_1823.ics"
 SEED_HOLIDAY_YEARS = frozenset({2026, 2027})
@@ -70,6 +80,17 @@ def _prev_wd(day: date, holidays: set[date]) -> date:
     return day
 
 
+def _span_end(start: date, working_days: int, holidays: set[date]) -> date:
+    """The last day of a leave that starts on ``start`` (a working day) and covers exactly
+    ``working_days`` full working days."""
+    end, counted = start, 1
+    while counted < working_days:
+        end += timedelta(days=1)
+        if is_working_day(end, holidays):
+            counted += 1
+    return end
+
+
 def _seed_holidays(session: Session) -> set[date]:
     events = parse_ics(BUNDLED_ICS.read_text(encoding="utf-8"))
     stamp = latest_stamp(events)
@@ -78,16 +99,46 @@ def _seed_holidays(session: Session) -> set[date]:
     return {e.holiday_date for e in wanted}
 
 
-def _seed_users(session: Session) -> dict[str, User]:
-    rows = [
-        ("amy", "Amy Lau", UserRole.EMPLOYEE),
-        ("ben", "Ben Chow", UserRole.EMPLOYEE),
-        ("cathy", "Cathy Ng", UserRole.EMPLOYEE),
-        ("hr", "Daniel Wong", UserRole.HR_APPROVER),
-        ("finance", "Eva Cheung", UserRole.FINANCE_APPROVER),
-    ]
+# (key, name, department, role, job title, leave approver key, claim approver key)
+_USERS: list[tuple[str, str, str, UserRole, str, str | None, str | None]] = [
+    ("amy", "Amy Lau", "IT", UserRole.EMPLOYEE, "Software Engineer", "cathy", "eva"),
+    ("ben", "Ben Chow", "IT", UserRole.EMPLOYEE, "Software Engineer", "cathy", "eva"),
+    ("cathy", "Cathy Ng", "HR", UserRole.HR_APPROVER, "HR Business Partner (IT)", "helen", "eva"),
+    ("daniel", "Daniel Wong", "HR", UserRole.EMPLOYEE, "HR Officer", "helen", "eva"),
+    ("helen", "Helen Yeung", "HR", UserRole.HR_APPROVER, "HR Manager", None, None),
+    ("eva", "Eva Cheung", "Finance", UserRole.FINANCE_APPROVER, "Finance Manager", None, None),
+]
+_DEPARTMENTS = {
+    "IT": Decimal("60000.00"),
+    "HR": Decimal("30000.00"),
+    "Finance": Decimal("30000.00"),
+}
+# key -> (annual, sick); Helen and Eva get no entitlement (they file nothing in the PoC).
+_ENTITLEMENTS = {
+    "amy": (Decimal("15"), Decimal("10")),
+    "ben": (Decimal("18"), Decimal("10")),
+    "cathy": (Decimal("15"), Decimal("10")),
+    "daniel": (Decimal("15"), Decimal("12")),
+}
+
+
+def _seed_departments(session: Session) -> dict[str, Department]:
+    departments = {
+        name: Department(
+            name=name,
+            claim_limit_amount=limit,
+            created_at=datetime(2026, 1, 5, 2, 0, tzinfo=UTC),
+        )
+        for name, limit in _DEPARTMENTS.items()
+    }
+    session.add_all(departments.values())
+    session.flush()
+    return departments
+
+
+def _seed_users(session: Session, departments: dict[str, Department]) -> dict[str, User]:
     users: dict[str, User] = {}
-    for index, (key, name, role) in enumerate(rows, start=1):
+    for index, (key, name, dept, role, title, _leave, _claim) in enumerate(_USERS, start=1):
         first, last = name.lower().split()
         users[key] = User(
             google_subject=f"mock-google-sub-{index:03d}",
@@ -95,11 +146,30 @@ def _seed_users(session: Session) -> dict[str, User]:
             display_name=name,
             role=role,
             is_active=True,
+            department_id=departments[dept].id,
+            job_title=title,
             created_at=datetime(2026, 1, 5, 2, 0, tzinfo=UTC),
         )
     session.add_all(users.values())
     session.flush()
+    for key, _name, _dept, _role, _title, leave_key, claim_key in _USERS:  # needs the ids
+        users[key].leave_approver_user_id = users[leave_key].id if leave_key else None
+        users[key].claim_approver_user_id = users[claim_key].id if claim_key else None
+    session.flush()
     return users
+
+
+def _seed_entitlements(session: Session, users: dict[str, User], today: date) -> None:
+    """Annual and sick days for this year and next (the Phase 3 defaults; see the docs)."""
+    for key, (annual, sick) in _ENTITLEMENTS.items():
+        for year in (today.year, today.year + 1):
+            for leave_type, days in ((LeaveType.ANNUAL, annual), (LeaveType.SICK, sick)):
+                session.add(
+                    LeaveEntitlement(
+                        user_id=users[key].id, year=year, leave_type=leave_type, entitled_days=days
+                    )
+                )
+    session.flush()
 
 
 @dataclass
@@ -147,47 +217,45 @@ def _leave_specs(today: date, hol: set[date]) -> list[_Leave]:
             **kw,
         )
 
-    s1 = _next_wd(today + timedelta(days=14), hol)
-    s2 = _next_wd(today + timedelta(days=8), hol)
+    s1 = _next_wd(today + timedelta(days=14), hol)  # Amy: pending, overlaps Ben's approved leave
+    s2 = _next_wd(today + timedelta(days=8), hol)  # Daniel: pending, above his annual balance
     s3 = _next_wd(today + timedelta(days=20), hol)
     s4 = _next_wd(today + timedelta(days=3), hol)
     s5 = _prev_wd(today - timedelta(days=40), hol)
     s6 = _prev_wd(today - timedelta(days=33), hol)
-    base7 = today - timedelta(days=56)
-    s7 = base7 - timedelta(days=(base7.weekday() - 3) % 7)  # the Thursday on/before
     s8 = _prev_wd(today - timedelta(days=70), hol)
     s9 = _prev_wd(today - timedelta(days=90), hol)
     s10 = _prev_wd(today - timedelta(days=100), hol)
+    s11 = _next_wd(s1 + timedelta(days=1), hol)  # Ben: approved, inside Amy's pending dates
     return [
         _Leave(
             "L1",
             "amy",
             LeaveType.ANNUAL,
             s1,
-            _next_wd(s1 + timedelta(days=3), hol),
+            _span_end(s1, 4, hol),
             S.PENDING_APPROVAL,
             _at(today, -1),
         ),
         _Leave(
             "L2",
-            "ben",
-            LeaveType.PERSONAL,
+            "daniel",
+            LeaveType.ANNUAL,
             s2,
-            s2,
+            _span_end(s2, 6, hol),  # 10 approved days (L7) + 6 requested > 15 entitled
             S.PENDING_APPROVAL,
             _at(today, -2),
-            start_part=DayPart.AM,
-            end_part=DayPart.AM,
         ),
         _Leave(
             "L3",
             "cathy",
             LeaveType.ANNUAL,
             s3,
-            _next_wd(s3 + timedelta(days=1), hol),
+            _span_end(s3, 2, hol),
             S.APPROVED,
             _at(today, -11),
             reviewed=_at(today, -10, 6),
+            note="Approved. Please hand over your open cases before you go.",
         ),
         _Leave(
             "L4",
@@ -200,17 +268,27 @@ def _leave_specs(today: date, hol: set[date]) -> list[_Leave]:
             reviewed=_at(today, -2, 6),
             note="Team is short-staffed that week; please pick another date.",
         ),
-        hist("L5", "amy", LeaveType.ANNUAL, s5, _next_wd(s5 + timedelta(days=3), hol)),
-        hist("L6", "ben", LeaveType.SICK, s6, s6),
-        hist("L7", "cathy", LeaveType.ANNUAL, s7, s7 + timedelta(days=4), start_part=DayPart.PM),
-        hist("L8", "amy", LeaveType.PERSONAL, s8, s8, start_part=DayPart.PM, end_part=DayPart.PM),
         hist(
+            "L5",
+            "amy",
+            LeaveType.ANNUAL,
+            s5,
+            _next_wd(s5 + timedelta(days=3), hol),
+            start_part=DayPart.PM,
+            note="Enjoy your break.",
+        ),
+        hist("L6", "ben", LeaveType.SICK, s6, s6),
+        hist("L7", "daniel", LeaveType.ANNUAL, s9, _span_end(s9, 10, hol)),
+        hist("L8", "amy", LeaveType.PERSONAL, s8, s8, start_part=DayPart.AM, end_part=DayPart.AM),
+        _Leave(
             "L9",
             "ben",
             LeaveType.ANNUAL,
-            s9,
-            _next_wd(s9 + timedelta(days=2), hol),
-            end_part=DayPart.AM,
+            s11,
+            _span_end(s11, 2, hol),
+            S.APPROVED,
+            _at(today, -6),
+            reviewed=_at(today, -5, 6),
         ),
         hist(
             "L10",
@@ -250,11 +328,12 @@ def _claim_specs(today: date) -> list[_Claim]:
             S.PENDING_APPROVAL,
             _at(today, -2),
         ),
+        # HR has 22,141.05 approved this year against a 30,000.00 limit: this pushes it over.
         _Claim(
             "C2",
-            "ben",
-            ClaimType.MEAL,
-            Decimal("86.00"),
+            "daniel",
+            ClaimType.TRAINING,
+            Decimal("9800.00"),
             today - timedelta(days=5),
             S.PENDING_APPROVAL,
             _at(today, -4, 3, 2),
@@ -262,12 +341,13 @@ def _claim_specs(today: date) -> list[_Claim]:
         _Claim(
             "C3",
             "cathy",
-            ClaimType.EQUIPMENT,
-            Decimal("1250.00"),
+            ClaimType.TRAINING,
+            Decimal("21500.00"),
             today - timedelta(days=14),
             S.APPROVED,
             _at(today, -12),
             reviewed=_at(today, -11, 6),
+            note="Approved within the training plan.",
         ),
         _Claim(
             "C4",
@@ -297,12 +377,20 @@ def _claim_specs(today: date) -> list[_Claim]:
     ]
 
 
+def _approver_of(session: Session, user: User, request_type: RequestType) -> User:
+    approver = resolve_approver(session, user, request_type)
+    if isinstance(approver, ApproverProblem):  # a seed bug, never user input
+        raise RuntimeError(f"Seed data has no valid {request_type.value} approver: {approver}")
+    return approver
+
+
 def _seed_requests(
     session: Session, users: dict[str, User], today: date, hol: set[date]
 ) -> tuple[dict[str, LeaveRequest], dict[str, ClaimRequest]]:
     leaves: dict[str, LeaveRequest] = {}
     for spec in _leave_specs(today, hol):
         days = calculate_leave_days(spec.start, spec.end, spec.start_part, spec.end_part, hol)
+        approver = _approver_of(session, users[spec.employee], RequestType.LEAVE)
         leaves[spec.key] = LeaveRequest(
             employee_id=users[spec.employee].id,
             leave_type=spec.leave_type,
@@ -313,9 +401,10 @@ def _seed_requests(
             calendar_days=days.calendar_days,
             working_days=days.working_days,
             status=spec.status,
-            required_approver_role=UserRole.HR_APPROVER,
+            required_approver_role=required_approver_role(RequestType.LEAVE),
+            approver_user_id=approver.id,
             submitted_at=spec.submitted,
-            reviewed_by_user_id=users["hr"].id if spec.reviewed else None,
+            reviewed_by_user_id=approver.id if spec.reviewed else None,
             reviewed_at=spec.reviewed,
             reviewer_note=spec.note,
             created_at=spec.submitted - timedelta(minutes=10),
@@ -323,6 +412,7 @@ def _seed_requests(
         )
     claims: dict[str, ClaimRequest] = {}
     for cspec in _claim_specs(today):
+        approver = _approver_of(session, users[cspec.employee], RequestType.CLAIM)
         claims[cspec.key] = ClaimRequest(
             employee_id=users[cspec.employee].id,
             claim_type=cspec.claim_type,
@@ -330,9 +420,10 @@ def _seed_requests(
             currency="HKD",
             receipt_date=cspec.receipt,
             status=cspec.status,
-            required_approver_role=UserRole.FINANCE_APPROVER,
+            required_approver_role=required_approver_role(RequestType.CLAIM),
+            approver_user_id=approver.id,
             submitted_at=cspec.submitted,
-            reviewed_by_user_id=users["finance"].id if cspec.reviewed else None,
+            reviewed_by_user_id=approver.id if cspec.reviewed else None,
             reviewed_at=cspec.reviewed,
             reviewer_note=cspec.note,
             created_at=cspec.submitted - timedelta(minutes=10),
@@ -346,9 +437,9 @@ def _seed_requests(
 def _seed_submissions(
     session: Session, leaves: dict[str, LeaveRequest], claims: dict[str, ClaimRequest]
 ) -> None:
-    """One fake success per submitted request, plus a 429 failure before C2's retry."""
+    """One fake success per submitted request, plus a 429 failure before C1's retry."""
     for request in [*leaves.values(), *claims.values()]:
-        if request.request_type is RequestType.CLAIM and request is claims["C2"]:
+        if request.request_type is RequestType.CLAIM and request is claims["C1"]:
             record_external_submission(
                 session,
                 request_type=RequestType.CLAIM,
@@ -378,7 +469,7 @@ def _seed_audit(
     leaves: dict[str, LeaveRequest],
     claims: dict[str, ClaimRequest],
 ) -> None:
-    """15 events for four showcase requests (L1, C2 with a 429 retry, L3 approved, C4 rejected)."""
+    """15 events for four showcase requests (L1, C1 with a 429 retry, L3 approved, C4 rejected)."""
 
     def flow(entity_type: str, req: Any, owner: User, *, failed_first: bool = False) -> None:
         eid, sub = req.id, req.submitted_at
@@ -389,6 +480,7 @@ def _seed_audit(
             event_type="request.created",
             actor_user_id=owner.id,
             to_status=S.DRAFT,
+            metadata={"approver_user_id": req.approver_user_id},
             created_at=sub - timedelta(minutes=10),
         )
         record_audit(
@@ -432,31 +524,25 @@ def _seed_audit(
                 created_at=sub,
             )
 
+    def decision(entity_type: str, req: Any, event_type: str, to_status: RequestStatus) -> None:
+        record_audit(
+            session,
+            entity_type=entity_type,
+            entity_id=req.id,
+            event_type=event_type,
+            actor_user_id=req.reviewed_by_user_id,
+            from_status=S.PENDING_APPROVAL,
+            to_status=to_status,
+            metadata={"note_present": bool(req.reviewer_note), "reviewer_note": req.reviewer_note},
+            created_at=req.reviewed_at,
+        )
+
     flow("leave_request", leaves["L1"], users["amy"])
-    flow("claim_request", claims["C2"], users["ben"], failed_first=True)
-    flow("leave_request", leaves["L3"], users["cathy"])
-    record_audit(
-        session,
-        entity_type="leave_request",
-        entity_id=leaves["L3"].id,
-        event_type="request.approved",
-        actor_user_id=users["hr"].id,
-        from_status=S.PENDING_APPROVAL,
-        to_status=S.APPROVED,
-        created_at=leaves["L3"].reviewed_at,
-    )
+    flow("claim_request", claims["C1"], users["amy"], failed_first=True)
+    flow("leave_request", leaves["L3"], users["ben"])
+    decision("leave_request", leaves["L3"], "request.approved", S.APPROVED)
     flow("claim_request", claims["C4"], users["ben"])
-    record_audit(
-        session,
-        entity_type="claim_request",
-        entity_id=claims["C4"].id,
-        event_type="request.rejected",
-        actor_user_id=users["finance"].id,
-        from_status=S.PENDING_APPROVAL,
-        to_status=S.REJECTED,
-        metadata={"reviewer_note": claims["C4"].reviewer_note},
-        created_at=claims["C4"].reviewed_at,
-    )
+    decision("claim_request", claims["C4"], "request.rejected", S.REJECTED)
 
 
 def _seed_notifications(
@@ -465,43 +551,29 @@ def _seed_notifications(
     leaves: dict[str, LeaveRequest],
     claims: dict[str, ClaimRequest],
 ) -> None:
-    for key in ("L1", "L2"):
+    """Pending requests notify their assigned approver; recent decisions notify the requester."""
+    for req in [*leaves.values(), *claims.values()]:
+        if req.status is S.PENDING_APPROVAL:
+            create_notification(
+                session,
+                recipient_user_id=req.approver_user_id,
+                event_type="request.submitted",
+                request_type=req.request_type,
+                request_id=req.id,
+                created_at=req.submitted_at,
+            )
+    for key, group in (("L3", leaves), ("L4", leaves), ("C3", claims), ("C4", claims)):
+        req = group[key]
+        approved = req.status is S.APPROVED
         create_notification(
             session,
-            recipient_user_id=users["hr"].id,
-            event_type="request.pending_approval",
-            request_type=RequestType.LEAVE,
-            request_id=leaves[key].id,
-            created_at=leaves[key].submitted_at,
+            recipient_user_id=req.employee_id,
+            event_type="request.approved" if approved else "request.rejected",
+            request_type=req.request_type,
+            request_id=req.id,
+            created_at=req.reviewed_at,
+            read_at=req.reviewed_at + timedelta(hours=2) if approved else None,
         )
-    for key in ("C1", "C2"):
-        create_notification(
-            session,
-            recipient_user_id=users["finance"].id,
-            event_type="request.pending_approval",
-            request_type=RequestType.CLAIM,
-            request_id=claims[key].id,
-            created_at=claims[key].submitted_at,
-        )
-    l3 = leaves["L3"]
-    create_notification(
-        session,
-        recipient_user_id=users["cathy"].id,
-        event_type="request.approved",
-        request_type=RequestType.LEAVE,
-        request_id=l3.id,
-        created_at=l3.reviewed_at,
-        read_at=l3.reviewed_at + timedelta(hours=2),
-    )
-    c4 = claims["C4"]
-    create_notification(
-        session,
-        recipient_user_id=users["ben"].id,
-        event_type="request.rejected",
-        request_type=RequestType.CLAIM,
-        request_id=c4.id,
-        created_at=c4.reviewed_at,
-    )
 
 
 def _seed_conversations(
@@ -511,7 +583,8 @@ def _seed_conversations(
     claims: dict[str, ClaimRequest],
     today: date,
 ) -> list[Conversation]:
-    l1, c2 = leaves["L1"], claims["C2"]
+    l1 = leaves["L1"]
+    receipt = today - timedelta(days=5)
     start = _at(today, -1, 2, 40)
 
     def msgs(base: datetime, items: list[tuple[SenderType, str, dict[str, Any] | None]]):
@@ -541,7 +614,7 @@ def _seed_conversations(
                 ),
                 (
                     SenderType.ASSISTANT,
-                    "Here is what I understood. Please confirm to submit to HR.",
+                    "Here is what I understood. Please confirm to submit it to your approver.",
                     {
                         "type": "confirmation",
                         "request_type": "leave",
@@ -555,7 +628,7 @@ def _seed_conversations(
                 (SenderType.USER, "Yes, confirm.", None),
                 (
                     SenderType.ASSISTANT,
-                    "Submitted. Your request is now pending HR approval.",
+                    "Submitted. Your request is now pending approval by Cathy Ng.",
                     {
                         "type": "submission_result",
                         "request_type": "leave",
@@ -586,7 +659,7 @@ def _seed_conversations(
                         "missing_fields": ["receipt_date"],
                     },
                 ),
-                (SenderType.USER, f"It was {c2.receipt_date:%d %b}.", None),
+                (SenderType.USER, f"It was {receipt:%d %b}.", None),
             ],
         ),
     )
@@ -629,7 +702,9 @@ def seed_demo_data(session: Session, today: date | None = None) -> SeedResult:
     today = today or today_hk()
 
     holidays = _seed_holidays(session)
-    users = _seed_users(session)
+    departments = _seed_departments(session)
+    users = _seed_users(session, departments)
+    _seed_entitlements(session, users, today)
     leaves, claims = _seed_requests(session, users, today, holidays)
     _seed_submissions(session, leaves, claims)
     _seed_audit(session, users, leaves, claims)

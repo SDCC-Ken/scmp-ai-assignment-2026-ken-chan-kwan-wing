@@ -18,9 +18,5 @@ class NotAuthorizedError(DomainError):
     """The actor may not perform the action (wrong role, inactive, or self-review)."""
 
 
-class ReviewNoteRequiredError(DomainError):
-    """Rejecting a request needs a non-empty reviewer note."""
-
-
 class LeaveCalculationError(DomainError):
     """Leave dates / day parts are invalid or cover no working day."""

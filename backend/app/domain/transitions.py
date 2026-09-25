@@ -7,13 +7,13 @@ from typing import Protocol
 from app.domain.clock import utcnow
 from app.domain.enums import RequestStatus as S
 from app.domain.enums import RequestType
-from app.domain.errors import InvalidTransitionError, NotAuthorizedError, ReviewNoteRequiredError
-from app.domain.roles import UserLike, can_review
+from app.domain.errors import InvalidTransitionError, NotAuthorizedError
+from app.domain.roles import UserLike, can_decide
 
 TRANSITIONS: dict[S, frozenset[S]] = {
     S.DRAFT: frozenset({S.PENDING_APPROVAL, S.SUBMISSION_FAILED, S.CANCELLED}),
     S.SUBMISSION_FAILED: frozenset({S.PENDING_APPROVAL, S.CANCELLED}),
-    S.PENDING_APPROVAL: frozenset({S.APPROVED, S.REJECTED}),
+    S.PENDING_APPROVAL: frozenset({S.APPROVED, S.REJECTED, S.CANCELLED}),
     S.APPROVED: frozenset(),
     S.REJECTED: frozenset(),
     S.CANCELLED: frozenset(),
@@ -24,6 +24,7 @@ TERMINAL_STATUSES = frozenset(s for s, targets in TRANSITIONS.items() if not tar
 class TransitionableRequest(Protocol):
     request_type: RequestType
     employee_id: int
+    approver_user_id: int | None
     status: S
     submitted_at: datetime | None
     reviewed_by_user_id: int | None
@@ -59,8 +60,13 @@ def apply_transition(
 ) -> TransitionResult:
     """Validate and apply a status change in place; return (from_status, to_status).
 
-    * Approve/reject need an actor who may review this request type and who is not the
-      request's own employee (no self-approval). Reject also needs a non-empty note.
+    * Approve/reject need the request's assigned approver (``approver_user_id``): an active user
+      with the matching approver role who is not the request's own employee (no
+      self-approval). Only a ``pending_approval`` request can be decided (the state machine).
+      The reviewer note is optional for both.
+    * Cancelling a request that is already ``pending_approval`` (not yet reviewed) needs the
+      request's own employee as actor. Cancelling a ``draft`` / ``submission_failed`` request
+      accepts no actor (system), but an actor that is given must be the owner.
     * Moving to ``pending_approval`` stamps ``submitted_at`` (first time only).
     Nothing is mutated when a rule is violated.
     """
@@ -71,15 +77,18 @@ def apply_transition(
     clean_note = note.strip() if note and note.strip() else None
 
     if to_status in (S.APPROVED, S.REJECTED):
-        if actor is None or not can_review(actor, request.request_type):
-            raise NotAuthorizedError("Actor may not review this request type")
-        if actor.id == request.employee_id:
-            raise NotAuthorizedError("Reviewers cannot review their own requests")
-        if to_status == S.REJECTED and clean_note is None:
-            raise ReviewNoteRequiredError("A reviewer note is required to reject a request")
+        if actor is None or not can_decide(actor, request):
+            if actor is not None and actor.id == request.employee_id:
+                raise NotAuthorizedError("Reviewers cannot review their own requests")
+            raise NotAuthorizedError("Only the assigned approver may decide this request")
         request.reviewed_by_user_id = actor.id
         request.reviewed_at = now
         request.reviewer_note = clean_note
+    elif to_status == S.CANCELLED:
+        if from_status == S.PENDING_APPROVAL and actor is None:
+            raise NotAuthorizedError("Only the requester can cancel a pending request")
+        if actor is not None and actor.id != request.employee_id:
+            raise NotAuthorizedError("Only the requester can cancel this request")
     elif to_status == S.PENDING_APPROVAL and request.submitted_at is None:
         request.submitted_at = now
 
