@@ -72,7 +72,7 @@ def add_message(
 
 
 def find_card_message(
-    session: Session, conversation_id: int, card_id: str
+    session: Session, conversation_id: int, card_id: str, ui_type: str = "confirmation_card"
 ) -> ConversationMessage | None:
     rows = session.scalars(
         select(ConversationMessage)
@@ -84,11 +84,7 @@ def find_card_message(
     )
     for row in rows:
         ui = (row.ui_metadata_json or {}).get("ui")
-        if (
-            isinstance(ui, dict)
-            and ui.get("type") == "confirmation_card"
-            and (ui.get("card_id") == card_id)
-        ):
+        if isinstance(ui, dict) and ui.get("type") == ui_type and (ui.get("card_id") == card_id):
             return row
     return None
 
@@ -103,6 +99,22 @@ def set_card_state(session: Session, conversation_id: int, card_id: str, state: 
     ui["state"] = state
     metadata["ui"] = ui
     row.ui_metadata_json = metadata  # new object so the JSON column is marked dirty
+    return True
+
+
+def set_inbox_card_state(
+    session: Session, conversation_id: int, card_id: str, state: str, outcome: str | None
+) -> bool:
+    """Update the stored inbox card (done / skipped / stale) so reopening shows it correctly."""
+    row = find_card_message(session, conversation_id, card_id, "inbox_card")
+    if row is None:
+        return False
+    metadata = dict(row.ui_metadata_json or {})
+    ui = dict(metadata["ui"])
+    ui["state"] = state
+    ui["outcome"] = outcome
+    metadata["ui"] = ui
+    row.ui_metadata_json = metadata
     return True
 
 

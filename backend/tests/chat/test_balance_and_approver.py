@@ -39,6 +39,7 @@ from tests.chat.helpers import (
     update_turn,
 )
 from tests.conftest import CSRF_HEADERS, login, make_settings
+from tests.inbox.helpers import strip_capabilities
 
 DANIEL = "daniel.wong@example.com"
 HELEN = "helen.yeung@example.com"
@@ -522,12 +523,27 @@ def test_the_confirm_time_check_is_still_the_second_guard(
     assert count(seeded, LeaveRequest) == 10
 
 
-def test_users_without_any_approver_still_get_no_chat_at_all(chat_app: FastAPI):
-    """Helen and Eva (no approvers in the seed) are stopped by the API before any assistant work."""
+def test_users_who_neither_file_nor_approve_get_no_chat_at_all(chat_app: FastAPI, seeded: Database):
+    """Users with no approver AND no queue are stopped by the API before any assistant work.
+    Helen and Eva (no approvers, but they decide a queue) may open the chat for the bell inbox;
+    they still cannot file (see test_helen_and_eva_may_chat_but_cannot_file)."""
     for email in (HELEN, EVA):
         client = TestClient(chat_app, headers=CSRF_HEADERS)
         login(client, email)
+        assert client.post("/api/chat/conversations").status_code == 201
+        strip_capabilities(seeded, email)
         assert client.post("/api/chat/conversations").status_code == 403
+
+
+@pytest.mark.parametrize(("email", "word"), [(HELEN, "leave"), (EVA, "claim")])
+def test_helen_and_eva_may_chat_but_cannot_file(
+    chat_app: FastAPI, llm: ScriptedLLM, email: str, word: str
+):
+    chat = as_user(chat_app, email)
+    llm.push(leave_turn(**FULL_LEAVE) if word == "leave" else claim_turn(**VALID_CLAIM))
+    reply = chat.say("please file it for me")
+    assert "no approver is configured" in text_of(reply)
+    assert ui_of(reply) is None and reply["conversation"]["has_pending_card"] is False
 
 
 # ---- the result names the approver ----

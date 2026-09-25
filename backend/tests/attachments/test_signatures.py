@@ -21,6 +21,7 @@ from tests.attachments.helpers import (
     upload,
 )
 from tests.chat.helpers import Chat
+from tests.inbox.helpers import strip_capabilities
 
 
 def stored_files(upload_dir: Path) -> list[Path]:
@@ -162,8 +163,12 @@ def test_second_file_part_is_422(cathy: TestClient, chat: Chat, upload_dir: Path
 
 
 def test_role_ownership_and_auth(
-    cathy: TestClient, amy: TestClient, hr: TestClient, anon: TestClient, chat: Chat
+    cathy: TestClient, amy: TestClient, hr: TestClient, anon: TestClient, chat: Chat, seeded
 ) -> None:
+    # Helen decides a queue, so she may use the chat (bell inbox) but the conversation is not
+    # hers; a user who neither files nor approves is refused outright.
+    assert upload(hr, chat.id, PNG).status_code == 404
+    strip_capabilities(seeded, "helen.yeung@example.com")
     assert upload(hr, chat.id, PNG).status_code == 403
     assert upload(anon, chat.id, PNG).status_code == 401
     assert upload(amy, chat.id, PNG).status_code == 404  # someone else's conversation

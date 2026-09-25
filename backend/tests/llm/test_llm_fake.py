@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from app.domain.enums import ClaimType, DayPart, LeaveType, RequestStatus, RequestType
+from app.llm.base import LLMError
 from app.llm.fake import FakeLLMProvider
 from app.llm.schemas import AgentTurn, ClaimFields, Intent, LeaveFields, LLMContext
 
@@ -385,3 +386,17 @@ def test_never_raises_on_junk() -> None:
 
 def test_never_raises_on_non_string() -> None:
     assert fake.analyse(None, ctx()).intent is Intent.UNCLEAR  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["[[llm-down]]", "annual leave tomorrow [[llm-down]]", "hello [[LLM-DOWN]] there"],
+)
+def test_llm_down_trigger_raises_llm_error(message: str) -> None:
+    """Test-only outage trigger used by the end-to-end suite."""
+    with pytest.raises(LLMError, match="Simulated outage"):
+        run(message)
+
+
+def test_llm_down_trigger_needs_the_exact_marker() -> None:
+    assert run("the llm is down [llm-down]").intent is not None  # no raise

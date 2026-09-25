@@ -1,6 +1,7 @@
 """Shared fixtures. Everything is offline; Settings never read the real repo .env."""
 
 import os
+import tempfile
 from collections.abc import Callable, Iterator
 from datetime import date
 from typing import Any
@@ -11,6 +12,8 @@ os.environ["APP_ENV"] = "test"
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["DB_AUTO_SEED"] = "false"
 os.environ["JWT_SECRET_KEY"] = "import-time-test-secret-" + "i" * 32
+# A test that resets the demo data must never touch a real ./data/uploads folder.
+os.environ["UPLOAD_DIR"] = tempfile.mkdtemp(prefix="scmp-test-uploads-")
 
 import pytest
 from fastapi import FastAPI

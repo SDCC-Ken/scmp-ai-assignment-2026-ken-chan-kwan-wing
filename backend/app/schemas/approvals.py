@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from app.domain.enums import LeaveType, RequestStatus, RequestType
-from app.schemas.chat import AttachmentInfo, IsoZ
+from app.schemas.common import AttachmentInfo, IsoZ
 
 NOTE_MAX_CHARS = 500
 
@@ -101,6 +101,18 @@ class ApprovalDetail(BaseModel):
     warnings: list[str]
 
 
+def clean_note(value: str | None) -> str | None:
+    """Trim; empty becomes ``None``; more than 500 characters is a validation error."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > NOTE_MAX_CHARS:
+        raise ValueError(f"The note can be at most {NOTE_MAX_CHARS} characters.")
+    return value
+
+
 class DecisionBody(BaseModel):
     """``note`` is optional for both decisions: trimmed, empty becomes ``None``, max 500."""
 
@@ -110,14 +122,7 @@ class DecisionBody(BaseModel):
     @field_validator("note")
     @classmethod
     def _clean_note(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        if not value:
-            return None
-        if len(value) > NOTE_MAX_CHARS:
-            raise ValueError(f"The note can be at most {NOTE_MAX_CHARS} characters.")
-        return value
+        return clean_note(value)
 
 
 class DecisionResponse(BaseModel):

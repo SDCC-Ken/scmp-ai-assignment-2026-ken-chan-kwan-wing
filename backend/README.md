@@ -107,8 +107,10 @@ Routing is **per user**: `users.leave_approver_user_id` and `users.claim_approve
 (nullable). The approver is copied onto the request as `approver_user_id` when it is created and
 is the only person notified. A user with no approver for a request type cannot file it (the
 assistant explains and saves nothing); a user with none at all (`can_request` false: Helen and
-Eva in the seed) gets 403 from the chat and from `GET /api/me/balances`. `require_requester`
-(`app/auth`) implements that gate; `require_roles(UserRole.EMPLOYEE)` means "requester".
+Eva in the seed) gets 403 from `GET /api/me/balances`, and from the chat unless they decide a queue
+(Phase 3-D: `require_chat_access` = can file OR approves, so Helen and Eva can use the bell inbox).
+`require_requester` (`app/auth`) implements the stricter requester gate; `require_roles(
+UserRole.EMPLOYEE)` means "requester".
 
 - `app/services/routing.py`: `resolve_approver(session, user, request_type)` returns the approver
   or an `ApproverProblem` (not configured, inactive, is the requester, wrong role).
@@ -183,6 +185,24 @@ test uses a temporary file database).
 - Rules: `../docs/business-rules.md` (L-13, L-14, C-06, C-11, section 4d); shapes:
   `../docs/chat-api-contract.md`. Live check: `RUN_LIVE_LLM=1 uv run python scripts/live_llm_smoke.py
   --provider ollama --only balance` (also `--only date`, `--only dollar`).
+
+## Inbox: the bell opens a "handle it one by one" conversation (Phase 3-D)
+
+- `POST /api/chat/inbox` (any user who can file requests or decides a queue) snapshots what needs
+  the caller: pending approvals assigned to them (oldest first, same detail as the approvals screen)
+  and their other unread notifications. Empty: `200 {"empty": true, "unread_count": N}` and no
+  conversation. Otherwise it creates a NEW conversation "Items to handle (N)" with an intro and the
+  first `inbox_card`; the queue and position live in `conversations.state_json` (no new table).
+- Card buttons go through the existing `POST /api/chat/conversations/{id}/actions`: `approve` and
+  `reject` (need `confirmed: true`, optional `note`), `skip`, `acknowledge`. Approve and reject call
+  `services.approvals.decide` (the function behind the approvals endpoint; audit metadata gets
+  `"via": "inbox"`); a card is claimed with a compare-and-swap first, so a double click has one
+  winner. An item decided elsewhere becomes a `stale` card and the next one is shown.
+- Chat access is now "can file requests OR decides a queue" (`require_chat_access`), so Helen and
+  Eva can use the inbox; they still cannot file (no approver configured).
+- Code: `app/chat/inbox.py`, `app/schemas/inbox.py`, state in `app/chat/state.py` (`InboxState`).
+  Rules: `../docs/business-rules.md` (IN-01..IN-19); shapes: `../docs/chat-api-contract.md`;
+  tests: `uv run pytest -q tests/inbox`.
 
 ## Public holidays
 

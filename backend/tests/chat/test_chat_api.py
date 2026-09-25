@@ -36,6 +36,7 @@ from tests.chat.helpers import (
     ui_of,
 )
 from tests.conftest import CSRF_HEADERS, login, make_settings
+from tests.inbox.helpers import strip_capabilities
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
@@ -411,17 +412,24 @@ def test_configured_length_limit_is_used(seeded: Database, llm: ScriptedLLM) -> 
 def test_bad_action_bodies_are_422(chat: Chat) -> None:
     """HC-17"""
     url = f"/api/chat/conversations/{chat.id}/actions"
-    assert chat.client.post(url, json={"card_id": "c_x", "action": "approve"}).status_code == 422
+    assert chat.client.post(url, json={"card_id": "c_x", "action": "bogus"}).status_code == 422
+    # inbox actions are valid in the schema but need an open inbox card of this conversation
+    assert chat.client.post(url, json={"card_id": "c_x", "action": "approve"}).status_code == 409
     assert chat.client.post(url, json={"action": "confirm"}).status_code == 422
 
 
 @pytest.mark.parametrize("who", ["hr", "finance"])
 def test_users_without_an_approver_cannot_use_the_chat(
-    who: str, request: pytest.FixtureRequest, cathy: TestClient
+    who: str, request: pytest.FixtureRequest, cathy: TestClient, seeded: Database
 ) -> None:
-    """HC-18: Helen and Eva have no approver configured (out of the PoC scope), so no chat.
-    Approvers who DO have one (Cathy) are requesters too: see tests/org/test_access.py."""
+    """HC-18: a user with no approver configured AND no queue to decide gets no chat. Helen and
+    Eva have no approver but decide a queue, so they may use it (bell inbox, IN-01): here they
+    are stripped of the queue too. Approvers who have an approver (Cathy) are requesters too:
+    see tests/org/test_access.py."""
     client: TestClient = request.getfixturevalue(who)
+    strip_capabilities(
+        seeded, "helen.yeung@example.com" if who == "hr" else "eva.cheung@example.com"
+    )
     chat_id = Chat(cathy).id
     assert client.get("/api/chat/conversations").status_code == 403
     assert client.post("/api/chat/conversations").status_code == 403

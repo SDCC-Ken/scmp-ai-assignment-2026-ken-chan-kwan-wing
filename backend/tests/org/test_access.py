@@ -7,6 +7,7 @@ from app.auth.dependencies import REQUESTER_FORBIDDEN_DETAIL
 from app.db.models import User
 from app.db.session import Database
 from tests.conftest import SEED_TODAY, auth, get_user, login
+from tests.inbox.helpers import strip_capabilities
 
 AMY = "amy.lau@example.com"
 BEN = "ben.chow@example.com"
@@ -99,15 +100,29 @@ def test_can_request_follows_the_configured_approvers_live(
 
 @pytest.mark.parametrize(
     ("email", "status"),
-    [(AMY, 200), (BEN, 200), (CATHY, 200), (DANIEL, 200), (HELEN, 403), (EVA, 403)],
+    [(AMY, 200), (BEN, 200), (CATHY, 200), (DANIEL, 200), (HELEN, 200), (EVA, 200)],
 )
 def test_requester_matrix_on_the_chat(client: TestClient, email: str, status: int) -> None:
+    """Everybody in the seed may use the chat: requesters file, Helen and Eva use the bell
+    inbox (they decide a queue). A user with neither capability is refused (next test)."""
     token = login(client, email)
     response = client.get("/api/chat/conversations", headers=auth(token))
     assert response.status_code == status, response.text
     if status == 403:
         assert response.json() == {"detail": REQUESTER_FORBIDDEN_DETAIL}
         assert "no approver is configured" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("email", [AMY, HELEN, EVA])
+def test_a_user_with_neither_capability_gets_403_on_the_chat(
+    client: TestClient, seeded: Database, email: str
+) -> None:
+    token = login(client, email)
+    strip_capabilities(seeded, email)
+    response = client.get("/api/chat/conversations", headers=auth(token))
+    assert response.status_code == 403
+    assert response.json() == {"detail": REQUESTER_FORBIDDEN_DETAIL}
+    assert "no approver is configured" in response.json()["detail"]
 
 
 def test_unauthenticated_chat_is_401(client: TestClient) -> None:

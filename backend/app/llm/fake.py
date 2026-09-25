@@ -1,4 +1,5 @@
-"""Deterministic, rule-based LLM stand-in (``LLM_PROVIDER=fake``): no network, never raises.
+"""Deterministic, rule-based LLM stand-in (``LLM_PROVIDER=fake``): no network, never raises
+(except for the test-only outage trigger below).
 
 For offline development and end-to-end tests. It is NOT a language model: it only understands
 the phrases below, and anything else becomes ``unclear``.
@@ -44,6 +45,12 @@ One-day reply    when the context awaits `end_date` and the current leave has a 
                  message sets that date instead)
 Everything else  unclear
 
+Test-only outage trigger
+------------------------
+A message containing ``[[llm-down]]`` (any case) raises ``LLMError("Simulated outage")``, so
+end-to-end tests can exercise the "AI service is unavailable" path without a real outage. It
+is only reachable with ``LLM_PROVIDER=fake``.
+
 Attachments (no OCR)
 --------------------
 The fake provider cannot read images. A test fixture attachment is any file whose bytes contain
@@ -80,6 +87,7 @@ from collections.abc import Sequence
 from datetime import date, timedelta
 
 from app.domain.enums import ClaimType, DayPart, LeaveType, RequestStatus, RequestType
+from app.llm.base import LLMError
 from app.llm.schemas import (
     AgentTurn,
     AttachmentInput,
@@ -94,6 +102,7 @@ from app.llm.schemas import (
 )
 
 _MAX_CHARS = 2000
+LLM_DOWN_TRIGGER = "[[llm-down]]"  # test-only: makes ``analyse`` raise LLMError
 
 _WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 _MONTHS = {
@@ -703,6 +712,8 @@ class FakeLLMProvider:
         context: LLMContext,
         attachments: Sequence[AttachmentInput] = (),
     ) -> AgentTurn:
+        if isinstance(user_message, str) and LLM_DOWN_TRIGGER in user_message.lower():
+            raise LLMError("Simulated outage")
         try:
             message = user_message if isinstance(user_message, str) else ""
             if not attachments:

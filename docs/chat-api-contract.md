@@ -1,8 +1,9 @@
 # Chat API contract (Phase 2)
 
 Shared by the backend and the frontend. All routes are under `/api/chat`, require the session
-cookie and the `employee` role (other roles get `403 {"detail":"Forbidden"}`), and every POST
-needs `X-Requested-With: XMLHttpRequest`. All data is fictional.
+cookie and a user who can file requests (an approver is configured) **or** decides an approval
+queue (Phase 3: Cathy, Daniel, Helen and Eva may all use it; a user with neither gets `403`), and
+every POST needs `X-Requested-With: XMLHttpRequest`. All data is fictional.
 
 The LLM only classifies intent and extracts fields. The backend validates everything, owns the
 state transitions, saves to SQLite and calls ReqRes. **A request is only saved and submitted
@@ -196,3 +197,52 @@ Behaviour:
   filled in (the assistant asks "What is the date on the receipt?"); a bare `$`, `HK$`, "dollars"
   and "HK dollars" are HKD, `USD`/`US$`/"US dollars" are still rejected (business-rules.md L-14,
   C-11, C-06).
+
+## Phase 3-D additions: the bell inbox (`docs/inbox-design.md`)
+
+Clicking the bell starts a new conversation that shows everything waiting for the caller, one
+card at a time. Rules: business-rules.md IN-01..IN-19.
+
+| Method and path | Body | Result |
+| --- | --- | --- |
+| `POST /api/chat/inbox` | none | Nothing to handle: `200 {"empty": true, "unread_count": 0}` (no conversation; `unread_count` is the caller's real unread count). Otherwise `201 {"empty": false, "conversation": ConversationSummary, "assistant_messages": [Message, Message], "warning_code": null}`: a NEW conversation titled `Items to handle (N)` with the intro text and the first `InboxCard` message |
+| `POST /api/chat/conversations/{id}/actions` | `{"card_id", "action": "approve" or "reject" or "skip" or "acknowledge", "note": null or "<=500 chars", "confirmed": true}` | `TurnResponse` (`user_message` null): a short result message, then the NEXT `InboxCard` message or the closing message |
+
+`confirmed` must be `true` for `approve` and `reject` (422 otherwise; the UI asks for a second
+click) and is ignored otherwise; `note` is only used by them (trimmed, empty means none, at most 500
+characters, else 422). `confirm` / `discard` keep working for confirmation cards. `card_id` must be
+the newest OPEN inbox card of that conversation (409 with `warning_code: "stale_card"` otherwise);
+`approve` / `reject` on a notice or `acknowledge` on an approval is 422; someone else's conversation
+is 404.
+
+```jsonc
+InboxCard = {                                    // Message.ui.type = "inbox_card"; trace is null
+  "type": "inbox_card", "card_id": "i_7c1d2e",
+  "kind": "approval" | "notice",
+  "position": {"index": 1, "total": 3},          // position in the snapshot (a dropped item leaves a gap)
+  "title": "Leave request #1 from Amy Lau",      // notice: the bell title, e.g. "Your leave request #1 was approved"
+  "request_type": "leave" | "claim" | null, "request_id": 1 | null,
+  "detail": ApprovalDetail | null,               // kind "approval": exactly GET /api/approvals/{type}/{id}
+  "notice": {"title": "...", "body": "..."} | null,   // kind "notice"
+  "actions": ["approve", "reject", "skip"] | ["acknowledge", "skip"],
+  "state": "open" | "done" | "skipped" | "stale",
+  "outcome": null | "approved" | "rejected" | "acknowledged"
+}
+```
+
+Behaviour the UI can rely on:
+1. Only the newest inbox card is `open`; after an action the acted card is stored as `done` (with
+   `outcome`), `skipped` or `stale`, so reopening the conversation shows the states, and the open
+   card is restored. `ConversationSummary.has_pending_card` is true while an inbox card is open.
+2. Every action answers with `assistant_messages`: the result ("You approved leave request #1 from
+   Amy Lau.", "Skipped ...", "Got it. I marked that notice as read.", or "That request was already
+   handled." when it was decided or cancelled elsewhere), then the next card (message text "Item 2
+   of 3") or the closing message ("All done. You handled 2 items and skipped 1. Skipped items stay
+   in your bell and in Approvals."). A stale item is HTTP **200** with a `stale` card, not 409.
+3. Items are re-validated before they are shown: one that is no longer pending or was read
+   elsewhere is skipped silently and counted as "already handled" in the closing message.
+4. Typing normal text in an inbox conversation works like any chat message; an open inbox card is
+   not closed by it. Approvers who are not requesters (Helen, Eva) are refused politely when they
+   try to file.
+5. The bell's unread number still comes from `GET /api/notifications`; `POST /api/chat/inbox` is
+   what the bell click calls.

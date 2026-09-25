@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.agent.graph import Reply, TurnResult, run_turn
+from app.chat import inbox as inbox_flow
 from app.chat.actions import ActionResult, CardActions, StaleCardError
 from app.chat.policy import HISTORY_MESSAGE_CHARS, HISTORY_MESSAGES
 from app.chat.state import ConversationState, load_state
@@ -28,6 +29,8 @@ from app.llm.schemas import ChatTurn
 from app.schemas.chat import (
     ConversationDetail,
     ConversationSummary,
+    InboxEmpty,
+    InboxOpened,
     Message,
     TraceStep,
     TurnResponse,
@@ -119,10 +122,16 @@ class ChatService:
             out.append(
                 ConversationSummary(
                     id=conv.id,
-                    title=make_title(first_messages.get(conv.id)),
+                    title=(
+                        state.inbox.title
+                        if state.inbox is not None
+                        else make_title(first_messages.get(conv.id))
+                    ),
                     status=conv.status.value,
                     active_request_type=conv.active_request_type,
-                    has_pending_card=state.open_card() is not None,
+                    has_pending_card=(
+                        state.open_card() is not None or state.open_inbox_card_id() is not None
+                    ),
                     created_at=conv.created_at,
                     updated_at=conv.updated_at,
                 )
@@ -267,9 +276,36 @@ class ChatService:
             warning_code=result.reply.warning_code,  # type: ignore[arg-type]
         )
 
+    # ---- bell inbox ----------------------------------------------------------------------------
+    def open_inbox(self) -> InboxOpened | InboxEmpty:
+        """A new "Items to handle (N)" conversation, or ``empty`` when nothing needs handling."""
+        opened = inbox_flow.open_inbox(self.session, self.user)
+        if isinstance(opened, int):
+            return InboxEmpty(unread_count=opened)
+        return InboxOpened(
+            conversation=self._summary(opened.conversation),
+            assistant_messages=[message_out(m) for m in opened.messages],
+        )
+
     # ---- card actions ------------------------------------------------------------------------
-    def post_action(self, conversation_id: int, card_id: str, action: str) -> TurnResponse:
+    def post_action(
+        self,
+        conversation_id: int,
+        card_id: str,
+        action: str,
+        note: str | None = None,
+        confirmed: bool | None = None,
+    ) -> TurnResponse:
         conv = self._owned(conversation_id)
+        if action in ("approve", "reject", "skip", "acknowledge"):
+            messages = inbox_flow.act(
+                self.session, self.user, conv, card_id, action, note, confirmed
+            )
+            return TurnResponse(
+                conversation=self._summary(conv),
+                user_message=None,
+                assistant_messages=[message_out(m) for m in messages],
+            )
         state: ConversationState = load_state(conv.state_json, conv.active_request_type)
         card = state.open_card()
         if card is None or card.card_id != card_id:

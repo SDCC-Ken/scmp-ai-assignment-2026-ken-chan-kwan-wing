@@ -962,8 +962,10 @@ def test_there_are_no_approver_actions_in_the_chat(
     llm.push(receipt_turn())
     card = card_of(say_files(chat, "", file_id))
     for action in ("approve", "reject"):
+        # inbox actions never apply to a confirmation card: 409, and the card stays open
         response = chat.act_raw(card["card_id"], action)
-        assert response.status_code == 422
+        assert response.status_code == 409
+    assert chat.detail()["conversation"]["has_pending_card"] is True
 
 
 # ---- trace -----------------------------------------------------------------------------------

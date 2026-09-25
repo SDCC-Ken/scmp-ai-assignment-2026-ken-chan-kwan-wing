@@ -100,6 +100,16 @@ def require_requester(user: User = Depends(get_current_user)) -> User:
     return user
 
 
+def require_chat_access(user: User = Depends(get_current_user)) -> User:
+    """403 unless the user may use the chat: can file requests (has an approver configured) OR
+    decides one of the approval queues (``approves`` is set), so Helen and Eva can use the bell
+    inbox. Filing a request still needs an approver (the assistant refuses politely without one).
+    """
+    if user_can_request(user) or user.approves is not None:
+        return user
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=REQUESTER_FORBIDDEN_DETAIL)
+
+
 def require_roles(*roles: UserRole) -> Callable[..., User]:
     """Dependency factory: 403 unless the current user's (DB) role is one of ``roles``.
 

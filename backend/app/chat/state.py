@@ -63,6 +63,34 @@ class HeldDocument(BaseModel):
     extraction: dict[str, Any]
 
 
+class InboxItem(BaseModel):
+    """One entry of a bell-inbox snapshot (see ``app.chat.inbox``)."""
+
+    kind: Literal["approval", "notice"]
+    request_type: RequestType
+    request_id: int
+    notification_id: int | None = None  # kind "notice": the notification this item stands for
+
+
+class InboxState(BaseModel):
+    """The queue of an "Items to handle" conversation, stored with the conversation.
+
+    ``index`` is the position (0-based) of the item whose card is shown, or was shown last
+    (-1 before the first card); ``open_card_id`` is the newest card still waiting for an answer.
+    Independent of the confirmation-card ``pending_card`` and of the draft: normal chat keeps
+    working while an inbox card is open.
+    """
+
+    title: str
+    items: list[InboxItem]
+    index: int = -1
+    open_card_id: str | None = None
+    handled: int = 0  # approved, rejected or acknowledged
+    skipped: int = 0
+    already_handled: int = 0  # dropped because it was handled elsewhere or no longer applies
+    finished: bool = False
+
+
 class ConversationState(BaseModel):
     active_request_type: RequestType | None = None
     leave: LeaveSlots = Field(default_factory=LeaveSlots)
@@ -86,6 +114,9 @@ class ConversationState(BaseModel):
     doc_warnings: list[str] = Field(default_factory=list)  # e.g. the name on the document differs
     held_document: HeldDocument | None = None
     pending_card: PendingCard | None = None
+    inbox: InboxState | None = (
+        None  # only in "Items to handle" conversations (optional, legacy-safe)
+    )
     state_version: int = 0
 
     def has_draft(self) -> bool:
@@ -96,6 +127,9 @@ class ConversationState(BaseModel):
     def open_card(self) -> PendingCard | None:
         card = self.pending_card
         return card if card is not None and card.state == "open" else None
+
+    def open_inbox_card_id(self) -> str | None:
+        return self.inbox.open_card_id if self.inbox is not None else None
 
     def reset_draft(self) -> None:
         self.active_request_type = None

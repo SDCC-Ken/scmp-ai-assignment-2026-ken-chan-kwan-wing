@@ -1,21 +1,13 @@
 """Chat API shapes (see docs/chat-api-contract.md). Timestamps are ISO-8601 UTC ending in ``Z``."""
 
-from datetime import UTC, datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, PlainSerializer
+from pydantic import BaseModel, Field, field_validator
 
 from app.domain.enums import RequestType
-
-
-def iso_z(value: datetime) -> str:
-    """UTC timestamp with second precision and a trailing ``Z`` (naive values are taken as UTC)."""
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-IsoZ = Annotated[datetime, PlainSerializer(iso_z, return_type=str)]
+from app.schemas.approvals import clean_note
+from app.schemas.common import AttachmentInfo, IsoZ
+from app.schemas.inbox import InboxCard
 
 TraceStepName = Literal[
     "understand", "documents", "merge", "validate", "decide", "submit", "status", "respond"
@@ -29,15 +21,6 @@ class TraceStep(BaseModel):
     detail: str = ""
     ok: bool = True
     duration_ms: int = 0
-
-
-class AttachmentInfo(BaseModel):
-    id: int
-    filename: str
-    content_type: str
-    size_bytes: int
-    url: str  # /api/attachments/{id}
-    created_at: IsoZ
 
 
 class CardField(BaseModel):
@@ -119,7 +102,8 @@ class BalanceCard(BaseModel):
 
 
 UiCard = Annotated[
-    ConfirmationCard | StatusCard | ResultCard | BalanceCard, Field(discriminator="type")
+    ConfirmationCard | StatusCard | ResultCard | BalanceCard | InboxCard,
+    Field(discriminator="type"),
 ]
 
 
@@ -159,6 +143,22 @@ class TurnResponse(BaseModel):
     warning_code: WarningCode | None = None
 
 
+class InboxOpened(BaseModel):
+    """``POST /api/chat/inbox`` (201): the new conversation, the intro and the first card."""
+
+    empty: Literal[False] = False
+    conversation: ConversationSummary
+    assistant_messages: list[Message]
+    warning_code: WarningCode | None = None
+
+
+class InboxEmpty(BaseModel):
+    """``POST /api/chat/inbox`` (200): nothing to handle, so no conversation was created."""
+
+    empty: Literal[True] = True
+    unread_count: int
+
+
 class MessageBody(BaseModel):
     # The upper bound comes from settings.chat_max_message_chars and is enforced in the route
     # (422), so it can be configured without changing this schema.
@@ -169,8 +169,19 @@ class MessageBody(BaseModel):
 
 
 class ActionBody(BaseModel):
+    """A card button. ``confirm`` / ``discard`` are for confirmation cards; ``approve`` / ``reject``
+    / ``skip`` / ``acknowledge`` are for inbox cards (``confirmed`` is required for approve and
+    reject; ``note`` is only used by them: trimmed, empty becomes ``None``, at most 500)."""
+
     card_id: str = Field(min_length=1, max_length=64)
-    action: Literal["confirm", "discard"]
+    action: Literal["confirm", "discard", "approve", "reject", "skip", "acknowledge"]
+    note: str | None = None
+    confirmed: bool | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _clean_note(cls, value: str | None) -> str | None:
+        return clean_note(value)
 
 
 STATUS_LABELS = {

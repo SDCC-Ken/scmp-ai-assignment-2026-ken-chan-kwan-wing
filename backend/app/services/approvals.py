@@ -365,10 +365,14 @@ def decide(
     request_id: int,
     decision: str,
     note: str | None,
+    *,
+    via: str | None = None,
 ) -> DecisionResponse:
     """Approve or reject. Commits on success; nothing is written on any error.
 
-    ``note`` must already be trimmed (empty -> None, see ``DecisionBody``).
+    ``note`` must already be trimmed (empty -> None, see ``DecisionBody``). ``via`` names the
+    channel when it is not the approvals screen (the inbox chat passes ``"inbox"``); it is added
+    to the audit metadata only when given.
     """
     req = _assigned(session, approver, request_type, request_id)
     if req.status != PENDING:
@@ -423,6 +427,8 @@ def decide(
         }
         if request_type == RequestType.LEAVE:
             metadata["team_overlap_count"] = len(ctx.overlap)
+        if via is not None:
+            metadata["via"] = via
         record_audit(
             session,
             entity_type=entity_type(request_type),

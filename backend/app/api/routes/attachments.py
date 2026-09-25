@@ -14,10 +14,9 @@ from python_multipart.multipart import MultipartParser, parse_options_header
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.auth.dependencies import get_current_user, require_roles
+from app.auth.dependencies import get_current_user, require_chat_access
 from app.db.models import Attachment, Conversation, User
 from app.db.session import get_db
-from app.domain.enums import UserRole
 from app.schemas.attachments import AttachmentResponse
 from app.services.attachments import (
     AttachmentError,
@@ -37,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 upload_router = APIRouter(prefix="/chat", tags=["attachments"])
 download_router = APIRouter(prefix="/attachments", tags=["attachments"])
-Employee = Depends(require_roles(UserRole.EMPLOYEE))
+ChatUser = Depends(require_chat_access)  # may file requests or decide a queue (Phase 3 inbox)
 
 # The multipart envelope (boundaries, part headers, small extra fields) may add a little to the
 # file itself; anything beyond this is refused without reading further.
@@ -179,7 +178,7 @@ async def upload_attachment(
     conversation_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Employee,
+    user: User = ChatUser,
 ) -> Any:
     settings = request.app.state.settings
     try:

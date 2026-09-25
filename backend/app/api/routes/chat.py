@@ -8,12 +8,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_llm_provider, get_submission_adapter
-from app.auth.dependencies import require_roles
+from app.auth.dependencies import require_chat_access
 from app.chat.actions import StaleCardError
+from app.chat.inbox import InboxActionInvalid, InboxConflict
 from app.chat.service import ChatService, ConversationConflict, ConversationNotFound
 from app.db.models import User
 from app.db.session import get_db
-from app.domain.enums import UserRole
 from app.integrations.base import SubmissionAdapter
 from app.llm.base import LLMProvider
 from app.schemas.chat import (
@@ -21,6 +21,8 @@ from app.schemas.chat import (
     ConversationDetail,
     ConversationList,
     ConversationSummary,
+    InboxEmpty,
+    InboxOpened,
     MessageBody,
     TurnResponse,
 )
@@ -29,13 +31,14 @@ from app.services.attachments import AttachmentError
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
-Employee = Depends(require_roles(UserRole.EMPLOYEE))
+# Users who can file requests OR decide a queue (Phase 3: approvers use the bell inbox).
+ChatUser = Depends(require_chat_access)
 
 
 def get_chat_service(
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Employee,
+    user: User = ChatUser,
     llm: LLMProvider = Depends(get_llm_provider),
     adapter: SubmissionAdapter = Depends(get_submission_adapter),
 ) -> ChatService:
@@ -63,6 +66,25 @@ def list_conversations(service: ChatService = Depends(get_chat_service)) -> Conv
 )
 def create_conversation(service: ChatService = Depends(get_chat_service)) -> ConversationSummary:
     return service.create_conversation()
+
+
+@router.post(
+    "/inbox",
+    response_model=None,
+    responses={
+        200: {"model": InboxEmpty, "description": "Nothing to handle; no conversation created."},
+        201: {"model": InboxOpened, "description": "A new conversation with the first card."},
+    },
+)
+def open_inbox(service: ChatService = Depends(get_chat_service)) -> JSONResponse:
+    """The bell: start a new "Items to handle (N)" conversation (docs/inbox-design.md)."""
+    try:
+        opened = service.open_inbox()
+    except SQLAlchemyError:
+        logger.exception("Database error while opening the inbox")
+        return _db_unavailable()
+    code = status.HTTP_200_OK if isinstance(opened, InboxEmpty) else status.HTTP_201_CREATED
+    return JSONResponse(status_code=code, content=opened.model_dump(mode="json"))
 
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationDetail)
@@ -121,9 +143,20 @@ def post_action(
     service: ChatService = Depends(get_chat_service),
 ) -> Response | TurnResponse:
     try:
-        return service.post_action(conversation_id, body.card_id, body.action)
+        return service.post_action(
+            conversation_id, body.card_id, body.action, body.note, body.confirmed
+        )
     except ConversationNotFound:
         raise _not_found() from None
+    except InboxActionInvalid as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from None
+    except InboxConflict:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": "The conversation changed while I was working. Please try again."},
+        )
     except StaleCardError as exc:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
