@@ -106,6 +106,97 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
 - **Verification commands and results:** `docker compose config --quiet` valid; `docker compose up --build -d` → `api` healthy, `web` up; `curl localhost:9181/health` → `{"status":"ok"}`; `curl localhost:9180` → HTTP 200 with all six theme hex values present in the HTML; `docker compose down` afterwards.
 - **Commit:** `d9bb5d3` build: add Docker Compose deployment and document it in README.
 
+## Entry 05 - Phase 1 kickoff, design decisions and shared inputs (Ken → integrator agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), Claude Code, integrator.
+- **Actual prompt (Ken, condensed to the task list; the table names are exact):**
+  ```text
+  Phase 1 on DB, using SQLite. 1 install the model to Python. 2 add safe SQLite and create dummy records.
+  3 create tables: users, conversations, conversation_messages, leave_requests, claim_requests,
+    external_submissions, notifications, audit_events, public_holidays (seed_2026 / 1823_ics), feedback
+    (column lists supplied). Check how a user can apply for half-day leave.
+  4 seed: 5 users (3 employees, 1 HR, 1 Finance), 10 leave (2 pending, 1 approved, 1 rejected, rest past history),
+    10 claim (same), 12-16 audit events (creation, confirmation, API submission, approval, rejection, failures),
+    2-3 conversations.
+  5 seed safe 2026/2027 Hong Kong public holidays found on the internet; add a command and README steps for later years.
+  6 unit tests for seed data, role resolution, validation and state transitions.
+  7 Google sign-in mock in the frontend that shows the different roles and the 5 seed users (research the sign-in UI).
+  8 show a "mock sign-in" warning; after clicking, log in as that user.
+  9 create real auth and JWT with sign-in APIs.
+  Also: commit locally; Nuxt 4 and TypeScript 6 accepted; check whether tests run in Docker or locally.
+  ```
+- **Allowed scope:** integrator only: research, `.env.example`, `docker-compose.yml`, `README.md`, `PROMPT-INSTRUCTION.md`, and placing `backend/app/data/hk_public_holidays_1823.ics`.
+- **Agent result:**
+  - Holidays: fetched the official 1823 iCal (2025-2027, 17 dates per year) and cross-checked 2026 and 2027 line by line against the gov.hk holiday pages; they matched.
+  - Half-day design: added `start_day_part` / `end_day_part` (`full|am|pm`) to `leave_requests`, so `working_days` moves in 0.5 steps. This is an addition to the column list Ken supplied.
+  - Added `DB_AUTO_SEED`, `JWT_*` and `MOCK_SSO_ENABLED` to `.env.example`, and `NUXT_API_BASE_SERVER` to compose so Nuxt SSR reaches the API over the compose network.
+  - Answered the test question: tests run locally (`uv run pytest`, `bun run test`); Docker is only for running the stack.
+  - Wrote the API contract used by both sub-agents (Entries 06 and 07).
+- **Human review / changes requested:** Pending. Ken will test Phase 1.
+- **Verification commands and results:** see Entry 08.
+- **Commit:** `661e077` build: add auth/seed settings, server API URL and Phase 1 docs.
+
+## Entry 06 - Phase 1 database, seed data and JWT auth (backend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported by the sub-agent.
+- **Actual prompt (condensed from the task brief):**
+  ```text
+  Phase: 1 - Database, seed data, real JWT auth. Role: backend. File ownership: only backend/.
+  A. SQLAlchemy 2 + SQLite with safe pragmas (foreign_keys, WAL, busy_timeout), tz-aware UTC timestamps,
+     exact money, CHECK-constrained enums, the 10 tables and column lists from Ken (+ start/end_day_part).
+  B. Pure domain rules: status state machine, role resolution, half-day leave calculation
+     (Mon-Fri, excluding public holidays), Pydantic draft models.
+  C. Holiday ICS parser/upsert and a CLI: init-db, seed [--reset --yes], import-holidays.
+  D. Deterministic fictional seed with the counts Ken specified (5 users, 10 leave, 10 claim, 12-16 audit, 2-3 conversations).
+  E. Real auth with PyJWT: GET /api/auth/mock-users, POST /api/auth/mock-google/login, GET /api/auth/me,
+     POST /api/auth/logout; user and role re-read from the DB on every request; require_roles dependency.
+  F. Offline tests for constraints, seed, roles, transitions, leave days, holidays, CLI and the auth API.
+  Do not edit shared files or read .env; no commits; no ReqRes or Gemini calls.
+  ```
+- **Allowed scope:** `backend/` only.
+- **Agent result:** Added `app/db`, `app/domain`, `app/schemas`, `app/services`, `app/auth`, `app/api`, `app/seed.py`, `app/cli.py` and 11 test files; new dependencies `pyjwt` and `email-validator`. After seeding: users 5, leave 10, claims 10, external submissions 21, audit events 15, conversations 3, messages 9, notifications 6, holidays 34, feedback 2. Deviations the agent reported: `audit_events.entity_id` is nullable (failed logins for unknown emails); login accepts a plain string and returns the same 401 for malformed and unknown emails; extra CHECK constraints (approver role per request type, reject needs a note, reviewed rows need a reviewer, amount and working_days positive); money stored as integer cents and day counts as integer tenths (not floats); only four showcase requests have audit rows.
+- **Human review / changes requested:** Integrator read the JWT and login code: HS256 only, all claims required, expiry and issuer checked, no token or secret in logs or audit rows, identical error for unknown users. **Open point for Ken:** raw `working_days` shows `5` for a half day and `25` for 2.5 days (integer tenths), which is unfriendly when browsing the SQLite file; money is similarly stored as cents. Storing readable values is a small follow-up if Ken wants it.
+- **Verification commands and results (re-run by the integrator):** `uv run pytest -q` 205 passed; `uv run ruff check .` and `ruff format --check .` clean. Agent-reported: local smoke test (login, `/me`, logout, bad email), CLI on a temp DB, and a live `import-holidays --year 2027` fetch from 1823 (17 updated; `--year 2031` exits non-zero with a clear message).
+- **Commit:** `c81170c` feat(backend): add SQLite schema, domain rules, seed data, holidays CLI and JWT auth.
+
+## Entry 07 - Phase 1 mock Google sign-in UI (frontend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported by the sub-agent.
+- **Actual prompt (condensed from the task brief):**
+  ```text
+  Phase: 1 - Mock Google sign-in UI wired to real JWT auth. Role: frontend. File ownership: only frontend/.
+  Research Google's official sign-in branding and the account-chooser layout first and follow them.
+  /login with a mock warning visible before any click; a "Sign in with Google" button opens an accessible modal
+  chooser listing the 5 seeded users by role; choosing one calls POST /api/auth/mock-google/login.
+  useAuth/useApi with the JWT in a cookie, a global route guard, SSR validation through a private server-side API
+  base URL (NUXT_API_BASE_SERVER), role-aware home page and sign out. Pure logic in utils with Vitest.
+  Verify against a stub of the contract; lint, typecheck, test and build must pass. No edits outside frontend/.
+  ```
+- **Allowed scope:** `frontend/` only.
+- **Agent result:** Added the login page, auth layout, six components (Google G mark, sign-in button, mock warning, role badge, account chooser modal, header), `useAuth`, `useApi`, a global auth middleware, `app/utils/auth.ts`, 14 new Vitest tests and a dev-only `scripts/mock-api-stub.ts`. Sources followed: the Google Identity branding guidelines and Sign in with Google HTML reference. Reported deviations: the button uses a `"Google Sans", Roboto, system-ui` stack without fetching fonts from Google; 40px height and 200px minimum width; no "Continue as" wording. The account chooser layout was modelled on a generic description rather than an official specification.
+- **Human review / changes requested:** Integrator re-ran lint, typecheck and tests, then tested the real backend in the Docker stack (Entry 08). Known limitation reported by the agent: the JWT cookie is set from JavaScript, so it is not `httpOnly`; another open tab keeps its old user until it revalidates.
+- **Verification commands and results (re-run by the integrator):** `bun run lint` clean; `bun run typecheck` clean; `bun run test` 18 passed (4 theme + 14 auth). Agent-reported: `bun run build` passes; SSR redirect and session behaviour checked with curl against a stub; chooser, focus trap, error states, 360px layout and computed text contrast (at least 4.5:1) checked in the browser pane.
+- **Commit:** `2fd061c` feat(frontend): add mock Google sign-in wired to real JWT auth.
+
+## Entry 08 - Phase 1 integration and end-to-end verification (integrator agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`).
+- **Actual prompt:** Integrate Entries 06 and 07, rebuild the Docker stack, test the real flow in the browser, and update the README.
+- **Allowed scope:** integrator files (`README.md`, `.env.example`, `docker-compose.yml`, `PROMPT-INSTRUCTION.md`).
+- **Agent result:** Stopped the stale Phase 0 containers left running from Ken's own `docker compose up` (they held ports 9180 and 9181), rebuilt and started the Phase 1 stack, and drove the sign-in flow in the Claude browser pane. README gained sections for demo sign-in, database and seed data, half-day rules, the yearly holiday update, and testing.
+- **Human review / changes requested:** Pending. Ken will test Phase 1.
+- **Verification commands and results:**
+  - `docker compose up --build -d`: `api` healthy, `web` up.
+  - API from the host: `mock-users` returned the 5 seed users; HR login returned a JWT; `/me` with it returned the user; no token, a bad token and an unknown email each returned 401; a CORS preflight from `http://localhost:9180` allowed the `Authorization` header.
+  - Browser: `/` redirected to `/login`; the mock warning was visible before clicking; the chooser listed the seed users; signing in as Daniel Wong (HR Approver) landed on the role-aware home page; a hard reload kept the session and the server-rendered HTML contained the user name but no JWT; localStorage and sessionStorage were empty; the console had no messages; dark theme rendered; sign-out cleared the cookie and returned to `/login`.
+  - Database in the volume: WAL mode; audit rows for the login, failed login, browser login and logout were present.
+  - README commands checked inside the container against a throwaway database: `seed --reset --yes`, `import-holidays --file ... --year 2027` (17 updated) and `--year 2031` (clear error, non-zero).
+- **Commit:** this log is committed in the commit that follows `661e077`.
+
 ## Entry template
 
 ### Entry NN - [phase and short task name]
