@@ -48,6 +48,15 @@ class CardField(BaseModel):
     source: Literal["document"] | None = None  # the value was read from an attachment
 
 
+class CardInfoLine(BaseModel):
+    """An informational line on a confirmation card (for example the leave balance). Unlike
+    ``warnings`` it may be neutral (``info``) and never blocks Confirm."""
+
+    label: str
+    value: str
+    tone: Literal["info", "warning"] = "info"
+
+
 class ConfirmationCard(BaseModel):
     type: Literal["confirmation_card"] = "confirmation_card"
     card_id: str
@@ -57,6 +66,7 @@ class ConfirmationCard(BaseModel):
     title: str
     fields: list[CardField]
     warnings: list[str] = Field(default_factory=list)
+    info: list[CardInfoLine] = Field(default_factory=list)  # e.g. the leave balance (leave only)
     state: Literal["open", "used", "superseded", "discarded"] = "open"
     confirm_label: Literal["Submit", "Save changes", "Cancel request", "Retry"]
     attachments: list[AttachmentInfo] = Field(default_factory=list)  # linked on Confirm
@@ -72,6 +82,7 @@ class StatusItem(BaseModel):
     reviewed_at: IsoZ | None = None
     reviewer_note: str | None = None
     external_reference_id: str | None = None
+    approver_name: str | None = None  # display name only (never the e-mail); None when unassigned
 
 
 class StatusCard(BaseModel):
@@ -91,7 +102,25 @@ class ResultCard(BaseModel):
     external_reference_id: str | None = None
 
 
-UiCard = Annotated[ConfirmationCard | StatusCard | ResultCard, Field(discriminator="type")]
+class BalanceLine(BaseModel):
+    """One leave type of the signed-in user's balance (days in 0.5 steps)."""
+
+    leave_type: Literal["annual", "sick"]
+    entitled_days: float
+    approved_days: float
+    pending_days: float  # pending requests are shown, never deducted
+    remaining_days: float  # entitled - approved (may be negative)
+
+
+class BalanceCard(BaseModel):
+    type: Literal["balance_card"] = "balance_card"
+    year: int  # calendar year in Hong Kong
+    lines: list[BalanceLine]
+
+
+UiCard = Annotated[
+    ConfirmationCard | StatusCard | ResultCard | BalanceCard, Field(discriminator="type")
+]
 
 
 class Message(BaseModel):

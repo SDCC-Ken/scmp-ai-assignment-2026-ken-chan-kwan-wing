@@ -533,7 +533,7 @@ def _seed_audit(
             actor_user_id=req.reviewed_by_user_id,
             from_status=S.PENDING_APPROVAL,
             to_status=to_status,
-            metadata={"note_present": bool(req.reviewer_note), "reviewer_note": req.reviewer_note},
+            metadata={"note_present": bool(req.reviewer_note)},
             created_at=req.reviewed_at,
         )
 
