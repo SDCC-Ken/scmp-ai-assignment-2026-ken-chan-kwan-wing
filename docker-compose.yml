@@ -43,6 +43,9 @@ services:
     environment:
       HOST: 0.0.0.0
       NITRO_PORT: "9180"
+      # Server-side rendering reaches the API over the compose network, not the
+      # browser-facing NUXT_PUBLIC_API_BASE (localhost would be the web container itself).
+      NUXT_API_BASE_SERVER: http://api:9181
     ports:
       - "${WEB_PORT:-9180}:9180"
     depends_on:

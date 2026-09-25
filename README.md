@@ -30,7 +30,7 @@ All accounts, requests, dates, policies, and records are fictional demonstration
 
 ## Development status
 
-**Phase 0 (foundation) is complete:** repository, environment template, Python backend skeleton, Nuxt 4 frontend skeleton with env-driven theming, and Docker Compose deployment. The chat workflows, mock SSO, LangGraph agent, and approvals are added in later phases; this README is updated with each one.
+**Phase 0 (foundation) and Phase 1 (database, seed data, mock Google sign-in with real JWT auth) are complete.** The chat workflow, LangGraph agent, ReqRes submission and approval screens are added in later phases; this README is updated with each one.
 
 ## Deployment (Docker Compose)
 
@@ -43,7 +43,7 @@ docker compose up --build
 
 | Service | URL | Notes |
 | --- | --- | --- |
-| Frontend (Nuxt 4) | <http://localhost:9180> | Placeholder Phase 0 page with theme toggle |
+| Frontend (Nuxt 4) | <http://localhost:9180> | Redirects to the mock Google sign-in, then a role-aware home page |
 | Backend (FastAPI) | <http://localhost:9181/health> | Returns `{"status":"ok"}`; interactive docs at `/docs` |
 
 Useful commands:
@@ -66,6 +66,9 @@ The `web` service waits for the `api` healthcheck. SQLite is stored in the named
 | `WEB_PORT` / `API_PORT` | Host ports for the frontend / backend (default `9180` / `9181`) |
 | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_THINKING_LEVEL` | Gemini provider (used from Phase 1; `LLM_PROVIDER=fake` for offline runs) |
 | `REQRES_API_KEY`, `REQRES_BASE_URL` | Hosted ReqRes mock API; requires an `x-api-key` header |
+| `DB_AUTO_SEED` | Create tables and load the fictional demo data on startup when the database is empty (default `true`) |
+| `JWT_SECRET_KEY`, `JWT_EXPIRE_MINUTES`, `JWT_ISSUER` | JWT signing. Empty secret = random per-process secret in development (logins reset when the API restarts); production requires 32+ characters (`openssl rand -hex 32`) |
+| `MOCK_SSO_ENABLED` | Enables the mock Google sign-in endpoints (default `true`) |
 | `NUXT_PUBLIC_API_BASE` | Backend URL as seen by the browser |
 | `NUXT_PUBLIC_THEME_*` | Light and dark theme colours (see below) |
 
@@ -80,6 +83,77 @@ Changing `.env` needs `docker compose up -d` again (recreate) to take effect. Th
 | Background | `#ffffff` | `#020617` |
 
 Values are set through `NUXT_PUBLIC_THEME_{LIGHT,DARK}_{PRIMARY,SECONDARY,BACKGROUND}` and exposed as CSS variables and Tailwind tokens (`bg-primary`, `text-secondary`, `bg-background`). Invalid hex values fall back to the defaults. The theme toggle on the page switches light, dark, or system.
+
+## Demo sign-in and seeded users
+
+Open <http://localhost:9180>, click **Sign in with Google**, and pick an account. This is a **mock** sign-in: the page says so before and after the click, nothing is sent to Google, and choosing an account signs you in immediately as that fictional user (no password). Behind it the backend issues a real signed JWT.
+
+| User | Email | Role | Can do (from the next phase) |
+| --- | --- | --- | --- |
+| Amy Lau, Ben Chow, Cathy Ng | `amy.lau@`, `ben.chow@`, `cathy.ng@example.com` | `employee` | Create Leave and Claim requests; view only their own |
+| Daniel Wong | `daniel.wong@example.com` | `hr_approver` | List, view, approve, reject Leave requests only |
+| Eva Cheung | `eva.cheung@example.com` | `finance_approver` | List, view, approve, reject Claim requests only |
+
+Auth API (mounted under `/api/auth`): `GET /mock-users`, `POST /mock-google/login`, `GET /me`, `POST /logout`. The backend re-reads the user and role from the database on every request, so the role inside the token is never trusted on its own. Details and error codes are in [backend/README.md](backend/README.md).
+
+## Database and seed data
+
+SQLite (WAL mode, foreign keys enforced) through SQLAlchemy, stored in the `api-data` volume. Ten tables: `users`, `conversations`, `conversation_messages`, `leave_requests`, `claim_requests`, `external_submissions`, `notifications`, `audit_events`, `public_holidays`, `feedback`.
+
+| Seed data | Rows | Notes |
+| --- | ---: | --- |
+| Users | 5 | 3 employees, 1 HR approver, 1 Finance approver (`@example.com`) |
+| Leave requests | 10 | 2 pending, recent approved and rejected, the rest past history; includes half-day examples |
+| Claim requests | 10 | Same mix, HKD amounts |
+| Audit events | 15 | Creation, confirmation, API submission, a 429 failure then retry, approval, rejection |
+| Conversations | 3 | With 9 short messages |
+| Public holidays | 34 | Hong Kong 2026 and 2027 (17 each) |
+
+Also seeded: 21 external-submission records, 6 notifications and 2 feedback rows. Every seeded record is fictional. Rebuild the demo data at any time:
+
+```bash
+docker compose exec api python -m app.cli seed --reset --yes   # drops and reseeds the database
+```
+
+**Request status flow** (enforced in the backend): `draft` → `pending_approval` (after confirmation and API submission) or `submission_failed` (retry allowed) → `approved` or `rejected`; `draft` and `submission_failed` can also be `cancelled`. Rejecting needs a reviewer note, and a reviewer cannot act on their own request. HR reviews Leave only; Finance reviews Claims only.
+
+**Half-day leave.** `leave_requests` has `start_day_part` and `end_day_part` (`full`, `am`, `pm`), and `working_days` is a decimal in 0.5 steps.
+
+| Request | start / end date | start_day_part / end_day_part | working_days |
+| --- | --- | --- | ---: |
+| Whole day | same date | `full` / `full` | 1 |
+| Half day, morning or afternoon | same date | `am` / `am` or `pm` / `pm` | 0.5 |
+| Several days, starting at noon | different dates | `pm` / `full` | first day counts 0.5 |
+| Several days, ending at noon | different dates | `full` / `am` | last day counts 0.5 |
+
+The working week is Monday to Friday, excluding Hong Kong public holidays. Those two optional fields are all the chat step needs to fill for "half day tomorrow afternoon".
+
+### Hong Kong public holidays: yearly update
+
+The 2026 and 2027 holidays are bundled from the official 1823 calendar (checked against the gov.hk holiday pages on 2026-09-25). 1823 publishes roughly three years ahead, so each year, once the new year appears, import it:
+
+```bash
+docker compose exec api python -m app.cli import-holidays --year 2028
+# local (no Docker), from backend/
+uv run python -m app.cli import-holidays --year 2028
+# offline, from a downloaded calendar file
+uv run python -m app.cli import-holidays --file path/to/en.ics --year 2028
+```
+
+The import is safe to re-run (it updates by date), and it stops with a clear message if the year is not yet published.
+
+## Testing
+
+Tests run locally, not inside Docker. Docker Compose is only used to run and demonstrate the stack.
+
+| What | Command | Where |
+| --- | --- | --- |
+| Backend unit tests (205, offline) | `cd backend && uv run pytest -q` | local |
+| Backend lint | `cd backend && uv run ruff check . && uv run ruff format --check .` | local |
+| Frontend lint, types, unit tests (18) | `cd frontend && bun run lint && bun run typecheck && bun run test` | local |
+| Full-stack smoke check | `docker compose up --build`, then open both URLs above | Docker |
+
+Backend tests use in-memory or temporary SQLite databases, never read `.env`, and never call ReqRes or Gemini.
 
 ## Local development (without Docker)
 
