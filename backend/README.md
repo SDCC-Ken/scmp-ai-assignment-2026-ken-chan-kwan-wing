@@ -121,6 +121,69 @@ Eva in the seed) gets 403 from the chat and from `GET /api/me/balances`. `requir
   set-approvers` (in Docker: `docker compose exec api python -m app.cli ...`). Full guide:
   [`../docs/limits-and-routing.md`](../docs/limits-and-routing.md).
 
+## Approvals and notifications (Phase 3)
+
+The approver side of the workflow. Contract: [`../docs/phase3-approval-design.md`](../docs/phase3-approval-design.md)
+section 5; every rule with its tests: [`../docs/business-rules.md`](../docs/business-rules.md) section 4c.
+Code: `app/services/approvals.py`, `app/services/notifications.py`, routes
+`app/api/routes/approvals.py` and `notifications.py`, schemas `app/schemas/approvals.py` and
+`notifications.py`. Tests: `tests/approvals/` (offline, seeded in-memory database; the concurrency
+test uses a temporary file database).
+
+| Endpoint | Who | Result |
+| --- | --- | --- |
+| `GET /api/approvals` | `hr_approver` (leave) or `finance_approver` (claims) | `{"items": [...], "count": n}`: the caller's `pending_approval` requests, oldest submitted first, each with a summary and `flags` (`over_limit`, `team_overlap_count`, `has_attachments`). Others: `403` |
+| `GET /api/approvals/{request_type}/{id}` | the assigned approver | fields, attachments (with URLs), `limits` (leave balance or department budget after this request), `team_overlap`, `warnings`. `404` (one body) when unknown, not assigned to you, of the other type, or not pending |
+| `POST /api/approvals/{request_type}/{id}/decision` `{"decision": "approve" or "reject", "note": null or text}` | the assigned approver | `200 {"request_type", "id", "status", "reviewed_at"}`; `409` if it is no longer pending or another decision won; `422` for a bad decision or a note over 500 characters (the note is trimmed, empty becomes null, optional for both decisions) |
+| `GET /api/notifications?limit=20` | any signed-in user | `{"items": [...], "unread_count": n}`, the caller's own, newest first (`limit` 1 to 50) |
+| `POST /api/notifications/{id}/read`, `POST /api/notifications/read-all` | the owner | `204`; someone else's or an unknown id is `404`; both are idempotent |
+
+- **Per-user assignment.** An approver only ever sees requests whose `approver_user_id` is
+  theirs, and never their own. Being a `hr_approver` is not enough (Cathy does not see Helen's
+  staff). The decision goes through the domain rules (`can_decide`, the status machine).
+- **Limits are shown, never blocking.** An over-balance leave or over-budget claim can be
+  approved; the detail carries a sentence such as "Over the annual leave balance by 1.5 days. You
+  decide.". The request itself is excluded from "approved" and "pending other" and reported as
+  "requested". Money is a string with two decimals, days are numbers.
+- **One winner.** The decision is one conditional `UPDATE ... WHERE status = 'pending_approval'`
+  (the status change, the audit row and the notifications share one transaction, committed
+  together). Under two simultaneous decisions one gets `200`, the other `409` and writes nothing.
+- **Audit.** One `audit_events` row per decision (`request.approved` / `request.rejected`) with
+  `note_present`, `over_limit`, a `snapshot` of the numbers the approver saw, `team_overlap_count`
+  (leave) and `employee_id`. The note text is only on the request, never in the audit metadata.
+- **Notifications.** A row stores only recipient, event type and request. `title`, `body` and
+  `link` are composed when read from the row and the current request (plain text; no attachments,
+  no e-mail addresses), so no payload column is needed: the approver's name and the note of a
+  decision are read from `reviewed_by_user_id` / `reviewer_note` of the (final) request. `link` is
+  `/approvals/{type}/{id}` only for the assigned approver while the request is pending, else
+  `null`. Unknown or legacy event types get the neutral title "Update on leave request #12".
+  A decision creates `request.approved` / `request.rejected` for the requester and marks the
+  approver's own unread `request.submitted` / `request.updated` for that request as read.
+- **Attachments of a decided request.** Unchanged `can_download` rule: the owner always; the
+  assigned approver of the matching type while the request is `pending_approval`, `approved` or
+  `rejected` (so a file stays downloadable after the decision, although the approver's detail
+  page is then `404`); nobody else; not for `cancelled`, `draft` or `submission_failed`.
+- **Requester side.** After a decision the requester's balance (`GET /api/me/balances`) and the
+  department budget count the approved request only, the chat status card shows the reviewer note
+  of a rejected request, and the chat refuses to edit or cancel a decided request.
+
+## Chat: balances, approver awareness, stated dates (Phase 3-C)
+
+- **Leave balance on the card**: annual and sick leave cards carry `info` lines (year of the start
+  date; approved days deducted, pending shown but not deducted) and a `warning` line when over the
+  balance. Shown, never blocking. New intent `check_balance` ("how many annual leave days do I have
+  left?") answers with a `balance_card`; the backend writes every number (`app/chat/balance.py`).
+- **Approver awareness**: a new leave or claim is refused up front (no draft, no card) when the user
+  has no valid approver; the result message names the approver; status cards carry `approver_name`.
+- **Stated dates only**: a leave date or receipt date that the user never wrote is dropped
+  (`app/llm/dates.py`, used by the Ollama provider and by the graph merge), so "Claim HKD 180 for a
+  taxi" asks for the receipt date. A scripted test double may set `trust_dates = True` to skip the
+  merge guard. **HKD wording**: a bare `$`, `HK$`, `HKD$`, "dollars" and "HK dollars" are HKD
+  (`app/llm/currency.py`); `USD`, `US$` and "US dollars" are still rejected.
+- Rules: `../docs/business-rules.md` (L-13, L-14, C-06, C-11, section 4d); shapes:
+  `../docs/chat-api-contract.md`. Live check: `RUN_LIVE_LLM=1 uv run python scripts/live_llm_smoke.py
+  --provider ollama --only balance` (also `--only date`, `--only dollar`).
+
 ## Public holidays
 
 Leave working days skip Saturdays, Sundays and rows in `public_holidays`. The seed loads 2026 and
@@ -173,8 +236,8 @@ database only gains a new table).
   and on update. `cleanup_staged_uploads(session, upload_dir)` deletes staged files older than
   24 hours (a function only; nothing schedules it).
 - **Who can download:** the owner always. An approver only when the file is linked to a request
-  that has been submitted (`pending_approval`, `approved` or `rejected`) and their role reviews
-  that type (HR: leave, Finance: claim). Everyone else gets `404`.
+  that has been submitted (`pending_approval`, `approved` or `rejected`), their role reviews
+  that type (HR: leave, Finance: claim) and it is assigned to them. Everyone else gets `404`.
 - **Response headers:** `Content-Type` from the stored type, `Content-Disposition: inline` with an
   ASCII `filename` and a percent-encoded `filename*`, `X-Content-Type-Options: nosniff`,
   `Cache-Control: private, no-store`, `Content-Security-Policy: sandbox`, plus the normal CORS

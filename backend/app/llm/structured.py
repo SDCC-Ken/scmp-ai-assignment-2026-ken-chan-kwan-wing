@@ -15,6 +15,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from app.domain.enums import ClaimType, DayPart, LeaveType, RequestStatus, RequestType
+from app.llm.currency import mentions_dollars, normalise_currency, says_hkd, says_usd
 from app.llm.schemas import AgentTurn, DocType, DocumentExtraction, Intent
 
 ATTACHMENT_MIME_TYPES = frozenset(
@@ -279,21 +280,8 @@ def _none(value: Any) -> str | None:
     return _s(value) or None
 
 
-_CURRENCY_ALIASES = {
-    "$": "HKD",
-    "HK$": "HKD",
-    "HKD$": "HKD",
-    "HK DOLLAR": "HKD",
-    "HK DOLLARS": "HKD",
-    "DOLLAR": "HKD",
-    "DOLLARS": "HKD",
-    "US$": "USD",
-}
-
-
 def _currency(value: Any) -> str | None:
-    text = _s(value).upper()
-    return _CURRENCY_ALIASES.get(text, text) or None
+    return normalise_currency(_s(value))
 
 
 def _parse_number(value: Any, field: str) -> float | None:
@@ -585,18 +573,21 @@ def parse_flat_turn(
     return with_unreadable_documents(turn.model_copy(update={"documents": docs}), total_documents)
 
 
-_USD_WORDS = re.compile(r"\b(usd|us\$|u\.s\.|us dollars?|american dollars?)", re.IGNORECASE)
-
-
 def correct_currency(turn: AgentTurn, message: str) -> AgentTurn:
-    """The company is in Hong Kong: a bare ``$`` or "dollars" means HKD. Small models answer
-    USD for ``$``; that is only kept when the user wrote it explicitly. Text turns only."""
+    """The company is in Hong Kong: a bare ``$``, ``HK$`` or "dollars" means HKD. Small models
+    answer USD for ``$`` (and sometimes HKD for "US dollars"); the message decides. Text turns
+    only. ``USD`` / ``US$`` / "US dollars" stay USD and are rejected later by the backend."""
     claim = turn.claim
-    if claim is None or turn.documents or (claim.currency or "").upper() != "USD":
+    if claim is None or turn.documents:
         return turn
-    if _USD_WORDS.search(message):
+    current = normalise_currency(claim.currency)
+    fixed = current
+    if says_usd(message) and not says_hkd(message):
+        fixed = "USD"
+    elif current == "USD":  # the model's guess, not the user's words
+        fixed = "HKD" if mentions_dollars(message) else None
+    if fixed == claim.currency:
         return turn
-    fixed = "HKD" if re.search(r"\$|dollar", message, re.IGNORECASE) else None
     return turn.model_copy(update={"claim": claim.model_copy(update={"currency": fixed})})
 
 

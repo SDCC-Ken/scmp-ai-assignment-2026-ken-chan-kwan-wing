@@ -7,7 +7,7 @@ from datetime import date
 from sqlalchemy.orm import Session
 
 from app.chat.policy import EDITABLE_STATUSES
-from app.db.models import LeaveRequest
+from app.db.models import LeaveRequest, User
 from app.domain.enums import RequestStatus, RequestType
 from app.llm.schemas import RequestRef
 from app.services.requests import Req, own_requests, status_label, summary_text
@@ -26,6 +26,14 @@ class Resolved:
 @dataclass(frozen=True)
 class Unresolved:
     message: str
+
+
+def approver_name(session: Session, req: Req) -> str | None:
+    """Display name of the approver assigned to ``req`` (never the e-mail); None when unassigned."""
+    if req.approver_user_id is None:
+        return None
+    user = session.get(User, req.approver_user_id)
+    return user.display_name if user is not None else None
 
 
 def noun(request_type: RequestType) -> str:

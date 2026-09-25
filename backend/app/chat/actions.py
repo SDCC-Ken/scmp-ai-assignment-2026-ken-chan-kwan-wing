@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.chat import cards as card_builders
 from app.chat.policy import EDITABLE_STATUSES, RETRYABLE_STATUSES
-from app.chat.resolver import not_editable_message, noun
+from app.chat.resolver import approver_name, not_editable_message, noun
 from app.chat.state import ConversationState, PendingCard, normalised_values, payload_hash
 from app.chat.store import add_message, cas_save_state, set_card_state, stored_card
 from app.chat.text import scrub
@@ -349,7 +349,9 @@ class CardActions:
         assert req is not None
         self._record_submission(req, result, wire)
         old_status = req.status
-        approver = "HR" if rtype == RequestType.LEAVE else "Finance"
+        approver = approver_name(self.session, req) or (
+            "HR" if rtype == RequestType.LEAVE else "Finance"
+        )
         if result.ok:
             apply_transition(req, RequestStatus.PENDING_APPROVAL, actor=None)
             record_audit(
@@ -384,7 +386,7 @@ class CardActions:
             )
             msg = self._result_message(
                 f"Done. Your {noun(rtype)} #{rid} was submitted to {self._provider_label()}"
-                f"{ref_text} and is now pending {approver} approval.",
+                f"{ref_text} and is now waiting for approval by {approver}.",
                 card,
                 steps,
             )

@@ -30,6 +30,7 @@ import httpx
 
 from app.config import Settings
 from app.llm.base import LLMError, LLMOutputError
+from app.llm.dates import claim_dates, drop_unstated_dates, leave_dates
 from app.llm.pdf_images import MAX_PAGES, flatten_png_alpha, pdf_to_png_pages
 from app.llm.prompts import (
     CORRECTION_TEMPLATE,
@@ -62,6 +63,20 @@ _NO_TEXT = re.compile(
     r"\b(no (visible |readable )?(lines of )?text|unreadable|cannot read|can't read|blank)\b",
     re.IGNORECASE,
 )
+
+
+def _drop_unstated_dates(turn: AgentTurn, message: str, context: LLMContext) -> AgentTurn:
+    """Text turns only: a small model fills today's date when the user gave none ("Claim HKD
+    180 for a taxi" -> receipt_date = today). A date the message never mentions is dropped, so
+    the backend asks for it. Values the draft already holds are not "invented" and stay."""
+    if turn.documents:
+        return turn
+    known = leave_dates(context.current_leave) | claim_dates(context.current_claim)
+    leave, dropped_leave = drop_unstated_dates(turn.leave, message, known)
+    claim, dropped_claim = drop_unstated_dates(turn.claim, message, known)
+    if not (dropped_leave or dropped_claim):
+        return turn
+    return turn.model_copy(update={"leave": leave, "claim": claim})
 
 
 class OllamaProvider:
@@ -215,7 +230,8 @@ class OllamaProvider:
                 turn = parse_flat_turn(
                     content, positions, len(attachments), vague, has_values, sources
                 )
-                return drop_invented_leave_type(correct_currency(turn, user_message), user_message)
+                turn = drop_invented_leave_type(correct_currency(turn, user_message), user_message)
+                return _drop_unstated_dates(turn, user_message, context)
             except InvalidOutput as invalid:
                 problem = invalid.problem
                 logger.warning("Ollama output invalid (attempt %d): %s", attempt, problem)

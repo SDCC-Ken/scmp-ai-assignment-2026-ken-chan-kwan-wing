@@ -21,6 +21,7 @@ class Intent(StrEnum):
     UPDATE_REQUEST = "update_request"  # amend an EXISTING submitted request (see ``target``)
     CANCEL_REQUEST = "cancel_request"  # withdraw an EXISTING request (see ``target``)
     CHECK_STATUS = "check_status"  # asks about the status of existing requests
+    CHECK_BALANCE = "check_balance"  # asks for their OWN leave balance ("days left")
     HELP = "help"  # greeting / what can you do
     OUT_OF_SCOPE = "out_of_scope"  # anything else (incl. approve/reject, other people's data)
     UNCLEAR = "unclear"  # cannot tell what the user wants

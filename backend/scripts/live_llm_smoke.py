@@ -4,7 +4,7 @@
         [--model qwen2.5:7b] [--vision-model qwen2.5vl:3b] [--cases text|docs|all] [-v]
     RUN_LIVE_LLM=1 ALLOW_LIVE_GEMINI=1 uv run python scripts/live_llm_smoke.py --provider gemini
 
-Runs at most 23 short analyses (19 text cases and 4 document cases from backend/samples/)
+Runs at most 27 short analyses (23 text cases and 4 document cases from backend/samples/)
 using the normal settings (../.env is read by Settings and never printed) and prints a compact
 table. Fictional inputs only. ``--provider fake`` needs no network (its samples are the
 ``*.fake.pdf`` files, so document cases are skipped). Ollama is free and local; a tiny
@@ -309,7 +309,52 @@ CASES += [
         lambda t: bool(t.leave and t.leave.end_date == date(2026, 10, 5)),
     ),
 ]
-assert len(CASES) <= 24
+CASES += [
+    Case(
+        "balance question",
+        "how many annual leave days do I have left?",
+        {Intent.CHECK_BALANCE},
+        base_ctx(),
+        lambda t: t.leave is None and t.claim is None,
+    ),
+    Case(
+        "leave type+dates",
+        "annual leave 2026-10-12 to 2026-10-14",
+        {Intent.CREATE_LEAVE},
+        base_ctx(),
+        lambda t: (
+            leave_is("2026-10-12", "2026-10-14")(t)
+            and t.leave is not None
+            and t.leave.leave_type is not None
+            and t.leave.leave_type.value == "annual"
+        ),
+    ),
+    Case(
+        "taxi no date",
+        "Claim HKD 180 for a taxi",
+        {Intent.CREATE_CLAIM},
+        base_ctx(),
+        lambda t: bool(
+            t.claim
+            and t.claim.amount == 180.0
+            and t.claim.receipt_date is None  # never today's date: the backend asks for it
+            and (t.claim.currency or "HKD") == "HKD"
+        ),
+    ),
+    Case(
+        "claim $ lunch",
+        "claim $65.5 lunch on 2026-09-22",
+        {Intent.CREATE_CLAIM},
+        base_ctx(),
+        lambda t: bool(
+            t.claim
+            and t.claim.amount == 65.5
+            and (t.claim.currency or "HKD") == "HKD"
+            and t.claim.receipt_date == date(2026, 9, 22)
+        ),
+    ),
+]
+assert len(CASES) <= 27
 DOC_CASES = [c for c in CASES if c.files]
 SAMPLES = Path(__file__).resolve().parents[1] / "samples"
 _MIME = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg"}
@@ -401,7 +446,9 @@ def main() -> int:
     parser.add_argument("--model", help="override the text model")
     parser.add_argument("--vision-model", help="override the Ollama vision model")
     parser.add_argument("--cases", choices=["text", "docs", "all"], default="all")
-    parser.add_argument("--only", help="run only the cases whose label contains this text")
+    parser.add_argument(
+        "--only", help="run only the cases whose label contains this text (comma-separated list)"
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="print each rationale")
     args = parser.parse_args()
     if os.environ.get("RUN_LIVE_LLM") != "1":
@@ -417,7 +464,8 @@ def main() -> int:
     if args.provider == "fake":
         cases = [c for c in cases if not c.files]
     if args.only:
-        cases = [c for c in cases if args.only.lower() in c.label.lower()]
+        wanted = [w.strip().lower() for w in args.only.split(",") if w.strip()]
+        cases = [c for c in cases if any(w in c.label.lower() for w in wanted)]
     if args.provider == "ollama" and any(not c.files for c in cases):
         started = time.perf_counter()
         try:

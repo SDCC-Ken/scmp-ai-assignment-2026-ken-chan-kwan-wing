@@ -21,6 +21,7 @@ from app.domain.clock import today_hk
 from app.domain.enums import ClaimType, DayPart, LeaveType, RequestType
 from app.domain.errors import LeaveCalculationError
 from app.domain.leave import LeaveDays, calculate_leave_days
+from app.llm.currency import normalise_currency
 from app.schemas.drafts import ClaimDraft, LeaveDraft
 from app.services.holidays import load_holidays
 
@@ -264,7 +265,8 @@ def validate_claim(
 
     if slots.amount is not None and (p := _amount_problem(slots.amount)) is not None:
         return p
-    currency = (slots.currency or CLAIM_CURRENCY).strip().upper()
+    # A bare $, HK$, HKD$, "dollars" and "HK dollars" are HKD; USD, US$ and others are not.
+    currency = normalise_currency(slots.currency) or CLAIM_CURRENCY
     if currency != CLAIM_CURRENCY:
         return Problem(
             "currency",

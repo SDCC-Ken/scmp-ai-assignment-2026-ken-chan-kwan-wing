@@ -5,6 +5,7 @@
         update_request            -> prepare_update -> merge -> validate -> decide -> respond
         cancel_request            -> prepare_cancel -> respond
         check_status              -> status -> respond
+        check_balance             -> balance -> respond
         help / out_of_scope / unclear -> explain -> respond
 
 Only ``understand`` talks to the LLM (intent + fields, and the reading of attached documents).
@@ -27,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.chat import cards as card_builders
 from app.chat import documents as docs
+from app.chat.balance import balance_reply, leave_card_info
 from app.chat.format import fmt_date, fmt_days
 from app.chat.policy import (
     EDITABLE_STATUSES,
@@ -36,7 +38,14 @@ from app.chat.policy import (
     RETRYABLE_STATUSES,
     STATUS_LIST_LIMIT,
 )
-from app.chat.resolver import Unresolved, describe, not_editable_message, noun, resolve_target
+from app.chat.resolver import (
+    Unresolved,
+    approver_name,
+    describe,
+    not_editable_message,
+    noun,
+    resolve_target,
+)
 from app.chat.state import (
     ClaimSlots,
     ConversationState,
@@ -58,8 +67,11 @@ from app.chat.validation import (
     validate_claim,
     validate_leave,
 )
+from app.db.models import User
 from app.domain.enums import ClaimType, DayPart, LeaveType, RequestStatus, RequestType
 from app.llm.base import LLMError, LLMOutputError, LLMProvider
+from app.llm.currency import normalise_currency
+from app.llm.dates import claim_dates, drop_unstated_dates, leave_dates
 from app.llm.schemas import (
     AgentTurn,
     ChatTurn,
@@ -83,6 +95,7 @@ from app.services.requests import (
     status_label,
     summary_text,
 )
+from app.services.routing import ApproverProblem, ApproverProblemReason, resolve_approver
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +208,8 @@ def _awaiting_end_date(conv: ConversationState) -> bool:
 HELP_TEXT = (
     "I can help you with two things: leave applications (annual, sick, personal or unpaid) and "
     "staff claims (travel, meal, equipment, training or other). I can create a request, change "
-    "or cancel one that has not been reviewed yet, and tell you the status of your own requests. "
+    "or cancel one that has not been reviewed yet, tell you the status of your own requests, and "
+    "show your leave balance (for example: how many annual leave days do I have left?). "
     "Approvals are done by the HR and Finance approvers, not through this chat. Try: "
     '"I\'d like annual leave from 2026-10-05 to 2026-10-07" or "Claim HKD 120 for a taxi '
     'receipt from yesterday".'
@@ -581,6 +595,8 @@ def route_understand(state: TurnState) -> str:
         return "prepare_cancel"
     if intent == Intent.CHECK_STATUS:
         return "status"
+    if intent == Intent.CHECK_BALANCE:
+        return "balance"
     return "explain"
 
 
@@ -851,6 +867,7 @@ def _status_item(session: Session, req: Req) -> StatusItem:
         reviewed_at=req.reviewed_at,
         reviewer_note=req.reviewer_note,
         external_reference_id=latest_external_reference(session, req),
+        approver_name=approver_name(session, req),
     )
 
 
@@ -903,6 +920,26 @@ def status(state: TurnState) -> dict[str, Any]:
             "status",
             "Looked up your requests",
             f"{len(rows)} found (own requests only)",
+            started=started,
+        ),
+    }
+
+
+def balance(state: TurnState) -> dict[str, Any]:
+    """ "How many annual leave days do I have left?": the signed-in user's own balance for the
+    current Hong Kong year, worded and calculated by the backend (never by the model)."""
+    started = time.perf_counter()
+    deps = state["deps"]
+    year = deps.today.year
+    text, card = balance_reply(deps.session, deps.user_id, year)
+    count = len(card.lines) if card is not None else 0
+    return {
+        "reply": Reply(text, ui=card),
+        "trace": _trace(
+            state,
+            "status",
+            "Looked up your leave balance",
+            f"{count} leave types for {year} (own balance only)",
             started=started,
         ),
     }
@@ -964,7 +1001,9 @@ def _apply_claim(
                 continue
             value = dec
         elif name == "currency":
-            value = str(value).strip().upper()
+            value = normalise_currency(value)  # $, HK$, "dollars" -> HKD; USD stays USD
+            if value is None:
+                continue
         setattr(conv.claim, name, value)
         changed.append(name)
     return changed
@@ -999,6 +1038,58 @@ def _track_document_fields(
         if warning not in conv.doc_warnings:
             conv.doc_warnings.append(warning)
     docs.cap_attachments(state["deps"].session, conv, rtype, effects.attachment_ids, notices)
+
+
+def _approver_refusal(state: TurnState, rtype: RequestType) -> dict[str, Any] | None:
+    """A NEW request is only started for a user who has a valid approver (one per requester).
+
+    Without one nothing would ever decide the request, so the assistant says so up front and
+    creates no draft and no card. (Confirm checks again as a second guard.)"""
+    deps = state["deps"]
+    user = deps.session.get(User, deps.user_id)
+    started = time.perf_counter()
+    problem = resolve_approver(deps.session, user, rtype) if user is not None else None
+    if not isinstance(problem, ApproverProblem):
+        return None
+    what = noun(rtype)
+    team = "HR" if rtype == RequestType.LEAVE else "Finance"
+    if problem.reason == ApproverProblemReason.NOT_CONFIGURED:
+        text = (
+            f"I can't file a {what} for you yet: no approver is configured for you (this is "
+            f"outside the PoC scope). Please contact {team}."
+        )
+    else:
+        text = f"I can't file a {what} for you yet. {problem.message}"
+    return {
+        "reply": Reply(_with_notices(state, text)),
+        "trace": _trace(
+            state,
+            "validate",
+            "Approver check",
+            f"no valid {rtype.value} approver ({problem.reason.value}); nothing created",
+            ok=False,
+            started=started,
+        ),
+    }
+
+
+def _guards_dates(llm: LLMProvider) -> bool:
+    """Dates from a model are checked against the user's words. A scripted test double may opt
+    out with ``trust_dates = True`` (its dates come from the script, not from a model)."""
+    return not getattr(llm, "trust_dates", False)
+
+
+def _document_dates(run: docs.DocRun | None) -> set[date]:
+    found: set[date] = set()
+    for info in run.infos if run else []:
+        ex = info.extraction
+        if ex is not None:
+            found |= {
+                d
+                for d in (ex.receipt_date, ex.issue_date, ex.rest_start_date, ex.rest_end_date)
+                if d is not None
+            }
+    return found
 
 
 def merge(state: TurnState) -> dict[str, Any]:
@@ -1041,6 +1132,14 @@ def merge(state: TurnState) -> dict[str, Any]:
             ),
         }
 
+    if not update_mode and (
+        turn.intent in (Intent.CREATE_LEAVE, Intent.CREATE_CLAIM)
+        or conv.active_request_type != rtype
+    ):
+        refusal = _approver_refusal(state, rtype)
+        if refusal is not None:
+            return refusal
+
     if has_leave and has_claim and not update_mode:
         other = "claim" if rtype == RequestType.LEAVE else "leave application"
         first = "leave application" if rtype == RequestType.LEAVE else "claim"
@@ -1070,6 +1169,18 @@ def merge(state: TurnState) -> dict[str, Any]:
     effects: docs.DocEffects | None = None
     doc_intro: str | None = None
     run = state.get("doc_run")
+    dropped_dates: list[str] = []
+    if _guards_dates(state["deps"].llm):
+        # A date the user never stated (a model's "today" default) is not accepted: it is asked.
+        held = (
+            leave_dates(_leave_fields_of(conv.leave))
+            if rtype == RequestType.LEAVE
+            else claim_dates(_claim_fields_of(conv.claim))
+        )
+        guarded, dropped_dates = drop_unstated_dates(
+            typed_fields, state["message"], held | _document_dates(run)
+        )
+        typed_fields = guarded or (LeaveFields() if rtype == RequestType.LEAVE else ClaimFields())
     if run is not None:
         effects = docs.apply_documents(
             run,
@@ -1114,6 +1225,8 @@ def merge(state: TurnState) -> dict[str, Any]:
     )
     if turn.ambiguities:
         detail += "; held back ambiguous values"
+    if dropped_dates:
+        detail += f"; ignored a date you did not state ({', '.join(dropped_dates)})"
     update: dict[str, Any] = {
         "conv": conv,
         "notices": notices,
@@ -1371,6 +1484,18 @@ def decide(state: TurnState) -> dict[str, Any]:
     warnings = [*outcome.warnings, *docs.document_warnings(conv, values)]
     doc_fields = docs.document_card_fields(conv)
     attached = docs.attachment_infos(deps.session, conv.attachment_ids, deps.user_id)
+    info = (
+        leave_card_info(
+            deps.session,
+            deps.user_id,
+            outcome.draft.leave_type,
+            outcome.draft.start_date,
+            outcome.days.working_days,
+            conv.editing_request_id,
+        )
+        if isinstance(outcome, ValidLeave)
+        else []
+    )
 
     if conv.editing_request_id is not None:
         original = conv.original or {}
@@ -1440,6 +1565,7 @@ def decide(state: TurnState) -> dict[str, Any]:
             warnings=warnings,
             document_fields=doc_fields,
             attachments=attached,
+            info=info,
         )
         conv.pending_card = PendingCard(
             card_id=card.card_id,
@@ -1463,6 +1589,7 @@ def decide(state: TurnState) -> dict[str, Any]:
             warnings=warnings,
             document_fields=doc_fields,
             attachments=attached,
+            info=info,
         )
         conv.pending_card = PendingCard(
             card_id=card.card_id,
@@ -1574,6 +1701,7 @@ def _build() -> Any:
         "hold_cancel": hold_cancel,
         "explain": explain,
         "status": status,
+        "balance": balance,
         "merge": merge,
         "prepare_update": prepare_update,
         "prepare_cancel": prepare_cancel,
@@ -1606,6 +1734,7 @@ def _build() -> Any:
             "prepare_update": "prepare_update",
             "prepare_cancel": "prepare_cancel",
             "status": "status",
+            "balance": "balance",
             "explain": "explain",
         },
     )
@@ -1624,6 +1753,7 @@ def _build() -> Any:
         "hold_cancel",
         "explain",
         "status",
+        "balance",
         "prepare_cancel",
         "decide",
     ):

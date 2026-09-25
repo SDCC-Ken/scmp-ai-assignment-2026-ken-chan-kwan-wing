@@ -31,6 +31,10 @@ class ScriptedLLM:
 
     name = "scripted"
     model = "scripted"
+    # The dates of a scripted turn come from the test, not from a model, so the backend's
+    # "the user never stated this date" guard is off by default. Tests of that guard set
+    # ``llm.trust_dates = False`` (see tests/chat/test_unstated_dates.py).
+    trust_dates = True
 
     def __init__(self) -> None:
         self.queue: list[AgentTurn | Exception] = []

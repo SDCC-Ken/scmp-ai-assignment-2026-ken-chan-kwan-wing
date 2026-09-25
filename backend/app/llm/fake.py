@@ -11,7 +11,8 @@ Half day         "half day", "morning" (am), "afternoon" (pm). Single day: both 
                  Multi-day: "starting in the afternoon" -> start pm; "until the morning" -> end am.
                  "half day" without morning/afternoon -> ambiguity, parts left null.
 Leave types      annual/vacation, sick/unwell/doctor/medical, personal/family/casual, unpaid/no pay
-Dates            2026-10-05, today, tomorrow, day after tomorrow, [this|next] monday..sunday
+Dates            2026-10-05, today, tomorrow, yesterday, day after tomorrow,
+                 [this|next] monday..sunday
                  ("next X" = first X strictly after today; "this X"/bare X = first X on or after
                  today), "5 Oct", "5th October", "Oct 5" (next occurrence; a lone "the 5th"
                  counts only when awaiting a date). Ranges: "from A to B", "A - B", "A until B".
@@ -22,13 +23,16 @@ Claim types      travel (taxi, flight, hotel, train, uber, mtr, bus, airfare), m
                  dinner, breakfast, meal), equipment (laptop, keyboard, mouse, monitor, headset,
                  equipment), training (course, training, certification, workshop, seminar,
                  exam), other
-Amounts          "HKD 120", "HK$120", "$120.50" and "120 dollars" (all HKD), "120 hkd";
-                 "USD 50"/"50 eur" keep their stated currency; a bare number counts only when
+Amounts          "HKD 120", "HK$120", "$120.50" and "120 dollars" (all HKD), "120 hkd",
+                 "120 HK dollars"; "USD 50", "US$50", "50 US dollars", "50 eur" keep their stated
+                 currency; a bare number counts only when
                  awaiting the amount. The claim receipt date is the (first) date mentioned.
 Provide details  when the context has an active form, draft or pending card and the message
                  carries fields (or no create verb): "make it sick leave", "the 5th", "HKD 200"
 Status           "status", "my requests", "pending", "has my leave been approved", with optional
                  filters: leave|claim, "#12", pending/approved/rejected/cancelled/failed/draft
+Balance          "how many annual leave days do I have left", "leave balance", "how much sick
+                 leave do I have", "remaining leave", "my sick leave balance" (check_balance)
 Cancel           "cancel #12", "withdraw my leave request 12", "cancel this"
 Update           "change #12 to sick leave", "update request 12 end 2026-10-09", "move #12 to
                  next monday" (without an id and with an active draft -> provide_details)
@@ -108,7 +112,7 @@ _DATE_RE = re.compile(
     |(?P<md>\b(?P<md_m>{_MONTH_RE})\.?\s+(?P<md_d>\d{{1,2}})(?:st|nd|rd|th)?\b)
     |(?P<dat>\bday\s+after\s+tomorrow\b)
     |(?P<rel>\b(?P<rel_n>next|this)?\s*(?P<rel_w>{_WD_RE})\b)
-    |(?P<word>\b(?P<word_w>today|tomorrow)\b)
+    |(?P<word>\b(?P<word_w>today|tomorrow|yesterday)\b)
     |(?P<ord>\bthe\s+(?P<ord_d>\d{{1,2}})(?:st|nd|rd|th)\b)
     """,
     re.VERBOSE,
@@ -116,11 +120,12 @@ _DATE_RE = re.compile(
 _ID_RE = re.compile(r"(?:#|\b(?:request|id|number|no\.?)\s*#?\s*)(\d{1,9})\b")
 _CURRENCY_CODES = {"hkd", "usd", "eur", "gbp", "jpy", "cny", "rmb", "sgd", "aud", "cad"}
 _AMOUNT_PRE = re.compile(
-    r"(?<![\w.])(hk\$|us\$|\$|hkd|usd|eur|gbp|jpy|cny|rmb|sgd|aud|cad)\s*(\d[\d,]*(?:\.\d+)?)"
+    r"(?<![\w.])(hkd\$|hk\$|us\$|\$|hkd|usd|eur|gbp|jpy|cny|rmb|sgd|aud|cad)\s*"
+    r"(\d[\d,]*(?:\.\d+)?)"
 )
 _AMOUNT_POST = re.compile(
-    r"(?<![\w.$])(\d[\d,]*(?:\.\d+)?)\s*(hk\$|hkd|usd|eur|gbp|jpy|cny|rmb|sgd|aud|cad"
-    r"|dollars?|bucks)\b"
+    r"(?<![\w.$])(\d[\d,]*(?:\.\d+)?)\s*(hkd\$|hk\$|hkd|usd|eur|gbp|jpy|cny|rmb|sgd|aud|cad"
+    r"|us\s+dollars?|hk\s+dollars?|hong\s+kong\s+dollars?|dollars?|bucks)\b"
 )
 _BARE_NUMBER = re.compile(r"(?<![\w.#-])(\d[\d,]*(?:\.\d+)?)(?![\w-])")
 
@@ -179,6 +184,14 @@ _ONE_DAY = re.compile(
     r"^(yes|yep|yeah|yup|correct|ok|okay|sure)\b"
     r"|\b(just|only)\s+(one|1|a single)\s+day\b|\b(one|1)\s+day\s+only\b"
     r"|\b(only|just)\s+(that|the same)\s+day\b|\bsame\s+day\b|\bsingle\s+day\b"
+)
+_BALANCE = re.compile(
+    r"\b(?:leave|annual|sick|vacation|holiday|pto)\s+(?:days?\s+)?(?:balances?|entitlements?)\b"
+    r"|\b(?:my|the)\s+balances?\b"
+    r"|\bhow\s+(?:many|much)\b[^?.!]*\b(?:leave|annual|sick|vacation|holiday|days?)\b"
+    r"[^?.!]*\b(?:left|remain\w*|have|available|got|entitled|used)\b"
+    r"|\b(?:remaining|leftover|unused)\s+(?:annual\s+|sick\s+)?(?:leave|days?|vacation)\b"
+    r"|\b(?:leave|days?)\s+(?:i\s+have\s+)?(?:left|remaining)\b"
 )
 _CANCEL = re.compile(r"\b(cancel|withdraw|retract)\b")
 _UPDATE = re.compile(
@@ -268,7 +281,8 @@ class _Parsed:
                 weekday = _WEEKDAYS.index(m.group("rel_w"))
                 value = _next_weekday(today, weekday, m.group("rel_n") == "next")
             elif m.group("word"):
-                value = today + timedelta(days=1 if m.group("word_w") == "tomorrow" else 0)
+                offset = {"today": 0, "tomorrow": 1, "yesterday": -1}[m.group("word_w")]
+                value = today + timedelta(days=offset)
             elif m.group("ord") and awaiting_date:
                 day = int(m.group("ord_d"))
                 value = _day_in_month(today, day)
@@ -310,9 +324,12 @@ def _amount(parsed: _Parsed) -> tuple[float | None, str | None]:
 
 
 def _currency(token: str) -> str:
-    if token in {"$", "hk$", "dollar", "dollars", "bucks"}:
+    token = " ".join(token.split())
+    if token in {"$", "hk$", "hkd$", "dollar", "dollars", "bucks"} or token.startswith(
+        ("hk dollar", "hong kong dollar")
+    ):
         return "HKD"
-    if token == "us$":
+    if token == "us$" or token.startswith("us dollar"):
         return "USD"
     return token.upper() if token in _CURRENCY_CODES else "HKD"
 
@@ -482,6 +499,9 @@ def _analyse(message: str, ctx: LLMContext) -> AgentTurn:
             request_type=RequestType.LEAVE,
             leave=LeaveFields(end_date=current.start_date),
         )
+
+    if _BALANCE.search(text) and not p.dates and not _CANCEL.search(text):
+        return _turn(Intent.CHECK_BALANCE, "fake rules: leave balance question")
 
     hint = _type_hint(p)
     ref_id = p.ids[0] if p.ids else None

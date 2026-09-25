@@ -111,13 +111,13 @@ def test_good_morning_is_help_not_half_day() -> None:
     ("message", "claim_type", "amount", "currency", "receipt"),
     [
         ("claim HKD 120 for taxi on 2026-09-20", ClaimType.TRAVEL, 120.0, "HKD", date(2026, 9, 20)),
-        (
-            "expense $120.50 lunch yesterday-ish 2026-09-21",
-            ClaimType.MEAL,
-            120.5,
-            "HKD",
-            date(2026, 9, 21),
-        ),
+        ("expense $120.50 lunch 2026-09-21", ClaimType.MEAL, 120.5, "HKD", date(2026, 9, 21)),
+        ("claim HKD 65 for a taxi yesterday", ClaimType.TRAVEL, 65.0, "HKD", date(2026, 9, 24)),
+        ("claim HKD 180 for a taxi", ClaimType.TRAVEL, 180.0, "HKD", None),
+        ("claim 50 US dollars for a hotel", ClaimType.TRAVEL, 50.0, "USD", None),
+        ("claim US$50 for a hotel", ClaimType.TRAVEL, 50.0, "USD", None),
+        ("claim 80 HK dollars for lunch", ClaimType.MEAL, 80.0, "HKD", None),
+        ("claim HKD$80 for lunch", ClaimType.MEAL, 80.0, "HKD", None),
         ("reimburse 300 dollars for a keyboard", ClaimType.EQUIPMENT, 300.0, "HKD", None),
         (
             "I want to claim 1,250 hkd for a training course",
@@ -145,6 +145,41 @@ def test_create_claim(
     assert turn.claim.currency == currency
     assert turn.claim.receipt_date == receipt
     assert turn.leave is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "how many annual leave days do I have left",
+        "How many annual leave days do I have left?",
+        "what is my leave balance",
+        "leave balance",
+        "how much sick leave do I have",
+        "how much sick leave do I have left?",
+        "remaining leave",
+        "my sick leave balance please",
+        "how many days of annual leave are left",
+        "annual leave entitlement",
+    ],
+)
+def test_check_balance_phrases(message: str) -> None:
+    turn = run(message)
+    assert turn.intent is Intent.CHECK_BALANCE, message
+    assert turn.leave is None and turn.claim is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "I want annual leave from 2026-10-05 to 2026-10-07",
+        "take 3 days of annual leave next monday",
+        "how is my leave request",
+        "cancel my annual leave",
+        "claim HKD 120 for taxi",
+    ],
+)
+def test_balance_intent_does_not_steal_other_requests(message: str) -> None:
+    assert run(message).intent is not Intent.CHECK_BALANCE, message
 
 
 def test_amount_does_not_read_dates_or_ids_as_money() -> None:

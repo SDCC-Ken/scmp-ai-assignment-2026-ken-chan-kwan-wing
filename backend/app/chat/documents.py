@@ -29,6 +29,7 @@ from app.chat.text import scrub
 from app.chat.validation import FIELD_LABELS, to_decimal
 from app.db.models import Attachment
 from app.domain.enums import LeaveType, RequestType
+from app.llm.currency import normalise_currency
 from app.llm.schemas import ClaimFields, DocType, DocumentExtraction, LeaveFields
 from app.schemas.chat import AttachmentInfo
 from app.services.attachments import to_info
@@ -63,7 +64,6 @@ _UNREADABLE_ALIASES = {
     "suggested_claim_type": "claim_type",
     "claim_type": "claim_type",
 }
-_CURRENCY_ALIASES = {"HK$": "HKD", "HKD$": "HKD", "US$": "USD", "RMB": "CNY"}
 _DOC_AMBIGUITY_WORDS = (
     "document",
     "attach",
@@ -201,8 +201,7 @@ class DocEffects:
 
 
 def _currency(value: str | None) -> str | None:
-    text = (value or "").strip().upper()
-    return _CURRENCY_ALIASES.get(text, text) or None
+    return normalise_currency(value)
 
 
 def norm(name: str, value: object) -> str | None:
@@ -216,7 +215,7 @@ def norm(name: str, value: object) -> str | None:
         return value.isoformat()
     if hasattr(value, "value"):
         return str(value.value)
-    return str(value).strip().upper() if name == "currency" else str(value)
+    return normalise_currency(value) if name == "currency" else str(value)
 
 
 def _document_values(rtype: RequestType, ex: DocumentExtraction) -> dict[str, object | None]:

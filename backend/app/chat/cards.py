@@ -7,7 +7,7 @@ from decimal import Decimal
 from app.chat.format import fmt_date, fmt_date_with_part, fmt_days, fmt_money
 from app.chat.state import CardAction
 from app.domain.enums import DayPart, RequestType
-from app.schemas.chat import AttachmentInfo, CardField, ConfirmationCard
+from app.schemas.chat import AttachmentInfo, CardField, CardInfoLine, ConfirmationCard
 
 _LABELS = {
     "employee_email": "Employee",
@@ -91,6 +91,7 @@ def build_card(
     card_id: str | None = None,
     document_fields: set[str] | None = None,
     attachments: list[AttachmentInfo] | None = None,
+    info: list[CardInfoLine] | None = None,
 ) -> ConfirmationCard:
     """``old`` (update cards) marks each changed field with its previous value.
 
@@ -125,6 +126,7 @@ def build_card(
         title=title,
         fields=fields,
         warnings=warnings or [],
+        info=info or [],
         state="open",
         confirm_label=CONFIRM_LABELS[action],  # type: ignore[arg-type]
         attachments=attachments or [],

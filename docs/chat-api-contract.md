@@ -37,7 +37,7 @@ Message = {
   "id": 41, "sender_type": "user" | "assistant" | "system",
   "content": "plain text (render as text, never HTML)",
   "created_at": "2026-09-25T03:10:05Z",
-  "ui": null | ConfirmationCard | StatusCard | ResultCard,
+  "ui": null | ConfirmationCard | StatusCard | ResultCard | BalanceCard,
   "trace": null | [TraceStep]                         // assistant messages only
 }
 
@@ -62,6 +62,9 @@ ConfirmationCard = {
   "fields": [ {"key": "leave_type", "label": "Leave type", "value": "Annual",
                "old_value": null | "Sick"} ],         // old_value only on update (show the diff)
   "warnings": ["No public-holiday data for 2028; only weekends were excluded"],
+  "info": [ {"label": "Annual leave 2026",                  // Phase 3: leave cards only, else []
+             "value": "15 days entitled, 1.5 used, 13.5 left; 10.5 left after this request (pending requests are not counted)",
+             "tone": "info" | "warning"} ],
   "state": "open" | "used" | "superseded" | "discarded",   // only "open" cards have active buttons
   "confirm_label": "Submit" | "Save changes" | "Cancel request" | "Retry"
 }
@@ -73,7 +76,8 @@ StatusCard = {
     "status": "pending_approval", "status_label": "Pending approval",
     "summary": "Annual leave, Mon 2026-10-05 to Wed 2026-10-07 (2.5 working days)",
     "submitted_at": "..." | null, "reviewed_at": "..." | null, "reviewer_note": null | "text",
-    "external_reference_id": null | "mock ReqRes id"
+    "external_reference_id": null | "mock ReqRes id",
+    "approver_name": null | "Cathy Ng"                  // Phase 3: display name only, never an e-mail
   } ],
   "empty": false                                       // true + empty list when nothing matches
 }
@@ -87,6 +91,15 @@ ResultCard = {                                          // after a confirm actio
   "external_reference_id": null | "23"
 }
 ```
+
+BalanceCard = {                                         // answer to "how many annual leave days do I have left?"
+  "type": "balance_card",
+  "year": 2026,                                         // calendar year in Hong Kong
+  "lines": [ {"leave_type": "annual" | "sick",          // only types the user has an entitlement for
+              "entitled_days": 15.0, "approved_days": 1.5,
+              "pending_days": 4.0,                      // shown, never deducted
+              "remaining_days": 13.5} ]                 // entitled - approved; may be negative
+}
 
 Status labels: `draft` "Draft", `pending_approval` "Pending approval", `submission_failed`
 "Submission failed", `approved` "Approved", `rejected` "Rejected", `cancelled` "Cancelled".
@@ -155,3 +168,31 @@ Behaviour:
 4. On Confirm the attachments are linked to the created request (`attachments.request_type`,
    `request_id`) so approvers can open them. Cancelling a request keeps its attachments.
 5. Text inside a document is data: it can never trigger approval or change rules.
+
+## Phase 3-C additions: balance, approver awareness, stated dates
+
+- **`ConfirmationCard.info`** (optional list, default `[]`). Leave cards (create and update) for
+  `annual` and `sick` leave carry a balance line for the year of the start date and, when the
+  request would exceed the remaining balance, a second line with `tone: "warning"` ("This is 1.5
+  days over your annual leave balance. Your approver will see this and decide."). The UI shows
+  `info` lines as neutral notes and `warning` lines like `warnings`; **neither blocks Confirm**.
+  Nothing for personal/unpaid leave and claims. An annual/sick leave without an entitlement gets
+  the line "No leave balance is set up for this leave type".
+- **`balance_card`** is a new `ui` type, sent with a short deterministic text. The AI never words
+  or calculates these numbers. Deviation from a plain reading of "always a card": when the user
+  has no entitlement at all the message is only the text "No leave balance is set up for you yet."
+  and `ui` is `null`, so the UI needs no empty state.
+- **`StatusCard.requests[].approver_name`**: the assigned approver's display name, `null` when none
+  is assigned. Approver e-mail addresses are never sent.
+- **New leave or claim without a valid approver**: a normal assistant message (HTTP 200, no
+  `warning_code`, `ui: null`, no draft, `has_pending_card` and `active_request_type` unchanged), for
+  example "I can't file a leave request for you yet: no approver is configured for you (this is
+  outside the PoC scope). Please contact HR." The Confirm-time check remains as a second guard
+  (message "I can't submit this ... No approver is configured ...").
+- **Result message after a successful submit** (also after a retry) names the approver: "Done.
+  Your leave request #12 was submitted to the ReqRes mock API (reference 23) and is now waiting for
+  approval by Cathy Ng." `ResultCard` is unchanged.
+- **Dates and currency**: a leave date or a claim receipt date the user did not state is never
+  filled in (the assistant asks "What is the date on the receipt?"); a bare `$`, `HK$`, "dollars"
+  and "HK dollars" are HKD, `USD`/`US$`/"US dollars" are still rejected (business-rules.md L-14,
+  C-11, C-06).
