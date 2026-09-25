@@ -204,7 +204,7 @@ Tests run locally, not inside Docker. Docker Compose is only used to run and dem
 | --- | --- | --- |
 | Backend unit tests (1,482, offline) | `cd backend && uv run pytest -q` | local |
 | Backend lint | `cd backend && uv run ruff check . && uv run ruff format --check .` | local |
-| Frontend lint, types, unit tests (144) | `cd frontend && bun run lint && bun run typecheck && bun run test` | local |
+| Frontend lint, types, unit tests (150) | `cd frontend && bun run lint && bun run typecheck && bun run test` | local |
 | End-to-end (Playwright, 10 tests, offline, fake AI): employee to approval (bell inbox and Approvals page), role denial, safe failures with Try again | `cd e2e && bun install && bun run test` (ports 9280/9281, system Chrome; see [e2e/README.md](e2e/README.md)) | local |
 | Full-stack smoke check | `docker compose -f docker-compose.yml -f docker-compose.ollama.yml up --build`, then open both URLs above | Docker |
 | Live AI check (opt-in) | `cd backend && RUN_LIVE_LLM=1 uv run python scripts/live_llm_smoke.py --provider ollama` (Gemini also needs `ALLOW_LIVE_GEMINI=1`) | local |

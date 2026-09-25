@@ -10,6 +10,7 @@ import {
   fieldValue,
   formatClock,
   formatDateTime,
+  formatIsoDate,
   formatDuration,
   isEmptyConversation,
   isNearBottom,
@@ -99,10 +100,14 @@ describe('time formatting', () => {
   })
 
   it('formats clock time, date-time and durations', () => {
-    expect(formatClock('2026-09-25T03:05:00Z', 'UTC')).toBe('03:05')
+    // Hong Kong time (UTC+8) is the default; an explicit offset in minutes is used by tests
+    expect(formatClock('2026-09-25T03:05:00Z')).toBe('11:05')
+    expect(formatClock('2026-09-25T03:05:00Z', 0)).toBe('03:05')
     expect(formatClock('nope')).toBe('')
-    expect(formatDateTime('2026-09-25T03:05:00Z', 'UTC')).toMatch(/^25 Sep\w* 2026, 03:05$/)
+    expect(formatDateTime('2026-09-25T03:05:00Z')).toBe('25 Sep 2026, 11:05')
+    expect(formatDateTime('2026-09-25T03:05:00Z', 0)).toBe('25 Sep 2026, 03:05')
     expect(formatDateTime(null)).toBe('')
+    expect(formatDateTime('not a date')).toBe('')
     expect(formatDuration(640)).toBe('640 ms')
     expect(formatDuration(1240)).toBe('1.2 s')
     expect(formatDuration(-1)).toBe('')
@@ -281,5 +286,54 @@ describe('screen-reader announcements', () => {
       ui: { type: 'result_card', outcome: 'submitted', request_type: 'leave', request_id: 1, status: 'pending_approval', status_label: 'Pending approval', message: 'Submitted.', external_reference_id: '23' },
     }))
     expect(result).toBe('Submitted.')
+  })
+})
+
+
+describe('deterministic date and time formatting', () => {
+  it('always writes a three-letter month, never "Sept"', () => {
+    for (let month = 1; month <= 12; month++) {
+      const iso = `2026-${String(month).padStart(2, '0')}-15T04:00:00Z`
+      expect(formatDateTime(iso)).toMatch(/^15 (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) 2026, 12:00$/)
+    }
+    expect(formatDateTime('2026-09-15T04:00:00Z')).toBe('15 Sep 2026, 12:00')
+  })
+
+  it('uses a 24 hour clock and never prints 24:xx for midnight', () => {
+    expect(formatClock('2026-09-25T16:05:00Z')).toBe('00:05') // 00:05 on 26 Sep in Hong Kong
+    expect(formatDateTime('2026-09-25T16:05:00Z')).toBe('26 Sep 2026, 00:05')
+    expect(formatClock('2026-09-25T15:59:00Z')).toBe('23:59')
+  })
+
+  it('rolls the calendar date over with the zone offset (year and leap day)', () => {
+    expect(formatDateTime('2026-12-31T16:30:00Z')).toBe('1 Jan 2027, 00:30')
+    expect(formatDateTime('2028-02-28T16:00:00Z')).toBe('29 Feb 2028, 00:00')
+    expect(formatDateTime('2026-09-25T03:05:00Z', -300)).toBe('24 Sep 2026, 22:05')
+  })
+
+  it('does not depend on the machine time zone or the runtime locale data', () => {
+    const before = process.env.TZ
+    try {
+      for (const tz of ['UTC', 'Asia/Tokyo', 'America/Los_Angeles', 'Pacific/Kiritimati']) {
+        process.env.TZ = tz
+        expect(formatDateTime('2026-09-25T03:05:00Z')).toBe('25 Sep 2026, 11:05')
+        expect(formatIsoDate('2026-09-25T20:00:00Z')).toBe('2026-09-26')
+      }
+    }
+    finally {
+      if (before === undefined) delete process.env.TZ
+      else process.env.TZ = before
+    }
+  })
+
+  it('gives the Hong Kong calendar date for relativeTime older than a week', () => {
+    const now = Date.parse('2026-10-20T12:00:00Z')
+    expect(relativeTime('2026-09-30T17:00:00Z', now)).toBe('2026-10-01') // 01:00 on 1 Oct in Hong Kong
+  })
+
+  it('returns an empty string for bad input', () => {
+    expect(formatIsoDate('')).toBe('')
+    expect(formatIsoDate(null)).toBe('')
+    expect(formatClock('')).toBe('')
   })
 })

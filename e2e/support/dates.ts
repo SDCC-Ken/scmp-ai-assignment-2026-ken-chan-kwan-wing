@@ -2,9 +2,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { BACKEND_DIR } from './env.mjs'
 
-/** Today's date in Hong Kong as ISO (the backend judges "past" and "future" by the Hong Kong date). */
+/**
+ * Today's date in Hong Kong as ISO (the backend judges "past" and "future" by the Hong Kong date).
+ * Computed from the UTC+8 offset instead of `Intl`, whose output depends on the runtime's ICU data.
+ */
 export function hkToday(): string {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Hong_Kong' }).format(new Date())
+  return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
 }
 
 let holidays: Set<string> | undefined

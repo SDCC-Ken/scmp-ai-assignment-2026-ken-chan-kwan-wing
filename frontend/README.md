@@ -230,3 +230,12 @@ approval after 20 s (it appears at the next bell click).
   see the 409 path in the UI: open a detail, then `curl -X POST "localhost:9191/__stub/decide?type=leave&id=12&decision=approve"`, then press Approve.
 - Notifications: see the bell-inbox table above (Amy 1, Ben 0, Cathy 3, Helen 1, Eva 2, Daniel 0). `POST /__stub/reset` re-seeds everything.
 - Chat: "how many annual leave days do I have left?" -> `balance_card`; the leave card carries an info line and a warning line.
+
+## Dates and times
+
+All dates and times are formatted by our own functions in `app/utils/chat.ts` (`formatDateTime`,
+`formatClock`, `formatIsoDate`, `relativeTime`), never with `toLocaleString` or `Intl`. Output is
+fixed, for example `25 Sep 2026, 11:05` (three-letter month, 24 hour clock, midnight is `00:05`) and is
+always in Hong Kong time (UTC+8, no daylight saving), the zone the backend uses for "today". This keeps
+the server render and the browser identical whatever the runtime's ICU data or time zone. Tests in
+`tests/chat.test.ts` check every month, midnight, year and leap-day rollover, and four machine time zones.

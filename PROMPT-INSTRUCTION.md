@@ -594,6 +594,17 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
 - **Verification commands and results:** `uv run pytest -q` 1482 passed; `bun run test` 144 passed; `cd e2e && bun run test` 10 passed in 13.8 s.
 - **Commit:** the next commit ("docs: final review ...").
 
+## Entry 35 - Deterministic date and time formatting (integrator)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`).
+- **Actual prompt (Ken):** `toLocaleString('en-GB')` sometimes does not format the date time correctly; change it to a custom function or find a third-party library.
+- **Allowed scope:** `frontend/app/utils/chat.ts`, `frontend/tests/chat.test.ts`, `e2e/support/dates.ts`, docs.
+- **Agent result:** a small custom formatter, no new dependency. Cause: `toLocale*`/`Intl` output depends on the runtime's ICU data ("Sept" in newer en-GB data, "24:05" for midnight in some versions) and on the machine time zone, so the server render (UTC in Docker) and the browser could differ. `formatDateTime`, `formatClock` and a new `formatIsoDate` now compute the result from a fixed UTC+8 offset (Hong Kong, no daylight saving): `25 Sep 2026, 11:05`; `relativeTime` uses the same Hong Kong date for old items; the E2E helper `hkToday()` no longer uses `Intl`. The machine used for development is in JST, which is why displayed times had been one hour off the Hong Kong times the backend uses.
+- **Human review / changes requested:** Ken asked for the fix; the choice of Hong Kong time is documented in `frontend/README.md` and `docs/architecture.md` and can be changed in one constant.
+- **Verification commands and results:** `bun run lint`, `typecheck` clean; `bun run test` 150 passed (6 new: all 12 months, midnight, year and leap-day rollover, four machine time zones, bad input); `cd e2e && bun run test` 10 passed; screenshots regenerated (now "24 Sep 2026, 11:00").
+- **Commit:** the commit that follows this entry.
+
 ## Entry template
 
 ### Entry NN - [phase and short task name]

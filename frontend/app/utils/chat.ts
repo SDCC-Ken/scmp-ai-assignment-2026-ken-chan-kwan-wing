@@ -107,30 +107,60 @@ export function relativeTime(iso: string, now: number = Date.now()): string {
   if (diff < DAY) return `${Math.floor(diff / HOUR)} h ago`
   if (diff < 2 * DAY) return 'yesterday'
   if (diff < 7 * DAY) return `${Math.floor(diff / DAY)} d ago`
-  return new Date(then).toISOString().slice(0, 10)
+  return formatIsoDate(iso)
 }
 
-/** Clock time of a message, e.g. "11:05". `timeZone` is only passed by tests. */
-export function formatClock(iso: string, timeZone?: string): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return ''
-  return date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone })
+/**
+ * Dates and times are formatted by our own code, never with `toLocaleString` / `Intl`: their output
+ * depends on the ICU data of the runtime ("Sep" vs "Sept" in en-GB, "24:05" for midnight) and on the
+ * time zone of the machine, so the server render and the browser could disagree. Everything is
+ * shown in Hong Kong time (UTC+8, no daylight saving), the zone the backend uses for "today".
+ */
+export const HK_UTC_OFFSET_MINUTES = 8 * 60
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const
+
+const pad2 = (n: number): string => String(n).padStart(2, '0')
+
+interface ClockParts {
+  year: number
+  month: number // 0-11
+  day: number
+  hour: number // 0-23
+  minute: number
 }
 
-/** Date and time for cards, e.g. "25 Sep 2026, 11:05". */
-export function formatDateTime(iso: string | null | undefined, timeZone?: string): string {
-  if (!iso) return ''
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return ''
-  return date.toLocaleString('en-GB', {
-    day: 'numeric',
-    month: 'short',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-    timeZone,
-  })
+/** Calendar and clock parts of an instant in the zone `offsetMinutes` east of UTC. null for bad input. */
+function clockParts(iso: string | null | undefined, offsetMinutes: number): ClockParts | null {
+  if (!iso) return null
+  const ms = Date.parse(iso)
+  if (Number.isNaN(ms)) return null
+  const shifted = new Date(ms + offsetMinutes * 60_000)
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth(),
+    day: shifted.getUTCDate(),
+    hour: shifted.getUTCHours(),
+    minute: shifted.getUTCMinutes(),
+  }
+}
+
+/** Clock time of a message, e.g. "11:05" (24 hour clock; midnight is "00:05"). */
+export function formatClock(iso: string, offsetMinutes: number = HK_UTC_OFFSET_MINUTES): string {
+  const p = clockParts(iso, offsetMinutes)
+  return p ? `${pad2(p.hour)}:${pad2(p.minute)}` : ''
+}
+
+/** Date and time for cards, e.g. "25 Sep 2026, 11:05". Empty for missing or invalid input. */
+export function formatDateTime(iso: string | null | undefined, offsetMinutes: number = HK_UTC_OFFSET_MINUTES): string {
+  const p = clockParts(iso, offsetMinutes)
+  return p ? `${p.day} ${MONTHS[p.month]} ${p.year}, ${pad2(p.hour)}:${pad2(p.minute)}` : ''
+}
+
+/** Calendar date as ISO, e.g. "2026-09-25" (Hong Kong date by default). Empty for bad input. */
+export function formatIsoDate(iso: string | null | undefined, offsetMinutes: number = HK_UTC_OFFSET_MINUTES): string {
+  const p = clockParts(iso, offsetMinutes)
+  return p ? `${p.year}-${pad2(p.month + 1)}-${pad2(p.day)}` : ''
 }
 
 /** "640 ms" or "1.2 s". */

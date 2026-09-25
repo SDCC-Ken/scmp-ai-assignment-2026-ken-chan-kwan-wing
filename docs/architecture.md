@@ -259,6 +259,10 @@ docs/screenshots/      five fictional-data screenshots produced by `cd e2e && bu
   automatically, at the cost of slower and less accurate answers.
 - **Cookie session, not a bearer token in JS.** `httpOnly` cookie plus `X-Requested-With` and Origin
   checks; web and API must share a host name (`localhost`).
+- **Our own date formatting.** The UI never uses `toLocaleString` or `Intl` for dates: their output
+  varies with the runtime's ICU data ("Sep" vs "Sept", "24:05" for midnight) and the machine time
+  zone, so the server render and the browser could disagree. `formatDateTime` / `formatClock` in
+  `frontend/app/utils/chat.ts` produce a fixed "25 Sep 2026, 11:05" in Hong Kong time (UTC+8).
 - **Polling, not websockets.** The bell and the approvals badge refresh every 30 s and on window
   focus. Much simpler; a new notification can take up to 30 s to appear.
 - **One deterministic card for every state change.** The model proposes, the backend builds the card,
