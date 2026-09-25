@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # Mock Google SSO (fictional seed users, no password). Disable to hide the endpoints.
     mock_sso_enabled: bool = True
     cors_origins: list[str] | str = ["http://localhost:9180"]
+    # The JWT travels only in this httpOnly cookie (never in a response body). Set
+    # AUTH_COOKIE_SECURE=true whenever the app is served over HTTPS; APP_ENV=production
+    # forces Secure regardless.
+    auth_cookie_name: str = Field(default="scmp_session", min_length=1)
+    auth_cookie_secure: bool = False
 
     llm_provider: str = "gemini"
     gemini_api_key: SecretStr = SecretStr("")
@@ -41,6 +46,11 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env.strip().lower() == "production"
+
+    @property
+    def cookie_secure(self) -> bool:
+        """Effective ``Secure`` attribute of the session cookie."""
+        return self.auth_cookie_secure or self.is_production
 
     @field_validator("cors_origins", mode="before")
     @classmethod

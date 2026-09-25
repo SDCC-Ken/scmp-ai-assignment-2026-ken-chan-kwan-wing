@@ -1,19 +1,22 @@
 """Mock Google SSO and session endpoints (mounted under /api/auth)."""
 
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, get_optional_user
 from app.auth.tokens import create_access_token
 from app.db.models import User
 from app.db.session import get_db
 from app.domain.enums import UserRole
-from app.schemas.auth import LoginRequest, TokenResponse, UserPublic
+from app.schemas.auth import LoginRequest, LoginResponse, UserPublic
 from app.services.audit import record_audit
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _ROLE_ORDER = {UserRole.EMPLOYEE: 0, UserRole.HR_APPROVER: 1, UserRole.FINANCE_APPROVER: 2}
 
 
@@ -31,14 +34,27 @@ def list_mock_users(
     return sorted(users, key=lambda u: (_ROLE_ORDER[u.role], u.id))
 
 
-@router.post("/mock-google/login", response_model=TokenResponse)
+def _cookie_attributes(request: Request) -> dict[str, object]:
+    """Shared by set and clear so the browser treats them as the same cookie."""
+    return {
+        "path": "/",  # host-only: no Domain attribute
+        "httponly": True,
+        "samesite": "Lax",
+        "secure": request.app.state.settings.cookie_secure,
+    }
+
+
+@router.post("/mock-google/login", response_model=LoginResponse)
 def mock_google_login(
     body: LoginRequest,
     request: Request,
+    response: Response,
     _: None = Depends(_require_mock_sso),
     db: Session = Depends(get_db),
-) -> TokenResponse:
+) -> LoginResponse:
     """Sign in as a seeded user without a password (mock Google SSO).
+
+    The JWT is set as an httpOnly cookie and is never part of the response body.
 
     Every failure looks the same (401 "Invalid credentials") except an inactive account
     (403). Audit rows never contain tokens.
@@ -82,11 +98,11 @@ def mock_google_login(
         actor_user_id=user.id,
     )
     db.commit()
-    return TokenResponse(
-        access_token=token,
-        expires_in=settings.jwt_expire_minutes * 60,
-        user=UserPublic.model_validate(user),
+    expires_in = settings.jwt_expire_minutes * 60
+    response.set_cookie(
+        settings.auth_cookie_name, token, max_age=expires_in, **_cookie_attributes(request)
     )
+    return LoginResponse(expires_in=expires_in, user=UserPublic.model_validate(user))
 
 
 @router.get("/me", response_model=UserPublic)
@@ -96,18 +112,33 @@ def me(user: User = Depends(get_current_user)) -> User:
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-def logout(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> Response:
-    """Record the logout in the audit trail.
+def logout(
+    request: Request,
+    user: User | None = Depends(get_optional_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Clear the session cookie and, when a valid user is signed in, record the logout.
 
-    Tokens are stateless (no server-side session or deny-list), so the client discards
-    its token; it simply expires at ``exp``.
+    Idempotent: with no/invalid credentials it still returns 204 and clears the cookie, and
+    writes no audit row (there is no user to attribute it to). Tokens are stateless (no
+    server-side session or deny-list), so a token copied elsewhere simply expires at ``exp``.
     """
-    record_audit(
-        db,
-        entity_type="user",
-        entity_id=user.id,
-        event_type="auth.logout",
-        actor_user_id=user.id,
+    if user is not None:
+        record_audit(
+            db,
+            entity_type="user",
+            entity_id=user.id,
+            event_type="auth.logout",
+            actor_user_id=user.id,
+        )
+        db.commit()
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    # Same name/path/attributes as at login, Max-Age=0 and an expiry in the past.
+    response.set_cookie(
+        request.app.state.settings.auth_cookie_name,
+        "",
+        max_age=0,
+        expires=_EPOCH,
+        **_cookie_attributes(request),
     )
-    db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return response

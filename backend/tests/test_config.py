@@ -12,6 +12,8 @@ ENV_VARS = [
     "JWT_ISSUER",
     "MOCK_SSO_ENABLED",
     "CORS_ORIGINS",
+    "AUTH_COOKIE_NAME",
+    "AUTH_COOKIE_SECURE",
     "LLM_PROVIDER",
     "GEMINI_API_KEY",
     "GEMINI_MODEL",
@@ -76,3 +78,22 @@ def test_auth_settings_from_env(clean_env: pytest.MonkeyPatch) -> None:
     assert (s.db_auto_seed, s.jwt_expire_minutes, s.mock_sso_enabled) == (False, 15, False)
     assert s.is_production is True
     assert "fake-jwt-secret" not in repr(s) + str(s)
+
+
+def test_cookie_settings_defaults_and_env(clean_env: pytest.MonkeyPatch) -> None:
+    s = Settings(_env_file=None)
+    assert (s.auth_cookie_name, s.auth_cookie_secure, s.cookie_secure) == (
+        "scmp_session",
+        False,
+        False,
+    )
+    clean_env.setenv("AUTH_COOKIE_NAME", "other")
+    clean_env.setenv("AUTH_COOKIE_SECURE", "true")
+    s = Settings(_env_file=None)
+    assert (s.auth_cookie_name, s.auth_cookie_secure, s.cookie_secure) == ("other", True, True)
+
+
+def test_production_forces_secure_cookie(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("APP_ENV", "production")
+    s = Settings(_env_file=None)
+    assert s.auth_cookie_secure is False and s.cookie_secure is True

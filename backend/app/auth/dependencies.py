@@ -27,17 +27,27 @@ def _unauthorized() -> HTTPException:
     )
 
 
+def _extract_token(request: Request, credentials: HTTPAuthorizationCredentials | None) -> str:
+    """The JWT from ``Authorization: Bearer`` (wins when present) or the session cookie."""
+    if credentials is not None:
+        token = credentials.credentials
+    else:
+        token = request.cookies.get(request.app.state.settings.auth_cookie_name, "")
+    if not token:
+        raise _unauthorized()
+    return token
+
+
 def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
     db: Session = Depends(get_db),
 ) -> User:
-    if credentials is None or not credentials.credentials:
-        raise _unauthorized()
+    token = _extract_token(request, credentials)
     settings = request.app.state.settings
     try:
         claims = decode_access_token(
-            credentials.credentials,
+            token,
             secret=request.app.state.jwt_secret,
             issuer=settings.jwt_issuer,
         )
@@ -49,6 +59,21 @@ def get_current_user(
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is inactive")
     return user
+
+
+def get_optional_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: Session = Depends(get_db),
+) -> User | None:
+    """Like ``get_current_user`` but ``None`` for a missing/invalid credential or an inactive
+    account (used by the idempotent logout)."""
+    try:
+        return get_current_user(request, credentials, db)
+    except HTTPException as exc:
+        if exc.status_code in (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN):
+            return None
+        raise
 
 
 def require_roles(*roles: UserRole) -> Callable[..., User]:

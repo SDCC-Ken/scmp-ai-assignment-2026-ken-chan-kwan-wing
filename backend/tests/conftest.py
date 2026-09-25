@@ -25,6 +25,9 @@ from app.seed import seed_demo_data
 
 SEED_TODAY = date(2026, 9, 25)
 TEST_SECRET = "unit-test-secret-" + "k" * 48
+COOKIE_NAME = "scmp_session"
+ORIGIN = "http://localhost:9180"
+CSRF_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 
 
 def make_settings(**overrides: Any) -> Settings:
@@ -86,15 +89,31 @@ def app(app_factory: Callable[..., FastAPI]) -> FastAPI:
 
 
 @pytest.fixture
-def client(app: FastAPI) -> Iterator[TestClient]:
+def raw_client(app: FastAPI) -> Iterator[TestClient]:
+    """Cookie-jar client that sends no CSRF header (use it to test the CSRF defence)."""
     with TestClient(app) as c:
         yield c
 
 
+@pytest.fixture
+def client(app: FastAPI) -> Iterator[TestClient]:
+    """Like a browser SPA: keeps cookies and sends ``X-Requested-With`` on every request."""
+    with TestClient(app, headers=CSRF_HEADERS) as c:
+        yield c
+
+
 def login(client: TestClient, email: str) -> str:
-    response = client.post("/api/auth/mock-google/login", json={"email": email})
+    """Log in (the session cookie lands in the client's jar) and return the JWT from the jar.
+
+    The token is never in the body; tests read it from the cookie only to forge/tamper.
+    """
+    response = client.post(
+        "/api/auth/mock-google/login", json={"email": email}, headers=CSRF_HEADERS
+    )
     assert response.status_code == 200, response.text
-    return response.json()["access_token"]
+    token = client.cookies.get(COOKIE_NAME)
+    assert token
+    return token
 
 
 def auth(token: str) -> dict[str, str]:

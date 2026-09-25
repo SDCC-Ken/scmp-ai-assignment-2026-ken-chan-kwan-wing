@@ -25,8 +25,8 @@ class LoginRequest(BaseModel):
         return value.strip().lower()
 
 
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+class LoginResponse(BaseModel):
+    """Login body. The JWT is delivered only as an httpOnly cookie, never in the body."""
+
     expires_in: int
     user: UserPublic

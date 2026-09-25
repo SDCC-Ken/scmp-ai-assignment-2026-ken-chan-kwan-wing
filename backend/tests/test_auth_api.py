@@ -12,7 +12,15 @@ from app.auth import get_current_user, require_roles
 from app.db.models import AuditEvent, User
 from app.db.session import Database
 from app.domain.enums import UserRole
-from tests.conftest import TEST_SECRET, auth, login, make_settings
+from tests.conftest import (
+    COOKIE_NAME,
+    CSRF_HEADERS,
+    ORIGIN,
+    TEST_SECRET,
+    auth,
+    login,
+    make_settings,
+)
 
 AMY = "amy.lau@example.com"
 HR = "daniel.wong@example.com"
@@ -75,7 +83,7 @@ def test_mock_users_hides_inactive(client: TestClient, seeded: Database) -> None
 
 
 def test_sso_disabled_returns_404(app_factory) -> None:
-    with TestClient(app_factory(mock_sso_enabled=False)) as c:
+    with TestClient(app_factory(mock_sso_enabled=False), headers=CSRF_HEADERS) as c:
         assert c.get("/api/auth/mock-users").status_code == 404
         assert c.post("/api/auth/mock-google/login", json={"email": AMY}).status_code == 404
 
@@ -90,11 +98,14 @@ def test_login_success_for_each_role(client: TestClient, email: str, role: str) 
     response = client.post("/api/auth/mock-google/login", json={"email": email})
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"access_token", "token_type", "expires_in", "user"}
-    assert body["token_type"] == "bearer" and body["expires_in"] == 3600
+    assert set(body) == {"expires_in", "user"}  # the JWT is never in the body
+    assert "access_token" not in response.text and "token" not in body
+    assert body["expires_in"] == 3600
     assert set(body["user"]) == {"id", "email", "display_name", "role"}
     assert body["user"]["email"] == email and body["user"]["role"] == role
-    claims = jwt.decode(body["access_token"], TEST_SECRET, algorithms=["HS256"], issuer=ISSUER)
+    token = client.cookies.get(COOKIE_NAME)
+    assert token and token not in response.text
+    claims = jwt.decode(token, TEST_SECRET, algorithms=["HS256"], issuer=ISSUER)
     assert set(claims) == {"sub", "email", "role", "iss", "iat", "exp", "jti"}
     assert claims["sub"] == str(body["user"]["id"]) and claims["role"] == role
     assert claims["exp"] - claims["iat"] == 3600
@@ -106,10 +117,10 @@ def test_login_is_case_insensitive(client: TestClient) -> None:
 
 
 def test_login_expiry_follows_settings(app_factory) -> None:
-    with TestClient(app_factory(jwt_expire_minutes=15)) as c:
-        assert (
-            c.post("/api/auth/mock-google/login", json={"email": AMY}).json()["expires_in"] == 900
-        )
+    with TestClient(app_factory(jwt_expire_minutes=15), headers=CSRF_HEADERS) as c:
+        response = c.post("/api/auth/mock-google/login", json={"email": AMY})
+        assert response.json()["expires_in"] == 900
+        assert "Max-Age=900" in response.headers["set-cookie"]
 
 
 @pytest.mark.parametrize("email", ["nobody@example.com", "not-an-email", "", "a" * 100])
@@ -158,6 +169,27 @@ def test_me_returns_current_user(client: TestClient) -> None:
 def assert_401(response) -> None:
     assert response.status_code == 401
     assert response.headers["www-authenticate"] == "Bearer"
+
+
+def set_cookie_attrs(response) -> dict[str, str]:
+    """Parse the (single) Set-Cookie header into {lowercased attribute: value}."""
+    headers = response.headers.get_list("set-cookie")
+    assert len(headers) == 1, headers
+    name_value, *attrs = [part.strip() for part in headers[0].split(";")]
+    name, _, value = name_value.partition("=")
+    parsed = {"name": name, "value": value}
+    for attr in attrs:
+        key, _, val = attr.partition("=")
+        parsed[key.lower()] = val
+    return parsed
+
+
+def assert_cookie_cleared(response) -> None:
+    attrs = set_cookie_attrs(response)
+    assert attrs["name"] == COOKIE_NAME and attrs["value"] in ("", '""')
+    assert attrs["max-age"] == "0" and "1970" in attrs["expires"]
+    assert attrs["path"] == "/" and attrs["samesite"] == "Lax" and "httponly" in attrs
+    assert "domain" not in attrs
 
 
 def test_me_without_or_with_garbage_token(client: TestClient) -> None:
@@ -240,12 +272,49 @@ def test_role_demotion_takes_effect_immediately(client: TestClient, seeded: Data
     assert client.get("/api/auth/me", headers=auth(token)).json()["role"] == "employee"
 
 
-def test_logout_writes_audit_and_returns_204(client: TestClient, seeded: Database) -> None:
-    token = login(client, AMY)
-    response = client.post("/api/auth/logout", headers=auth(token))
+def test_logout_writes_audit_clears_cookie_and_returns_204(
+    client: TestClient, seeded: Database
+) -> None:
+    login(client, AMY)
+    before = audit_types(seeded)
+    response = client.post("/api/auth/logout")
     assert response.status_code == 204 and response.content == b""
-    assert audit_types(seeded)[-1] == "auth.logout"
-    assert_401(client.post("/api/auth/logout"))
+    assert audit_types(seeded) == [*before, "auth.logout"]
+    assert_cookie_cleared(response)
+    assert client.cookies.get(COOKIE_NAME) is None
+    assert_401(client.get("/api/auth/me"))
+
+
+def test_logout_with_bearer_token_writes_audit(raw_client: TestClient, seeded: Database) -> None:
+    token = login(raw_client, AMY)
+    raw_client.cookies.clear()
+    before = audit_types(seeded)
+    response = raw_client.post("/api/auth/logout", headers={**auth(token), **CSRF_HEADERS})
+    assert response.status_code == 204 and audit_types(seeded) == [*before, "auth.logout"]
+
+
+@pytest.mark.parametrize("cookie", [None, "garbage"])
+def test_logout_without_valid_cookie_is_idempotent(
+    client: TestClient, seeded: Database, cookie: str | None
+) -> None:
+    if cookie:
+        client.cookies.set(COOKIE_NAME, cookie)
+    before = audit_types(seeded)
+    response = client.post("/api/auth/logout")
+    assert response.status_code == 204
+    assert_cookie_cleared(response)
+    assert audit_types(seeded) == before  # no user, no audit row
+
+
+def test_logout_for_deactivated_user_still_clears_cookie(
+    client: TestClient, seeded: Database
+) -> None:
+    login(client, AMY)
+    set_user(seeded, AMY, is_active=False)
+    before = audit_types(seeded)
+    response = client.post("/api/auth/logout")
+    assert response.status_code == 204 and audit_types(seeded) == before
+    assert_cookie_cleared(response)
 
 
 # ---- require_roles -----------------------------------------------------------------------
@@ -325,3 +394,209 @@ def test_health_still_at_root(client: TestClient) -> None:
 
 def test_settings_helper_builds_isolated_settings() -> None:
     assert make_settings().database_url == "sqlite:///:memory:"
+
+
+# ---- cookie delivery ---------------------------------------------------------------------
+
+
+def test_login_sets_httponly_samesite_lax_cookie(client: TestClient) -> None:
+    response = client.post("/api/auth/mock-google/login", json={"email": AMY})
+    attrs = set_cookie_attrs(response)
+    assert attrs["name"] == COOKIE_NAME and len(attrs["value"]) > 20
+    assert "httponly" in attrs
+    assert attrs["samesite"] == "Lax"
+    assert attrs["path"] == "/"
+    assert attrs["max-age"] == "3600"
+    assert "secure" not in attrs
+    assert "domain" not in attrs  # host-only cookie
+
+
+def test_cookie_secure_when_configured(app_factory) -> None:
+    with TestClient(app_factory(auth_cookie_secure=True), headers=CSRF_HEADERS) as c:
+        response = c.post("/api/auth/mock-google/login", json={"email": AMY})
+        assert "secure" in set_cookie_attrs(response)
+        assert "secure" in set_cookie_attrs(c.post("/api/auth/logout"))
+
+
+def test_cookie_secure_in_production(app_factory) -> None:
+    prod = app_factory(app_env="production", jwt_secret_key="p" * 40)
+    with TestClient(prod, headers=CSRF_HEADERS) as c:
+        response = c.post("/api/auth/mock-google/login", json={"email": AMY})
+        attrs = set_cookie_attrs(response)
+        assert "secure" in attrs and "httponly" in attrs and attrs["samesite"] == "Lax"
+
+
+def test_custom_cookie_name(app_factory) -> None:
+    with TestClient(app_factory(auth_cookie_name="custom_sid"), headers=CSRF_HEADERS) as c:
+        response = c.post("/api/auth/mock-google/login", json={"email": AMY})
+        assert set_cookie_attrs(response)["name"] == "custom_sid"
+        assert c.get("/api/auth/me").status_code == 200
+
+
+def test_me_works_with_only_the_cookie(client: TestClient) -> None:
+    login(client, HR)
+    response = client.get("/api/auth/me")  # no Authorization header
+    assert response.status_code == 200 and response.json()["email"] == HR
+
+
+def test_bearer_still_works_without_cookie(client: TestClient) -> None:
+    token = login(client, AMY)
+    client.cookies.clear()
+    response = client.get("/api/auth/me", headers=auth(token))
+    assert response.status_code == 200 and response.json()["email"] == AMY
+
+
+def test_authorization_header_wins_over_cookie(client: TestClient) -> None:
+    login(client, AMY)  # cookie: Amy
+    hr_token = login(client.__class__(client.app, headers=CSRF_HEADERS), HR)
+    assert client.get("/api/auth/me").json()["email"] == AMY
+    assert client.get("/api/auth/me", headers=auth(hr_token)).json()["email"] == HR
+    # an invalid header is not rescued by a valid cookie
+    assert_401(client.get("/api/auth/me", headers=auth("garbage")))
+
+
+def test_tampered_cookie_rejected(client: TestClient) -> None:
+    token = login(client, AMY)
+    head, payload, sig = token.split(".")
+    flipped = ("A" if sig[0] != "A" else "B") + sig[1:]
+    client.cookies.set(COOKIE_NAME, f"{head}.{payload}.{flipped}")
+    assert_401(client.get("/api/auth/me"))
+
+
+def test_expired_cookie_rejected(client: TestClient, seeded: Database) -> None:
+    past = datetime.now(UTC) - timedelta(hours=2)
+    client.cookies.set(
+        COOKIE_NAME, token_for(user_id(seeded, AMY), iat=past, exp=past + timedelta(minutes=5))
+    )
+    assert_401(client.get("/api/auth/me"))
+
+
+def test_wrong_issuer_cookie_rejected(client: TestClient, seeded: Database) -> None:
+    client.cookies.set(COOKIE_NAME, token_for(user_id(seeded, AMY), iss="someone-else"))
+    assert_401(client.get("/api/auth/me"))
+
+
+def test_deactivated_user_with_valid_cookie_is_403(client: TestClient, seeded: Database) -> None:
+    login(client, AMY)
+    assert client.get("/api/auth/me").status_code == 200
+    set_user(seeded, AMY, is_active=False)
+    response = client.get("/api/auth/me")
+    assert response.status_code == 403 and response.json() == {"detail": "Account is inactive"}
+
+
+def test_role_demotion_is_immediate_with_cookie(client: TestClient, seeded: Database) -> None:
+    login(client, HR)
+    assert client.get("/api/auth/me").json()["role"] == "hr_approver"
+    set_user(seeded, HR, role=UserRole.EMPLOYEE)
+    assert client.get("/api/auth/me").json()["role"] == "employee"
+
+
+# ---- CSRF --------------------------------------------------------------------------------
+
+
+def test_post_without_csrf_header_is_403(raw_client: TestClient) -> None:
+    for path, body in [
+        ("/api/auth/mock-google/login", {"email": AMY}),
+        ("/api/auth/logout", None),
+        ("/api/does-not-exist", None),
+    ]:
+        response = raw_client.post(path, json=body)
+        assert response.status_code == 403, path
+        assert response.json() == {"detail": "CSRF check failed"}
+    assert raw_client.cookies.get(COOKIE_NAME) is None
+
+
+@pytest.mark.parametrize("value", ["", "fetch", "true"])
+def test_post_with_wrong_csrf_header_value_is_403(raw_client: TestClient, value: str) -> None:
+    response = raw_client.post(
+        "/api/auth/mock-google/login", json={"email": AMY}, headers={"X-Requested-With": value}
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_other_unsafe_methods_require_csrf_header(raw_client: TestClient, method: str) -> None:
+    response = raw_client.request(method, "/api/auth/me")
+    assert response.status_code == 403 and response.json() == {"detail": "CSRF check failed"}
+    # with the header the CSRF layer passes (the route itself answers 405/401, not 403 CSRF)
+    passed = raw_client.request(method, "/api/auth/me", headers=CSRF_HEADERS)
+    assert passed.json() != {"detail": "CSRF check failed"}
+
+
+def test_post_with_disallowed_origin_is_403(raw_client: TestClient) -> None:
+    response = raw_client.post(
+        "/api/auth/mock-google/login",
+        json={"email": AMY},
+        headers={**CSRF_HEADERS, "Origin": "http://evil.example"},
+    )
+    assert response.status_code == 403
+    assert response.json() == {"detail": "CSRF check failed"}
+    assert "access-control-allow-origin" not in response.headers
+    assert raw_client.cookies.get(COOKIE_NAME) is None
+
+
+def test_post_with_allowed_origin_and_header_succeeds(raw_client: TestClient) -> None:
+    response = raw_client.post(
+        "/api/auth/mock-google/login",
+        json={"email": AMY},
+        headers={**CSRF_HEADERS, "Origin": ORIGIN},
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == ORIGIN
+    assert response.headers["access-control-allow-credentials"] == "true"
+
+
+def test_csrf_403_from_allowed_origin_carries_cors_headers(raw_client: TestClient) -> None:
+    response = raw_client.post(
+        "/api/auth/logout", headers={"Origin": ORIGIN}
+    )  # allowed origin, missing header
+    assert response.status_code == 403
+    assert response.headers["access-control-allow-origin"] == ORIGIN
+
+
+def test_get_and_head_without_header_are_fine(raw_client: TestClient) -> None:
+    assert raw_client.get("/api/auth/mock-users").status_code == 200
+    assert raw_client.get("/health").status_code == 200
+    assert raw_client.head("/api/auth/mock-users").status_code != 403
+    assert (
+        raw_client.get(
+            "/api/auth/mock-users", headers={"Origin": "http://evil.example"}
+        ).status_code
+        == 200
+    )
+
+
+def test_post_outside_api_is_not_csrf_checked(raw_client: TestClient) -> None:
+    assert raw_client.post("/health").status_code == 405  # plain router answer, not CSRF 403
+
+
+def test_cors_preflight_for_post_with_csrf_header(raw_client: TestClient) -> None:
+    response = raw_client.options(
+        "/api/auth/mock-google/login",
+        headers={
+            "Origin": ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type,x-requested-with",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == ORIGIN
+    assert response.headers["access-control-allow-credentials"] == "true"
+    allowed = response.headers["access-control-allow-headers"].lower()
+    assert "x-requested-with" in allowed and "content-type" in allowed
+    assert "authorization" in allowed
+
+
+def test_cors_disallowed_origin_gets_no_allow_origin(raw_client: TestClient) -> None:
+    evil = "http://evil.example"
+    preflight = raw_client.options(
+        "/api/auth/mock-google/login",
+        headers={
+            "Origin": evil,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "x-requested-with",
+        },
+    )
+    assert "access-control-allow-origin" not in preflight.headers
+    simple = raw_client.get("/api/auth/mock-users", headers={"Origin": evil})
+    assert "access-control-allow-origin" not in simple.headers

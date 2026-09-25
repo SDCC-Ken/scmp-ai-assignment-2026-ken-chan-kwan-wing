@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
+from app.auth.csrf import CSRFMiddleware
 from app.auth.tokens import resolve_jwt_secret
 from app.config import Settings, get_settings
 from app.db.session import Database
@@ -47,12 +48,15 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
     app.state.settings = settings
     app.state.database = database
     app.state.jwt_secret = jwt_secret
+    # Middleware added last is outermost: CORS wraps CSRF, so a 403 "CSRF check failed" from an
+    # allowed origin still carries the CORS headers and preflights never reach the CSRF check.
+    app.add_middleware(CSRFMiddleware, allowed_origins=list(settings.cors_origins))
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
         allow_credentials=True,
         allow_methods=["*"],
-        allow_headers=["Authorization", "Content-Type", "Accept"],
+        allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With"],
     )
 
     @app.get("/health")
