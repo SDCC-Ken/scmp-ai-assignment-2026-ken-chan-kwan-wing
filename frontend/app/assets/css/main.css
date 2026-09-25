@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+/* Runtime values (--theme-* and --color-*) are injected at :root by app/app.vue
+   from runtimeConfig.public.theme; these tokens expose them as utilities. */
+@theme inline {
+  --color-primary: var(--theme-primary);
+  --color-secondary: var(--theme-secondary);
+  --color-background: var(--theme-background);
+}
+
+html {
+  color-scheme: light;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) {
+    color-scheme: dark;
+  }
+}
+
+body {
+  background-color: var(--theme-background);
+  color: var(--theme-secondary);
+}

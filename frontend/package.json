@@ -1,0 +1,29 @@
+{
+  "name": "scmp-internal-ops-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev --dotenv ../.env",
+    "build": "nuxt build --dotenv ../.env",
+    "preview": "nuxt preview --dotenv ../.env --port ${WEB_PORT:-9180}",
+    "postinstall": "nuxt prepare",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "nuxt typecheck --dotenv ../.env",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "nuxt": "^4",
+    "vue": "^3.5.43",
+    "vue-router": "^5.3.1"
+  },
+  "devDependencies": {
+    "@nuxt/eslint": "^1.17.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "eslint": "^10.11.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~6.0",
+    "vitest": "^5.0.1",
+    "vue-tsc": "^3.3.11"
+  }
+}
