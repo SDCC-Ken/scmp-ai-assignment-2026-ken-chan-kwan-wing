@@ -197,6 +197,75 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
   - README commands checked inside the container against a throwaway database: `seed --reset --yes`, `import-holidays --file ... --year 2027` (17 updated) and `--year 2031` (clear error, non-zero).
 - **Commit:** this log is committed in the commit that follows `661e077`.
 
+## Entry 09 - Phase 1b research and decisions (Ken → integrator agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), integrator.
+- **Actual prompt (Ken, condensed):**
+  ```text
+  Test all users log in: good. Search the web: Google has a newer UI with the sign-in at the top-right corner; can we use it?
+  Make the session save to a cookie. I want to know how a real Google sign-in avoids surprise sign-outs and signs a
+  disabled user out, and what we could prepare for later. Check it out first.
+  Follow-up decision: change our mock UI so it is always on the login page, similar to that top-right UI.
+  Disabling users is on our side, so do the cookie only.
+  ```
+- **Allowed scope:** research only; no code changed in this step.
+- **Agent result:** Read Google's One Tap, FedCM migration, ID-token verification and Cross-Account Protection (RISC) documentation. Findings reported to Ken: the top-right prompt is Google One Tap (browser-native under FedCM, so it cannot be reproduced authentically with fictional users); a real ID token is a one-time proof of identity, the app must issue its own session and key users by `sub`; Google does not notify an app when an employer disables a user, and RISC events cover Google-detected security problems. The offboarding and suspension claims came from vendor blog posts, not Google documentation, and were reported as secondary sources. Ken chose: mock top-right One Tap-style card always shown, and the httpOnly cookie only (no refresh tokens, sessions table or Google verifier interface).
+- **Human review / changes requested:** Ken's scope decision above.
+- **Verification commands and results:** none (research step).
+- **Commit:** none.
+
+## Entry 10 - Phase 1b httpOnly cookie and CSRF protection (backend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported by the sub-agent.
+- **Actual prompt (condensed from the task brief):**
+  ```text
+  Phase: 1b. Role: backend. File ownership: only backend/.
+  Deliver the JWT in an httpOnly cookie: login sets HttpOnly, SameSite=Lax, Path=/, Max-Age cookie and returns no token in the body;
+  authenticated routes read the cookie (Bearer still accepted, Authorization wins); logout clears the cookie.
+  CSRF: unsafe methods under /api require X-Requested-With: XMLHttpRequest and an allowed Origin if present, else 403.
+  Add AUTH_COOKIE_NAME and AUTH_COOKIE_SECURE settings. Update tests and backend/README.md.
+  No refresh tokens, sessions table or Google verifier abstraction.
+  ```
+- **Allowed scope:** `backend/` only.
+- **Agent result:** New `app/auth/csrf.py` middleware; cookie handling in `app/api/routes/auth.py` and `app/auth/dependencies.py`; settings `auth_cookie_name` and `auth_cookie_secure` (Secure forced in production); `LoginResponse` without a token. Deviations reported: logout uses an explicit 1970 `Expires` because Starlette's `delete_cookie` expires at now; logout for an inactive user returns 204 and writes no audit row; a garbage Bearer header alongside a valid cookie returns 401.
+- **Human review / changes requested:** Integrator reviewed the CSRF middleware and re-ran all checks; no changes requested.
+- **Verification commands and results (re-run by the integrator):** `uv run pytest -q` 237 passed; `uv run ruff check .` and `ruff format --check .` clean.
+- **Commit:** `830f926` feat(backend): deliver the JWT in an httpOnly cookie with CSRF protection.
+
+## Entry 11 - Phase 1b top-right One Tap style prompt and cookie session (frontend sub-agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`), self-reported by the sub-agent.
+- **Actual prompt (condensed from the task brief):**
+  ```text
+  Phase: 1b. Role: frontend. File ownership: only frontend/.
+  Part 1: replace the modal chooser with a Google One Tap-style card fixed top-right of /login, shown on load without a click, listing the
+  5 seeded users, with MOCK labelling, an X/Escape to collapse and a button to reopen; keyboard operable; full-width on small screens.
+  Part 2: the session is an httpOnly cookie set by the API; remove all token handling; send credentials: 'include' and the CSRF header;
+  forward the cookie during SSR; update the stub, tests and README.
+  ```
+- **Allowed scope:** `frontend/` only.
+- **Agent result:** New `GoogleOneTapCard.vue` (modal removed), cookie-based `useAuth`/`useApi`/middleware, updated stub and tests (22 passing). Deviations reported: on mobile the card sits in normal flow rather than pinned; the frontend hard-codes the cookie name `scmp_session` for the "session expired" notice; `logout()` now waits up to 3 seconds for the POST. The agent tested only against its stub.
+- **Human review / changes requested:** Integrator tested against the real backend (Entry 12). Follow-up noted: the hard-coded cookie name would not follow a changed `AUTH_COOKIE_NAME`; this only affects the expired-session notice and is documented in the README.
+- **Verification commands and results (re-run by the integrator):** `bun run lint` clean; `bun run typecheck` clean; `bun run test` 22 passed.
+- **Commit:** `755f333` feat(frontend): always-visible top-right One Tap style prompt and cookie session.
+
+## Entry 12 - Phase 1b integration and end-to-end verification (integrator agent)
+
+- **Date:** 2026-09-25
+- **Model:** Sonnet 5 (`claude-sonnet-5`).
+- **Actual prompt:** Integrate Entries 10 and 11, rebuild the Docker stack, test against the real API in the browser, update the README.
+- **Allowed scope:** `.env.example` (added `AUTH_COOKIE_SECURE`, `AUTH_COOKIE_NAME`), `README.md`, `PROMPT-INSTRUCTION.md`.
+- **Agent result:** Rebuilt and restarted the stack; README now describes the top-right prompt, the httpOnly cookie, the CSRF header rule, the cookie settings and the different-hosts caveat.
+- **Human review / changes requested:** Pending. Ken will test.
+- **Verification commands and results:**
+  - API from the host: login returned 200 with `HttpOnly; SameSite=Lax; Path=/; Max-Age=3600` and no token in the body; `/me` worked with the cookie only; a POST without the header and a POST from `http://evil.example` both returned 403; a CORS preflight allowed `X-Requested-With` with credentials for `http://localhost:9180`; logout returned 204 and expired the cookie.
+  - Browser (Claude browser pane): the card appeared on load with all 5 users and no click; signing in as Eva Cheung (Finance Approver) landed on the home page; `document.cookie` contained only the theme cookie and storage was empty; `/me` returned 200 with credentials and 401 without; server-rendered HTML contained the name and no JWT; sign-out returned to `/login`; the 375px layout showed no overflow.
+  - Not repeated in the browser this round: logins for the other four users (covered by backend tests and the earlier Phase 1 browser check as Daniel Wong).
+- **Commit:** `0ab3401` docs: document cookie session, top-right sign-in prompt and cookie settings.
+
 ## Entry template
 
 ### Entry NN - [phase and short task name]
