@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo-root .env (backend/app/config.py -> repo root is two levels above backend/).
@@ -19,6 +19,15 @@ class Settings(BaseSettings):
     api_port: int = 9181
     app_env: str = "development"
     database_url: str = "sqlite:///./data/app.db"
+    # Create tables and load fictional demo data on startup when the users table is empty.
+    db_auto_seed: bool = True
+
+    # Real JWT auth (HS256). Empty secret: random per-process secret outside production.
+    jwt_secret_key: SecretStr = SecretStr("")
+    jwt_expire_minutes: int = Field(default=60, gt=0)
+    jwt_issuer: str = "scmp-ai-assignment"
+    # Mock Google SSO (fictional seed users, no password). Disable to hide the endpoints.
+    mock_sso_enabled: bool = True
     cors_origins: list[str] | str = ["http://localhost:9180"]
 
     llm_provider: str = "gemini"
@@ -28,6 +37,10 @@ class Settings(BaseSettings):
 
     reqres_base_url: str = "https://reqres.in/api/users"
     reqres_api_key: SecretStr = SecretStr("")
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.strip().lower() == "production"
 
     @field_validator("cors_origins", mode="before")
     @classmethod

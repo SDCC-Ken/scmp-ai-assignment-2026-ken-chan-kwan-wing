@@ -6,6 +6,11 @@ ENV_VARS = [
     "API_PORT",
     "APP_ENV",
     "DATABASE_URL",
+    "DB_AUTO_SEED",
+    "JWT_SECRET_KEY",
+    "JWT_EXPIRE_MINUTES",
+    "JWT_ISSUER",
+    "MOCK_SSO_ENABLED",
     "CORS_ORIGINS",
     "LLM_PROVIDER",
     "GEMINI_API_KEY",
@@ -49,3 +54,25 @@ def test_secrets_not_in_repr(clean_env: pytest.MonkeyPatch) -> None:
     assert "fake-gemini-secret" not in text
     assert "fake-reqres-secret" not in text
     assert s.gemini_api_key.get_secret_value() == "fake-gemini-secret"
+
+
+def test_auth_and_db_defaults(clean_env: pytest.MonkeyPatch) -> None:
+    s = Settings(_env_file=None)
+    assert s.db_auto_seed is True
+    assert s.jwt_secret_key.get_secret_value() == ""
+    assert s.jwt_expire_minutes == 60
+    assert s.jwt_issuer == "scmp-ai-assignment"
+    assert s.mock_sso_enabled is True
+    assert s.is_production is False
+
+
+def test_auth_settings_from_env(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("DB_AUTO_SEED", "false")
+    clean_env.setenv("JWT_SECRET_KEY", "fake-jwt-secret")
+    clean_env.setenv("JWT_EXPIRE_MINUTES", "15")
+    clean_env.setenv("MOCK_SSO_ENABLED", "false")
+    clean_env.setenv("APP_ENV", "Production")
+    s = Settings(_env_file=None)
+    assert (s.db_auto_seed, s.jwt_expire_minutes, s.mock_sso_enabled) == (False, 15, False)
+    assert s.is_production is True
+    assert "fake-jwt-secret" not in repr(s) + str(s)
