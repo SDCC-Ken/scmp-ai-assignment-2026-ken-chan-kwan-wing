@@ -4,7 +4,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 tests/
+# Runtime uploads and SQLite data are not part of the image.  Keep the bundled
+# holiday calendar, however: startup seeding reads it from app/data.
 data/
+!app/data/
+!app/data/hk_public_holidays_1823.ics
 .env
 .env.*
 Dockerfile
