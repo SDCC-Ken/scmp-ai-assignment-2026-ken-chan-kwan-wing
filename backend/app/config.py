@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # forces Secure regardless.
     auth_cookie_name: str = Field(default="scmp_session", min_length=1)
     auth_cookie_secure: bool = False
+    # Local presentation controller secret. It protects the one fixture-reset endpoint used to
+    # replay the scripted bell-to-decision demo without exposing a general database reset.
+    presentation_reset_token: SecretStr = SecretStr("")
 
     llm_provider: str = "gemini"
     gemini_api_key: SecretStr = SecretStr("")

@@ -13,7 +13,11 @@ from app.config import Settings, get_settings
 from app.db.session import Database
 from app.integrations.base import SubmissionAdapter
 from app.llm.base import LLMProvider
-from app.seed import seed_demo_data
+from app.seed import (
+    ensure_presentation_approval_demo_data,
+    ensure_presentation_cancel_demo_data,
+    seed_demo_data,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +36,14 @@ def startup_database(database: Database, settings: Settings) -> None:
     try:
         with database.session_factory() as session:
             result = seed_demo_data(session)
+            presentation_fixture_added = ensure_presentation_cancel_demo_data(session)
+            approval_fixture_added = ensure_presentation_approval_demo_data(session)
         if result.seeded:
             logger.info("Seeded fictional demo data")
+        if presentation_fixture_added:
+            logger.info("Added fictional presentation cancellation fixture")
+        if approval_fixture_added:
+            logger.info("Added fictional presentation approval fixtures")
     except Exception:
         logger.exception("Demo data seeding failed; continuing without it")
 

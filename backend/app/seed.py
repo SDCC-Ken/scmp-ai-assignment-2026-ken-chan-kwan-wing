@@ -18,17 +18,21 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.db.models import (
+    Attachment,
+    AuditEvent,
     ClaimRequest,
     Conversation,
     ConversationMessage,
     Department,
+    ExternalSubmission,
     Feedback,
     LeaveEntitlement,
     LeaveRequest,
+    Notification,
     User,
 )
 from app.domain.clock import today_hk
@@ -52,6 +56,18 @@ from app.services.routing import ApproverProblem, resolve_approver
 
 BUNDLED_ICS = Path(__file__).parent / "data" / "hk_public_holidays_1823.ics"
 SEED_HOLIDAY_YEARS = frozenset({2026, 2027})
+
+# This is deliberately separate from the ordinary seed fixtures.  The presentation can be
+# replayed against a long-lived local database, so it needs one known, pending request that
+# no earlier live-demo run can have changed.
+PRESENTATION_CANCEL_START = date(2026, 11, 10)
+PRESENTATION_CANCEL_END = date(2026, 11, 12)
+PRESENTATION_APPROVE_START = date(2026, 12, 9)
+PRESENTATION_APPROVE_END = date(2026, 12, 11)
+PRESENTATION_REJECT_START = date(2026, 12, 16)
+PRESENTATION_REJECT_END = date(2026, 12, 17)
+PRESENTATION_EMPLOYEE_EMAIL = "presentation.employee@example.com"
+PRESENTATION_APPROVER_EMAIL = "presentation.approver@example.com"
 
 S = RequestStatus
 
@@ -730,6 +746,239 @@ def seed_demo_data(session: Session, today: date | None = None) -> SeedResult:
     )
     session.commit()
     return SeedResult(seeded=True, counts=table_counts(session))
+
+
+def ensure_presentation_cancel_demo_data(session: Session) -> bool:
+    """Add the one stable fictional leave used by the replayable cancellation demo.
+
+    ``seed_demo_data`` intentionally makes no changes once a database has users.  That is
+    normally useful, but it means a persisted presentation database needs this small,
+    idempotent fixture added separately.  It is never recreated after the presenter cancels it:
+    a later replay receives a fresh pending row with the same distinctive dates.
+    """
+    daniel = session.scalar(select(User).where(User.email == "daniel.wong@example.com"))
+    if daniel is None:
+        return False
+    existing = session.scalar(
+        select(LeaveRequest).where(
+            LeaveRequest.employee_id == daniel.id,
+            LeaveRequest.leave_type == LeaveType.ANNUAL,
+            LeaveRequest.start_date == PRESENTATION_CANCEL_START,
+            LeaveRequest.end_date == PRESENTATION_CANCEL_END,
+            LeaveRequest.status == RequestStatus.PENDING_APPROVAL,
+        )
+    )
+    if existing is not None:
+        return False
+
+    approver = _approver_of(session, daniel, RequestType.LEAVE)
+    now = datetime.now(UTC)
+    session.add(
+        LeaveRequest(
+            employee_id=daniel.id,
+            leave_type=LeaveType.ANNUAL,
+            start_date=PRESENTATION_CANCEL_START,
+            end_date=PRESENTATION_CANCEL_END,
+            start_day_part=DayPart.FULL,
+            end_day_part=DayPart.FULL,
+            calendar_days=Decimal("3"),
+            working_days=Decimal("3"),
+            status=RequestStatus.PENDING_APPROVAL,
+            required_approver_role=required_approver_role(RequestType.LEAVE),
+            approver_user_id=approver.id,
+            submitted_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    session.commit()
+    return True
+
+
+def ensure_presentation_approval_demo_data(session: Session, *, reset: bool = False) -> bool:
+    """Replace old Scene 03 fixtures with one isolated bell-to-decision journey.
+
+    The dedicated employee and reviewer have no other pending work.  Thus the bell opens exactly
+    one request in the live walkthrough, without skipping unrelated ordinary demo data.  Legacy
+    Cathy/Amy/Ben presentation records are removed by their distinctive dates only.
+    """
+    it = session.scalar(select(Department).where(Department.name == "IT"))
+    hr = session.scalar(select(Department).where(Department.name == "HR"))
+    if it is None or hr is None:
+        return False
+
+    changed = False
+    legacy_people = session.scalars(
+        select(User.id).where(User.email.in_(("amy.lau@example.com", "ben.chow@example.com")))
+    ).all()
+    legacy_ids = session.scalars(
+        select(LeaveRequest.id).where(
+            LeaveRequest.employee_id.in_(legacy_people),
+            LeaveRequest.start_date.in_((PRESENTATION_APPROVE_START, PRESENTATION_REJECT_START)),
+        )
+    ).all()
+    if legacy_ids:
+        session.execute(
+            delete(Notification).where(
+                Notification.request_type == RequestType.LEAVE,
+                Notification.request_id.in_(legacy_ids),
+            )
+        )
+        session.execute(
+            delete(AuditEvent).where(
+                AuditEvent.entity_type == RequestType.LEAVE.value,
+                AuditEvent.entity_id.in_(legacy_ids),
+            )
+        )
+        session.execute(
+            delete(ExternalSubmission).where(
+                ExternalSubmission.request_type == RequestType.LEAVE,
+                ExternalSubmission.request_id.in_(legacy_ids),
+            )
+        )
+        session.execute(delete(LeaveRequest).where(LeaveRequest.id.in_(legacy_ids)))
+        changed = True
+
+    approver = session.scalar(select(User).where(User.email == PRESENTATION_APPROVER_EMAIL))
+    if approver is None:
+        approver = User(
+            google_subject="mock-presentation-reviewer-001",
+            email=PRESENTATION_APPROVER_EMAIL,
+            display_name="Robin Ho",
+            role=UserRole.HR_APPROVER,
+            is_active=True,
+            department_id=hr.id,
+            job_title="Presentation HR Reviewer",
+        )
+        session.add(approver)
+        changed = True
+    employee = session.scalar(select(User).where(User.email == PRESENTATION_EMPLOYEE_EMAIL))
+    if employee is None:
+        employee = User(
+            google_subject="mock-presentation-employee-001",
+            email=PRESENTATION_EMPLOYEE_EMAIL,
+            display_name="Mia Chan",
+            role=UserRole.EMPLOYEE,
+            is_active=True,
+            department_id=it.id,
+            job_title="Presentation Employee",
+        )
+        session.add(employee)
+        changed = True
+    session.flush()
+    if employee.leave_approver_user_id != approver.id:
+        employee.leave_approver_user_id = approver.id
+        changed = True
+
+    for year in (PRESENTATION_APPROVE_START.year, PRESENTATION_APPROVE_START.year + 1):
+        entitlement = session.scalar(
+            select(LeaveEntitlement).where(
+                LeaveEntitlement.user_id == employee.id,
+                LeaveEntitlement.year == year,
+                LeaveEntitlement.leave_type == LeaveType.ANNUAL,
+            )
+        )
+        if entitlement is None:
+            session.add(
+                LeaveEntitlement(
+                    user_id=employee.id,
+                    year=year,
+                    leave_type=LeaveType.ANNUAL,
+                    entitled_days=Decimal("15"),
+                )
+            )
+            changed = True
+
+    fixture_ids = session.scalars(
+        select(LeaveRequest.id).where(
+            LeaveRequest.employee_id == employee.id,
+            LeaveRequest.start_date == PRESENTATION_APPROVE_START,
+            LeaveRequest.end_date == PRESENTATION_APPROVE_END,
+        )
+    ).all()
+    if reset and fixture_ids:
+        session.execute(
+            delete(Notification).where(
+                Notification.request_type == RequestType.LEAVE,
+                Notification.request_id.in_(fixture_ids),
+            )
+        )
+        session.execute(
+            delete(AuditEvent).where(
+                AuditEvent.entity_type == RequestType.LEAVE.value,
+                AuditEvent.entity_id.in_(fixture_ids),
+            )
+        )
+        session.execute(
+            delete(ExternalSubmission).where(
+                ExternalSubmission.request_type == RequestType.LEAVE,
+                ExternalSubmission.request_id.in_(fixture_ids),
+            )
+        )
+        session.execute(delete(LeaveRequest).where(LeaveRequest.id.in_(fixture_ids)))
+        fixture_ids = []
+        changed = True
+
+    # Bell clicks deliberately create conversations.  A replay must therefore clear only the
+    # conversations owned by the two dedicated presentation identities, otherwise a later
+    # replay shows old inbox chats alongside the one controlled fixture.  No ordinary demo
+    # users or their history are touched.
+    if reset:
+        presentation_conversation_ids = session.scalars(
+            select(Conversation.id).where(Conversation.user_id.in_((approver.id, employee.id)))
+        ).all()
+        if presentation_conversation_ids:
+            session.execute(
+                delete(Attachment).where(
+                    Attachment.conversation_id.in_(presentation_conversation_ids)
+                )
+            )
+            session.execute(
+                delete(Feedback).where(Feedback.conversation_id.in_(presentation_conversation_ids))
+            )
+            session.execute(
+                delete(ConversationMessage).where(
+                    ConversationMessage.conversation_id.in_(presentation_conversation_ids)
+                )
+            )
+            session.execute(
+                delete(Conversation).where(Conversation.id.in_(presentation_conversation_ids))
+            )
+            changed = True
+
+    existing = session.scalar(
+        select(LeaveRequest).where(
+            LeaveRequest.employee_id == employee.id,
+            LeaveRequest.leave_type == LeaveType.ANNUAL,
+            LeaveRequest.start_date == PRESENTATION_APPROVE_START,
+            LeaveRequest.end_date == PRESENTATION_APPROVE_END,
+            LeaveRequest.status == RequestStatus.PENDING_APPROVAL,
+        )
+    )
+    if not fixture_ids and existing is None:
+        now = datetime.now(UTC)
+        session.add(
+            LeaveRequest(
+                employee_id=employee.id,
+                leave_type=LeaveType.ANNUAL,
+                start_date=PRESENTATION_APPROVE_START,
+                end_date=PRESENTATION_APPROVE_END,
+                start_day_part=DayPart.FULL,
+                end_day_part=DayPart.FULL,
+                calendar_days=Decimal("3"),
+                working_days=Decimal("3"),
+                status=RequestStatus.PENDING_APPROVAL,
+                required_approver_role=required_approver_role(RequestType.LEAVE),
+                approver_user_id=approver.id,
+                submitted_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        changed = True
+    if changed:
+        session.commit()
+    return changed
 
 
 def table_counts(session: Session) -> dict[str, int]:

@@ -18,6 +18,7 @@ services:
       # to the non-root user in backend/Dockerfile, so the volume inherits write access.
       DATABASE_URL: sqlite:////app/data/app.db
       UPLOAD_DIR: /app/data/uploads
+      PRESENTATION_RESET_TOKEN: ${PRESENTATION_PASSWORD:-}
       # Reach the Ollama running on the host machine from inside the container.
       OLLAMA_BASE_URL: http://host.docker.internal:11434
     extra_hosts:
@@ -51,6 +52,8 @@ services:
       # Server-side rendering reaches the API over the compose network, not the
       # browser-facing NUXT_PUBLIC_API_BASE (localhost would be the web container itself).
       NUXT_API_BASE_SERVER: http://api:9181
+      NUXT_PRESENTATION_PASSWORD: ${PRESENTATION_PASSWORD:-}
+      NUXT_PUBLIC_PRESENTATION_ORIGIN: ${PRESENTATION_PUBLIC_ORIGIN:-}
     ports:
       - "${WEB_PORT:-9180}:9180"
     depends_on:

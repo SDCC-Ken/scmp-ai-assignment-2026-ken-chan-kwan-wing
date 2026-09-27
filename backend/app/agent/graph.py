@@ -1325,6 +1325,38 @@ def prepare_cancel(state: TurnState) -> dict[str, Any]:
     started = time.perf_counter()
     deps, turn, conv = state["deps"], state["turn"], state["conv"]
     ref = turn.target
+    # A model can infer an id from the compact open-request context even though the person did
+    # not type one.  Leave and claim ids live in different tables and may coincide, so trust an
+    # id only when it was explicitly written.  The original wording is then a stable hint (for
+    # example, a specific leave date range) and an explicit "leave" / "claim" scopes lookup.
+    message = state["message"]
+    explicit_id = re.search(
+        r"(?:#|\b(?:cancel|leave|claim|request)\s+)(\d+)\b", message, re.IGNORECASE
+    )
+    low_message = message.lower()
+    mentions_leave = bool(re.search(r"\b(?:leave|annual|sick|vacation)\b", low_message))
+    mentions_claim = bool(re.search(r"\b(?:claim|expense|receipt)\b", low_message))
+    inferred_type = (
+        RequestType.LEAVE
+        if mentions_leave and not mentions_claim
+        else RequestType.CLAIM
+        if mentions_claim and not mentions_leave
+        else None
+    )
+    # Preserve an existing conversational reference such as "cancel it again".  Only discard a
+    # model-guessed id when the person has supplied a concrete date description instead.
+    has_date_hint = bool(
+        re.search(
+            r"\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}\s+"
+            r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b",
+            message,
+            re.IGNORECASE,
+        )
+    )
+    if ref is None or (has_date_hint and not explicit_id):
+        ref = RequestRef(request_type=inferred_type, hint=message)
+    elif ref.request_type is None and inferred_type is not None:
+        ref = ref.model_copy(update={"request_type": inferred_type, "hint": ref.hint or message})
     if conv.editing_request_id is not None and (
         ref is None or (ref.request_id is None and not ref.hint)
     ):

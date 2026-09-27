@@ -1,4 +1,8 @@
 export default defineNuxtRouteMiddleware(async (to) => {
+  // The presentation is a local, read-only showcase page. It deliberately sits
+  // outside the demo application's authenticated employee workflows.
+  if (to.path === '/presentation' || to.path === '/presenter' || to.path === '/presentation-login') return
+
   const { user, notice, checked, fetchMe } = useAuth()
 
   // First render (SSR) validates the httpOnly session cookie via /me; the result travels to the browser

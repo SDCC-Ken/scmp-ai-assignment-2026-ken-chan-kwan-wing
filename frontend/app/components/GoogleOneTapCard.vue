@@ -143,6 +143,7 @@ defineExpose({ focus: () => root.value?.focus() })
               <button
                 type="button"
                 data-account-row
+                :data-account-email="u.email"
                 class="focus-ring flex w-full items-center gap-2.5 rounded-lg border border-secondary/30 p-2 text-left hover:bg-secondary/10 aria-disabled:cursor-not-allowed aria-disabled:opacity-60 aria-disabled:hover:bg-transparent"
                 :aria-disabled="signingInEmail !== null && signingInEmail !== u.email"
                 :aria-busy="signingInEmail === u.email"

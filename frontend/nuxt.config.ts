@@ -14,7 +14,10 @@ export default defineNuxtConfig({
     // Private (server-only): API base used during SSR. In Docker, `localhost` is the web container
     // itself, so compose sets NUXT_API_BASE_SERVER=http://api:9181. Empty falls back to public.apiBase.
     apiBaseServer: '',
+    presentationPassword: '',
     public: {
+      presentationOrigin: '',
+      demoAppOrigin: '',
       // Browser-facing API base (NUXT_PUBLIC_API_BASE).
       apiBase: 'http://localhost:9181',
       theme: {

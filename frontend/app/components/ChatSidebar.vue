@@ -27,6 +27,7 @@ onBeforeUnmount(() => clearInterval(timer))
     <div class="p-3">
       <button
         type="button"
+        data-testid="new-chat-button"
         class="focus-ring inline-flex min-h-10 w-full items-center justify-center gap-2 rounded-lg bg-secondary px-3 py-2 text-sm font-semibold text-background hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
         :disabled="busy || loading"
         @click="$emit('create')"

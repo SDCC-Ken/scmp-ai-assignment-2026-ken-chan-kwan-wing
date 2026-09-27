@@ -8,6 +8,7 @@ const composer = ref<{ focus: () => void } | null>(null)
 const drawerOpen = ref(false)
 const toggleButton = ref<HTMLButtonElement | null>(null)
 const drawer = ref<HTMLElement | null>(null)
+const presentationConversationId = ref<number | null>(null)
 
 function closeDrawer(restoreFocus = false) {
   if (!drawerOpen.value) return
@@ -69,6 +70,14 @@ async function onCreate() {
   composer.value?.focus()
 }
 
+/** Used only by the presentation runner: it must never reuse an empty draft. */
+async function onPresentationCreate() {
+  closeDrawer()
+  await chat.createFreshConversation()
+  await nextTick()
+  composer.value?.focus()
+}
+
 function onEscape(event: KeyboardEvent) {
   if (event.key === 'Escape' && drawerOpen.value) {
     event.preventDefault()
@@ -103,6 +112,13 @@ onMounted(async () => {
   media.addEventListener('change', onWide)
   window.addEventListener('keydown', onEscape)
   await chat.init()
+  const requestedConversation = Number(new URLSearchParams(window.location.search).get('presentationConversation'))
+  if (Number.isInteger(requestedConversation) && requestedConversation > 0) {
+    await chat.select(requestedConversation)
+    if (chat.activeId.value === requestedConversation && !chat.loadingThread.value) {
+      presentationConversationId.value = requestedConversation
+    }
+  }
   await nextTick()
   // Do not pop the on-screen keyboard on phones; on desktop the composer is ready to type in.
   if (media.matches) composer.value?.focus()
@@ -119,7 +135,14 @@ const composerUnavailable = computed(() => chat.initialising.value || chat.loadi
 </script>
 
 <template>
-  <div class="relative mx-auto flex h-full min-h-0 w-full max-w-5xl overflow-hidden md:border-x md:border-secondary/30">
+  <div
+    class="relative mx-auto flex h-full min-h-0 w-full max-w-5xl overflow-hidden md:border-x md:border-secondary/30"
+    :data-presentation-conversation-id="presentationConversationId ?? undefined"
+    :data-active-conversation-id="chat.activeId.value ?? undefined"
+  >
+    <button type="button" data-testid="presentation-new-chat-button" class="sr-only" tabindex="-1" @click="onPresentationCreate">
+      Create fresh presentation conversation
+    </button>
     <!-- Conversation list: static column from 768px, slide-over drawer below. -->
     <div
       v-if="drawerOpen"

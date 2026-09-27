@@ -164,6 +164,23 @@ export function useChat() {
     }
   }
 
+  /** Creates and opens a genuinely new conversation, including when the current one is empty. */
+  async function createFreshConversation(): Promise<boolean> {
+    if (busy.value) return false
+    clearFeedback()
+    try {
+      const summary = await createConversation()
+      await openConversation(summary.id)
+      return activeId.value === summary.id && !loadingThread.value
+    }
+    catch (cause) {
+      // The retry action only needs to perform the fresh-chat operation; callers still receive
+      // the boolean result from the original invocation.
+      fail(cause, 'load', async () => { await createFreshConversation() })
+      return false
+    }
+  }
+
   async function select(id: number) {
     if (id === activeId.value || busy.value) return
     await openConversation(id)
@@ -438,6 +455,7 @@ export function useChat() {
     notice,
     init,
     newChat,
+    createFreshConversation,
     select,
     send,
     addFiles,
