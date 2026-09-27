@@ -207,7 +207,7 @@ test uses a temporary file database).
 ## Public holidays
 
 Leave working days skip Saturdays, Sundays and rows in `public_holidays`. The seed loads 2026 and
-2027 from the bundled `app/data/hk_public_holidays_1823.ics` (snapshot of the official 1823.gov.hk
+2027 from the bundled `app/resources/hk_public_holidays_1823.ics` (snapshot of the official 1823.gov.hk
 iCal, fetched 2026-09-25), with source `seed_2026`.
 
 1823 publishes about three years ahead. Each year, once the next calendar appears:

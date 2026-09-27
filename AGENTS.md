@@ -82,6 +82,8 @@ The project is developed on macOS Apple Silicon. Use the following tools and com
 - Use a provider interface so Gemini, Ollama or the fake can be swapped without changing business workflows; configure them with `LLM_PROVIDER` and `LLM_FALLBACK_PROVIDER`.
 - Use an integration adapter for ReqRes; do not call the endpoint directly from workflow logic.
 - Keep database models, API schemas, workflow state, and UI payloads separate.
+- Keep immutable package assets (for example, the bundled public-holiday calendar) under
+  `backend/app/resources/`; reserve `/app/data` for the Docker volume's runtime database and uploads.
 - Add tests with each behaviour, not only at the end.
 - Make small, meaningful commits. Each commit must pass the relevant tests.
 - Update `README.md`, `docs/business-rules.md`, `docs/test-cases.md` and `PROMPT-INSTRUCTION.md` when behaviour, rules or runnable instructions change.

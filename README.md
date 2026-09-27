@@ -85,6 +85,8 @@ docker compose up --build
 | --- | --- | --- |
 | Frontend (Nuxt 4) | <http://localhost:9180> | Redirects to the mock Google sign-in (top-right prompt), then a role-aware home page |
 | Backend (FastAPI) | <http://localhost:9181/health> | Returns `{"status":"ok"}`; interactive docs at `/docs` |
+| Presentation | <http://localhost:9180/presentation-login?returnTo=/presentation> | Requires `PRESENTATION_PASSWORD`; full-screen audience view |
+| Presenter controller | <http://localhost:9180/presentation-login?returnTo=/presenter> | Requires the same password; use this on the presenter device to navigate or restart scenes |
 
 Useful commands:
 
@@ -104,6 +106,10 @@ The `web` service waits for the `api` healthcheck. SQLite is stored in the named
 | Variable | Purpose |
 | --- | --- |
 | `WEB_PORT` / `API_PORT` | Host ports for the frontend / backend (default `9180` / `9181`) |
+| `PRESENTATION_PASSWORD` | Required password for `/presentation` and `/presenter`; pages fail closed if it is empty |
+| `PRESENTATION_PUBLIC_ORIGIN` | Optional LAN origin shown in the on-screen presentation QR code (for example, `http://192.168.x.x:9180`) |
+| `LLM_PROVIDER`, `LLM_FALLBACK_PROVIDER` | Choose `ollama`, `gemini`, or deterministic `fake`; use `ollama` for the live receipt demo because `fake` cannot read ordinary image/PDF attachments |
+| `OLLAMA_MODEL`, `OLLAMA_VISION_MODEL` | Text and document models used by Ollama (the supplied local-demo default is `gemma4:latest`) |
 | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_THINKING_LEVEL` | Gemini provider (used from Phase 1; `LLM_PROVIDER=fake` for offline runs) |
 | `REQRES_API_KEY`, `REQRES_BASE_URL` | Hosted ReqRes mock API; requires an `x-api-key` header |
 | `DATABASE_URL` | SQLite location (default `sqlite:///./data/app.db`; in Docker `sqlite:////app/data/app.db` on the `api-data` volume) |
@@ -142,6 +148,8 @@ Open <http://localhost:9180>. A Google One Tap-style prompt is always shown in t
 
 Every requester has exactly one approver per request type, stored per user (see [docs/limits-and-routing.md](docs/limits-and-routing.md)). Emails are `firstname.lastname@example.com`.
 
+The core organisation seed contains the six accounts above. A normal Compose startup also creates two isolated **presentation-only** identities: Mia Chan (`presentation.employee@example.com`) and Robin Ho (`presentation.approver@example.com`). They support the replayable Scene 03 bell-to-decision walkthrough and deliberately have no shared pending work with the six core accounts.
+
 Auth API (mounted under `/api/auth`): `GET /mock-users`, `POST /mock-google/login`, `GET /me`, `POST /logout`. The backend re-reads the user and role from the database on every request, so the role inside the token is never trusted on its own. Details and error codes are in [backend/README.md](backend/README.md).
 
 ## Database and seed data
@@ -150,7 +158,8 @@ SQLite (WAL mode, foreign keys enforced) through SQLAlchemy, stored in the `api-
 
 | Seed data | Rows | Notes |
 | --- | ---: | --- |
-| Users | 6 | 3 employees, 2 HR approvers, 1 Finance approver (`@example.com`), 3 departments |
+| Core users | 6 | 3 employees, 2 HR approvers, 1 Finance approver (`@example.com`), 3 departments |
+| Presentation users | 2 | Mia Chan and Robin Ho; isolated Scene 03 fixture identities created at normal API startup |
 | Leave requests | 10 | 2 pending, recent approved and rejected, the rest past history; half-day examples; one overlaps a colleague, one exceeds the annual balance |
 | Claim requests | 10 | Same mix, HKD amounts; one pending claim takes HR over its department limit |
 | Audit events | 15 | Creation, confirmation, API submission, a 429 failure then retry, approval, rejection |
@@ -184,7 +193,7 @@ The working week is Monday to Friday, excluding Hong Kong public holidays. Those
 
 ### Hong Kong public holidays: yearly update
 
-The 2026 and 2027 holidays are bundled from the official 1823 calendar (checked against the gov.hk holiday pages on 2026-09-25). 1823 publishes roughly three years ahead, so each year, once the new year appears, import it:
+The 2026 and 2027 holidays are bundled in `backend/app/resources/` from the official 1823 calendar (checked against the gov.hk holiday pages on 2026-09-25). Application resources are separate from the runtime `/app/data` database/upload volume, so a fresh Docker stack can seed them reliably. 1823 publishes roughly three years ahead, so each year, once the new year appears, import it:
 
 ```bash
 docker compose exec api python -m app.cli import-holidays --year 2028

@@ -228,7 +228,7 @@ backend/
     domain/            pure rules: enums, status transitions, roles, leave day maths
     db/                SQLAlchemy models, engine and SQLite pragmas, additive migrate.py
     schemas/           Pydantic API models
-    data/              bundled 1823 Hong Kong holiday calendar
+    resources/         bundled 1823 Hong Kong holiday calendar (immutable application asset)
   tests/               pytest, offline (fake LLM, in-memory or temp SQLite)
   samples/, scripts/   fictional sample documents, opt-in live smoke scripts
 frontend/

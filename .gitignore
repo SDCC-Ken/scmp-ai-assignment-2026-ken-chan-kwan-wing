@@ -35,8 +35,10 @@ test-results/
 blob-report/
 playwright/.cache/
 
-# Local data (SQLite databases, uploads)
-data/
+# Local data (SQLite databases, uploads). Keep packaged application resources
+# such as backend/app/resources/ under version control.
+/data/
+/backend/data/
 *.db
 *.sqlite
 *.sqlite3

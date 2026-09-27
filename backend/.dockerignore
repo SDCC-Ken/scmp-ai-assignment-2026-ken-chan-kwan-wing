@@ -4,10 +4,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 tests/
-# Runtime uploads and SQLite data at the build-context root are not part of
-# the image. Do not ignore app/data: it contains the bundled holiday calendar
-# required by startup seeding.
-/data/
+# Runtime uploads and SQLite data are not part of the image. Application
+# resources, including the bundled holiday calendar, live under app/resources.
+data/
 .env
 .env.*
 Dockerfile

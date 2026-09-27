@@ -10,6 +10,7 @@ All data is fictional.
 | --- | --- | --- |
 | `port is already allocated` or the page does not load on 9180 or 9181 | another program uses the port | `lsof -nP -iTCP:9180 -iTCP:9181 -sTCP:LISTEN`, stop it, or set `WEB_PORT` / `API_PORT` in `.env` (see below) |
 | API answers `503` with "created before Phase 3" | the database file is from an older schema | `./scripts/reset-demo.sh` or `docker compose down -v` |
+| Mock sign-in says no accounts are available or `GET /api/auth/mock-users` returns `[]` | demo seed did not finish (usually an old API image) | rebuild the API, recreate the volume, then confirm the bundled calendar exists; see below |
 | Demo data is messy or you want a clean start | you played with it | `./scripts/reset-demo.sh` |
 | Reply is "I couldn't reach the AI service just now" | the primary LLM failed and no fallback answered | check Ollama or Gemini below, then `docker compose logs -f api` |
 | First reply after a pause takes about 30 s | Ollama is loading the model into memory | wait; later replies are fast (the model stays loaded for 30 minutes) |
@@ -42,6 +43,32 @@ cd backend && uv run python -m app.cli reset-demo --yes
 
 `python -m app.cli seed --reset --yes` also works (it now clears the uploads too). `docker compose down -v`
 deletes the whole volume (database and uploads); the next `up` recreates and reseeds it.
+
+### Mock sign-in has no accounts
+
+First confirm the API log identifies the problem:
+
+```bash
+docker compose logs api --tail=120
+curl http://localhost:9181/api/auth/mock-users
+```
+
+On a fresh current checkout, the API image contains
+`/app/app/resources/hk_public_holidays_1823.ics`; startup reads it before creating fictional users.
+If the file is missing, update the checkout and rebuild the API without cache, then recreate the
+local demo volume:
+
+```bash
+git pull origin main
+docker compose down -v
+docker compose build --no-cache api
+docker compose up -d
+docker compose exec -T api ls -l /app/app/resources/hk_public_holidays_1823.ics
+curl http://localhost:9181/api/auth/mock-users
+```
+
+The final command should return the fictional user list. This affects only the local Docker
+database and uploads; it does not change GitHub or another machine's demo data.
 
 ## Ports 9180 and 9181
 

@@ -54,7 +54,9 @@ from app.services.audit import create_notification, record_audit, record_externa
 from app.services.holidays import latest_stamp, parse_ics, upsert_holidays
 from app.services.routing import ApproverProblem, resolve_approver
 
-BUNDLED_ICS = Path(__file__).parent / "data" / "hk_public_holidays_1823.ics"
+# Package the fictional holiday calendar as application data, separate from the
+# runtime SQLite/upload directory mounted at /app/data in Docker.
+BUNDLED_ICS = Path(__file__).parent / "resources" / "hk_public_holidays_1823.ics"
 SEED_HOLIDAY_YEARS = frozenset({2026, 2027})
 
 # This is deliberately separate from the ordinary seed fixtures.  The presentation can be

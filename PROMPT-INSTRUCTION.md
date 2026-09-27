@@ -619,3 +619,13 @@ The PoC uses Nuxt 3, FastAPI, LangGraph, Pydantic, SQLite/SQLAlchemy, Google Gem
 - **Human review / changes requested:**
 - **Verification commands and results:**
 - **Commit:**
+
+## Entry 36 - Docker seed packaging and Air setup verification (integrator)
+
+- **Date:** 2026-09-27
+- **Actual prompt:** Ken: check the MacBook Air Docker setup after mock sign-in showed no accounts; verify the README, AGENTS guide and troubleshooting documentation for anything missing.
+- **Allowed scope:** Docker packaging, bundled fictional calendar asset, README, AGENTS guide, architecture/troubleshooting documentation, and this log.
+- **Agent result:** diagnosed startup seeding failure as a missing bundled 1823 holiday calendar in the API image. The source asset had been under an ignored `app/data` directory, so it was neither committed nor sent to Docker. Moved it to tracked `app/resources`, updated the seed path, retained `/app/data` solely for the runtime SQLite/upload volume, and added explicit current-image recovery instructions. README now documents the password-protected audience presentation and presenter-controller URLs, local-Ollama requirements, and the isolated presentation identities used by the replayable Scene 03 walkthrough.
+- **Human review / changes requested:** Pending MacBook Air pull and fresh-stack verification.
+- **Verification commands and results:** rebuilt Compose API and web; confirmed `/app/app/resources/hk_public_holidays_1823.ics` exists inside the container; reset the local fictional database; `GET /api/auth/mock-users` returned the seeded fictional users.
+- **Commit:** pending.
