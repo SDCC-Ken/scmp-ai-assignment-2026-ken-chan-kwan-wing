@@ -244,8 +244,8 @@ onBeforeUnmount(() => {
       </div>
 
       <Transition name="scene" mode="out-in">
-        <div :key="currentScene.id" class="opening-scene" :class="{ 'opening-scene--employee': currentScene.id.startsWith('02'), 'opening-scene--live': isFullLiveDemo }">
-          <template v-if="currentScene.id !== '02D' && !isFullLiveDemo">
+        <div :key="currentScene.id" class="opening-scene" :class="{ 'opening-scene--employee': currentScene.id.startsWith('02'), 'opening-scene--evidence': ['02A', '02C', '03A', '03B', '03C', '03D'].includes(currentScene.id), 'opening-scene--live': isFullLiveDemo }">
+          <template v-if="currentScene.id !== '02D' && !isFullLiveDemo && !['02A', '02C', '03A', '03B', '03C', '03D'].includes(currentScene.id)">
             <p class="presentation-kicker">{{ currentScene.eyebrow }}</p>
             <h1>{{ currentScene.title }}<br><span>{{ currentScene.accent }}</span></h1>
             <p class="opening-summary">{{ currentScene.summary }}</p>
@@ -660,5 +660,5 @@ onBeforeUnmount(() => {
   .role-routes { grid-template-columns: 6rem 1.5rem 1fr; }
   .presentation-qr { right: .75rem; bottom: .75rem; }
 }
-.opening-scene--employee{width:min(88%,74rem);gap:clamp(.65rem,1.15vw,1rem)}.opening-scene--employee h1{font-size:clamp(1.8rem,3.25vw,3.65rem)}.opening-scene--employee .opening-summary{font-size:clamp(.78rem,.95vw,1rem);line-height:1.4}.opening-scene--employee:has(.live-demo),.opening-scene--live{width:94%;height:100%;align-content:stretch}.opening-scene--live :deep(.approval-live){width:100%;height:100%;max-height:none}
+.opening-scene--employee{width:min(88%,74rem);gap:clamp(.65rem,1.15vw,1rem)}.opening-scene--employee h1{font-size:clamp(1.8rem,3.25vw,3.65rem)}.opening-scene--employee .opening-summary{font-size:clamp(.78rem,.95vw,1rem);line-height:1.4}.opening-scene--evidence{width:min(88%,74rem);height:calc(100% - 2.75rem);align-content:center}.opening-scene--evidence :deep(.employee-demo),.opening-scene--evidence :deep(.approver-demo){max-height:100%}.opening-scene--employee:has(.live-demo),.opening-scene--live{width:94%;height:100%;align-content:stretch}.opening-scene--live :deep(.approval-live){width:100%;height:100%;max-height:none}
 </style>
