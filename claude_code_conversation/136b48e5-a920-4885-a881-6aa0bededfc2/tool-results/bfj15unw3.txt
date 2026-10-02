@@ -1,0 +1,977 @@
+<script setup lang="ts">
+import type { Message } from '~/types/chat'
+
+defineProps<{
+  message: Message
+  /** Decision in flight for a card of this message (only ever set for that card). */
+  pending: { cardId: string, decision: 'confirm' | 'discard' } | null
+  /** A turn or card action is running: card buttons are disabled. */
+  locked: boolean
+}>()
+defineEmits<{ action: [cardId: string, decision: 'confirm' | 'discard'] }>()
+</script>
+
+<template>
+  <li v-if="message.sender_type === 'system'" class="flex justify-center">
+    <p class="chat-text rounded-full border border-secondary/30 px-3 py-1 text-center text-xs">
+      {{ message.content }}
+    </p>
+  </li>
+
+  <li v-else-if="message.sender_type === 'user'" class="flex flex-col items-end">
+    <ul v-if="message.attachments?.length" class="mb-1 flex max-w-[85%] flex-wrap justify-end gap-2" aria-label="Attached files">
+      <li v-for="attachment in message.attachments" :key="attachment.id" class="max-w-full">
+        <AttachmentItem :attachment="attachment" />
+      </li>
+    </ul>
+    <p
+      v-if="message.content.trim()"
+      class="chat-text max-w-[85%] rounded-2xl rounded-br-md bg-secondary px-3.5 py-2 text-sm text-background"
+      :class="isOptimistic(message) ? 'opacity-80' : ''"
+    >
+      {{ message.content }}
+    </p>
+    <p class="mt-0.5 px-1 text-xs opacity-80">
+      <span v-if="isOptimistic(message)">Sending...</span>
+      <time v-else :datetime="message.created_at">{{ formatClock(message.created_at) }}</time>
+    </p>
+  </li>
+
+  <li v-else class="flex flex-col items-start">
+    <p
+      v-if="message.content.trim()"
+      class="chat-text max-w-[85%] rounded-2xl rounded-bl-md border border-secondary/30 bg-secondary/5 px-3.5 py-2 text-sm"
+    >
+      <span class="sr-only">Assistant: </span>{{ message.content }}
+    </p>
+    <div v-if="message.ui" class="mt-2 w-full max-w-[min(100%,34rem)]">
+      <ConfirmationCard
+        v-if="message.ui.type === 'confirmation_card'"
+        :card="message.ui"
+        :pending="pending && pending.cardId === message.ui.card_id ? pending.decision : null"
+        :locked="locked"
+        @action="(id, decision) => $emit('action', id, decision)"
+      />
+      <StatusCard v-else-if="message.ui.type === 'status_card'" :card="message.ui" />
+      <ResultCard v-else-if="message.ui.type === 'result_card'" :card="message.ui" />
+    </div>
+    <TraceDisclosure v-if="message.trace && message.trace.length" :steps="message.trace" />
+    <p class="mt-0.5 px-1 text-xs opacity-80">
+      <time :datetime="message.created_at">{{ formatClock(message.created_at) }}</time>
+    </p>
+  </li>
+</template>
+<script setup lang="ts">
+import type { Message } from '~/types/chat'
+
+const props = defineProps<{
+  conversationId: number | null
+  messages: Message[]
+  loading: boolean
+  sending: boolean
+  acting: { cardId: string, decision: 'confirm' | 'discard' } | null
+  busy: boolean
+}>()
+const emit = defineEmits<{
+  action: [cardId: string, decision: 'confirm' | 'discard']
+  suggest: [text: string]
+}>()
+
+const scroller = ref<HTMLElement | null>(null)
+/** True while the view follows new messages; turns false as soon as the user scrolls up. */
+const following = ref(true)
+const announcement = ref('')
+
+// Instant (not smooth) on purpose: a smooth scroll fires scroll events that would look like the user scrolling up.
+function scrollToBottom() {
+  const el = scroller.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function onScroll() {
+  const el = scroller.value
+  if (el) following.value = isNearBottom(el)
+}
+
+function jumpToLatest() {
+  following.value = true
+  scrollToBottom()
+}
+
+// A different conversation: start at the bottom and stay silent (only NEW assistant messages are announced).
+watch(() => props.conversationId, () => {
+  following.value = true
+  announcement.value = ''
+})
+
+// Messages that are on screen when a conversation finishes loading are not "new".
+let announcedUpTo = 0
+watch(() => props.loading, (loading) => {
+  if (!loading) announcedUpTo = props.messages.reduce((max, m) => Math.max(max, m.id), 0)
+}, { immediate: true })
+
+watch(() => props.messages, async (list, previous) => {
+  if (props.loading) return
+  const fresh = list.filter(m => m.sender_type === 'assistant' && m.id > announcedUpTo)
+  if (fresh.length && previous.length) {
+    announcement.value = fresh.map(announcementFor).join(' ')
+  }
+  announcedUpTo = Math.max(announcedUpTo, ...list.map(m => m.id))
+  // Own message: always show it. Otherwise only follow when the user has not scrolled up.
+  if (lastMessageIsUser(list)) following.value = true
+  await nextTick()
+  if (following.value) scrollToBottom()
+})
+
+watch(() => [props.loading, props.sending, props.acting], async () => {
+  await nextTick()
+  if (following.value) scrollToBottom()
+})
+
+const isEmpty = computed(() => !props.loading && props.messages.length === 0)
+</script>
+
+<template>
+  <div class="relative min-h-0 flex-1">
+    <div
+      ref="scroller"
+      class="h-full overflow-y-auto overscroll-contain px-3 py-4 sm:px-5"
+      tabindex="0"
+      role="region"
+      aria-label="Conversation messages"
+      @scroll.passive="onScroll"
+    >
+      <div v-if="loading" class="flex h-full items-center justify-center gap-2 text-sm" role="status">
+        <IconGlyph name="spinner" class="h-4 w-4" />
+        Loading conversation...
+      </div>
+
+      <div v-else-if="isEmpty" class="mx-auto flex h-full max-w-xl flex-col items-center justify-center gap-4 py-6 text-center">
+        <span class="flex h-12 w-12 items-center justify-center rounded-full border border-secondary/40" aria-hidden="true">
+          <IconGlyph name="chat" class="h-6 w-6" />
+        </span>
+        <div>
+          <h2 class="text-lg font-semibold">
+            How can I help today?
+          </h2>
+          <p class="mt-1 text-sm opacity-90">
+            Tell me in your own words about a leave application or a staff claim. I will ask for anything missing
+            and show a card to confirm before anything is submitted.
+          </p>
+        </div>
+        <SuggestionChips :disabled="busy" @pick="text => emit('suggest', text)" />
+      </div>
+
+      <ol v-else class="mx-auto flex max-w-3xl flex-col gap-4" aria-label="Messages">
+        <ChatMessage
+          v-for="message in messages"
+          :key="message.id"
+          :message="message"
+          :pending="acting"
+          :locked="busy"
+          @action="(id, decision) => emit('action', id, decision)"
+        />
+        <li v-if="sending" class="flex items-start" role="status">
+          <span class="inline-flex items-center gap-2 rounded-2xl rounded-bl-md border border-secondary/30 bg-secondary/5 px-3.5 py-2 text-sm">
+            <span class="flex items-center gap-1" aria-hidden="true"><span class="chat-dot" /><span class="chat-dot" /><span class="chat-dot" /></span>
+            Thinking...
+          </span>
+        </li>
+      </ol>
+    </div>
+
+    <button
+      v-if="!following && messages.length"
+      type="button"
+      class="focus-ring absolute bottom-3 left-1/2 inline-flex -translate-x-1/2 items-center gap-1 rounded-full bg-secondary px-3 py-1.5 text-xs font-semibold text-background shadow-md hover:opacity-90"
+      @click="jumpToLatest"
+    >
+      <IconGlyph name="down" class="h-3.5 w-3.5" />
+      Jump to latest
+    </button>
+
+    <div class="sr-only" aria-live="polite" aria-atomic="true">
+      {{ announcement }}
+    </div>
+  </div>
+</template>
+<script setup lang="ts">
+import type { ResultCardData } from '~/types/chat'
+
+const props = defineProps<{ card: ResultCardData }>()
+const meta = computed(() => outcomeMeta(props.card.outcome))
+</script>
+
+<template>
+  <section class="rounded-xl border p-3" :class="toneClass(meta.tone)" :aria-label="`${meta.label} result`">
+    <div class="flex items-start gap-2.5">
+      <IconGlyph :name="meta.icon" class="mt-0.5 h-5 w-5 shrink-0" />
+      <div class="min-w-0 flex-1">
+        <p class="text-sm font-semibold">
+          {{ meta.label }}
+          <span class="font-normal">- {{ card.request_type === 'leave' ? 'Leave application' : 'Staff claim' }} #{{ card.request_id }}</span>
+        </p>
+        <p class="chat-text mt-1 text-sm">
+          {{ card.message }}
+        </p>
+        <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+          <StatusBadge :status="card.status" :label="card.status_label" />
+          <span v-if="card.external_reference_id">ReqRes reference: <span class="font-semibold">{{ card.external_reference_id }}</span></span>
+        </div>
+      </div>
+    </div>
+  </section>
+</template>
+<script setup lang="ts">
+import type { StatusCardData } from '~/types/chat'
+
+defineProps<{ card: StatusCardData }>()
+</script>
+
+<template>
+  <section class="rounded-xl border border-secondary/30 p-3" aria-label="Your requests">
+    <p v-if="card.empty || !card.requests.length" class="text-sm">
+      No matching requests.
+    </p>
+    <ul v-else class="space-y-2.5">
+      <li v-for="req in card.requests" :key="`${req.request_type}-${req.id}`" class="rounded-lg border border-secondary/25 p-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+          <p class="text-sm font-semibold">
+            {{ req.request_type === 'leave' ? 'Leave application' : 'Staff claim' }} #{{ req.id }}
+          </p>
+          <StatusBadge :status="req.status" :label="req.status_label" />
+        </div>
+        <p class="chat-text mt-1 text-sm">
+          {{ req.summary }}
+        </p>
+        <dl class="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs">
+          <template v-if="req.submitted_at">
+            <dt class="font-semibold">
+              Submitted
+            </dt>
+            <dd>{{ formatDateTime(req.submitted_at) }}</dd>
+          </template>
+          <template v-if="req.reviewed_at">
+            <dt class="font-semibold">
+              Reviewed
+            </dt>
+            <dd>{{ formatDateTime(req.reviewed_at) }}</dd>
+          </template>
+          <template v-if="req.reviewer_note">
+            <dt class="font-semibold">
+              Reviewer note
+            </dt>
+            <dd class="chat-text">
+              {{ req.reviewer_note }}
+            </dd>
+          </template>
+          <template v-if="req.external_reference_id">
+            <dt class="font-semibold">
+              Reference
+            </dt>
+            <dd class="chat-text">
+              {{ req.external_reference_id }}
+            </dd>
+          </template>
+        </dl>
+      </li>
+    </ul>
+  </section>
+</template>
+@import "tailwindcss";
+
+/* Runtime values (--theme-* and --color-*) are injected at :root by app/app.vue
+   from runtimeConfig.public.theme; these tokens expose them as utilities. */
+@theme inline {
+  --color-primary: var(--theme-primary);
+  --color-secondary: var(--theme-secondary);
+  --color-background: var(--theme-background);
+}
+
+html {
+  color-scheme: light;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) {
+    color-scheme: dark;
+  }
+}
+
+body {
+  background-color: var(--theme-background);
+  color: var(--theme-secondary);
+}
+
+/* ---- Mock-warning (fixed amber) and role-badge palettes -------------------------------------
+   Not env-driven: these are status colours whose contrast is verified, so they follow the same
+   light / prefers-color-scheme / data-theme switching as the theme tokens but stay constant. */
+:root {
+  --warn-bg: #fffbeb;
+  --warn-border: #d97706;
+  --warn-text: #451a03;
+  --warn-icon: #b45309;
+  --badge-employee-bg: #e0f2fe;
+  --badge-employee-fg: #075985;
+  --badge-hr-bg: #ede9fe;
+  --badge-hr-fg: #5b21b6;
+  --badge-finance-bg: #dcfce7;
+  --badge-finance-fg: #166534;
+  --gsi-bg: #ffffff;
+  --gsi-border: #747775;
+  --gsi-fg: #1f1f1f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --warn-bg: #451a03;
+    --warn-border: #f59e0b;
+    --warn-text: #fef3c7;
+    --warn-icon: #fbbf24;
+    --badge-employee-bg: #0c4a6e;
+    --badge-employee-fg: #e0f2fe;
+    --badge-hr-bg: #4c1d95;
+    --badge-hr-fg: #ede9fe;
+    --badge-finance-bg: #14532d;
+    --badge-finance-fg: #dcfce7;
+    --gsi-bg: #131314;
+    --gsi-border: #8e918f;
+    --gsi-fg: #e3e3e3;
+  }
+}
+
+:root[data-theme="dark"] {
+  --warn-bg: #451a03;
+  --warn-border: #f59e0b;
+  --warn-text: #fef3c7;
+  --warn-icon: #fbbf24;
+  --badge-employee-bg: #0c4a6e;
+  --badge-employee-fg: #e0f2fe;
+  --badge-hr-bg: #4c1d95;
+  --badge-hr-fg: #ede9fe;
+  --badge-finance-bg: #14532d;
+  --badge-finance-fg: #dcfce7;
+  --gsi-bg: #131314;
+  --gsi-border: #8e918f;
+  --gsi-fg: #e3e3e3;
+}
+
+.mock-warning {
+  background-color: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-left-width: 6px;
+  color: var(--warn-text);
+}
+
+.mock-warning-icon {
+  color: var(--warn-icon);
+}
+
+.role-badge {
+  display: inline-block;
+  border-radius: 9999px;
+  padding: 0.125rem 0.625rem;
+  font-size: 0.75rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.role-badge[data-role="employee"] {
+  background-color: var(--badge-employee-bg);
+  color: var(--badge-employee-fg);
+}
+
+.role-badge[data-role="hr_approver"] {
+  background-color: var(--badge-hr-bg);
+  color: var(--badge-hr-fg);
+}
+
+.role-badge[data-role="finance_approver"] {
+  background-color: var(--badge-finance-bg);
+  color: var(--badge-finance-fg);
+}
+
+/* "Sign in with Google" button: light (default) / dark themes per Google's branding guidelines
+   (fill #FFFFFF/#131314, 1px stroke #747775/#8E918F, text #1F1F1F/#E3E3E3, 12px left padding,
+   10px after the logo, 12px right padding). Font: Google Sans Medium where installed, then
+   Roboto, then the system stack; no web font is fetched from Google. */
+.gsi-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 40px;
+  min-width: 200px;
+  max-width: 100%;
+  padding: 0 12px;
+  border: 1px solid var(--gsi-border);
+  border-radius: 4px;
+  background-color: var(--gsi-bg);
+  color: var(--gsi-fg);
+  font-family: "Google Sans", "Roboto", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  letter-spacing: 0.25px;
+  cursor: pointer;
+  transition: box-shadow 0.15s;
+}
+
+.gsi-button:hover {
+  box-shadow: 0 1px 2px 0 rgb(60 64 67 / 30%), 0 1px 3px 1px rgb(60 64 67 / 15%);
+}
+
+.gsi-button > svg {
+  width: 20px;
+  height: 20px;
+  margin-right: 10px;
+  flex: none;
+}
+
+.gsi-button:focus-visible,
+.focus-ring:focus-visible {
+  outline: 2px solid var(--theme-secondary);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin {
+    animation: none;
+  }
+}
+
+/* Error panels: fixed light red on light theme, dark red on dark theme (contrast >= 4.5:1). */
+:root[data-theme="dark"] .dark-error {
+  background-color: #450a0a;
+  color: #fee2e2;
+  border-color: #f87171;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .dark-error {
+    background-color: #450a0a;
+    color: #fee2e2;
+    border-color: #f87171;
+  }
+}
+
+/* ---- Mock One Tap card ------------------------------------------------------------------------ */
+.one-tap {
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 20%), 0 10px 24px -4px rgb(0 0 0 / 25%);
+}
+
+.one-tap:focus-visible {
+  outline: 2px solid var(--theme-secondary);
+  outline-offset: 2px;
+}
+
+/* "MOCK" chip: same amber palette as the warning banner (contrast verified there). */
+.mock-chip {
+  display: inline-block;
+  border: 1px solid var(--warn-border);
+  border-radius: 9999px;
+  background-color: var(--warn-bg);
+  color: var(--warn-text);
+  padding: 0 0.5rem;
+  font-size: 0.6875rem;
+  line-height: 1.125rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.one-tap-cta {
+  white-space: nowrap;
+}
+
+[data-account-row]:hover .one-tap-cta,
+[data-account-row]:focus-visible .one-tap-cta {
+  text-decoration: underline;
+}
+
+/* ---- Chat (Phase 2) ---------------------------------------------------------------------------
+   Status tones for badges, notices and outcome icons. Fixed palettes (not env-driven) so contrast stays
+   verified (>= 4.5:1 text on background) in both themes. */
+:root {
+  --tone-amber-bg: #fef3c7;
+  --tone-amber-fg: #78350f;
+  --tone-amber-bd: #d97706;
+  --tone-green-bg: #dcfce7;
+  --tone-green-fg: #14532d;
+  --tone-green-bd: #16a34a;
+  --tone-red-bg: #fee2e2;
+  --tone-red-fg: #7f1d1d;
+  --tone-red-bd: #dc2626;
+  --tone-grey-bg: #f1f5f9;
+  --tone-grey-fg: #334155;
+  --tone-grey-bd: #94a3b8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --tone-amber-bg: #451a03;
+    --tone-amber-fg: #fde68a;
+    --tone-amber-bd: #f59e0b;
+    --tone-green-bg: #14532d;
+    --tone-green-fg: #dcfce7;
+    --tone-green-bd: #4ade80;
+    --tone-red-bg: #450a0a;
+    --tone-red-fg: #fecaca;
+    --tone-red-bd: #f87171;
+    --tone-grey-bg: #1e293b;
+    --tone-grey-fg: #e2e8f0;
+    --tone-grey-bd: #64748b;
+  }
+}
+
+:root[data-theme="dark"] {
+  --tone-amber-bg: #451a03;
+  --tone-amber-fg: #fde68a;
+  --tone-amber-bd: #f59e0b;
+  --tone-green-bg: #14532d;
+  --tone-green-fg: #dcfce7;
+  --tone-green-bd: #4ade80;
+  --tone-red-bg: #450a0a;
+  --tone-red-fg: #fecaca;
+  --tone-red-bd: #f87171;
+  --tone-grey-bg: #1e293b;
+  --tone-grey-fg: #e2e8f0;
+  --tone-grey-bd: #64748b;
+}
+
+.tone {
+  background-color: var(--tone-bg);
+  color: var(--tone-fg);
+  border: 1px solid var(--tone-bd);
+}
+
+.tone-amber {
+  --tone-bg: var(--tone-amber-bg);
+  --tone-fg: var(--tone-amber-fg);
+  --tone-bd: var(--tone-amber-bd);
+}
+
+.tone-green {
+  --tone-bg: var(--tone-green-bg);
+  --tone-fg: var(--tone-green-fg);
+  --tone-bd: var(--tone-green-bd);
+}
+
+.tone-red {
+  --tone-bg: var(--tone-red-bg);
+  --tone-fg: var(--tone-red-fg);
+  --tone-bd: var(--tone-red-bd);
+}
+
+.tone-grey {
+  --tone-bg: var(--tone-grey-bg);
+  --tone-fg: var(--tone-grey-fg);
+  --tone-bd: var(--tone-grey-bd);
+}
+
+/* Thinking dots (motion is removed for prefers-reduced-motion). */
+@keyframes chat-dot {
+  0%, 80%, 100% { opacity: 0.25; }
+  40% { opacity: 1; }
+}
+
+.chat-dot {
+  display: inline-block;
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: 9999px;
+  background-color: currentColor;
+  animation: chat-dot 1.2s infinite ease-in-out;
+}
+
+.chat-dot:nth-child(2) { animation-delay: 0.2s; }
+.chat-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-dot { animation: none; opacity: 0.6; }
+  .chat-drawer { transition: none !important; }
+}
+
+/* Long unbroken text (e.g. a pasted URL) must wrap instead of overflowing a bubble. */
+.chat-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.text-danger {
+  color: var(--tone-red-fg);
+}
+
+.border-danger {
+  border-color: var(--tone-red-bd);
+}
+/** Pure, framework-free chat helpers (unit-tested offline in tests/chat.test.ts). */
+import type {
+  AttachmentInfo,
+  CardAction,
+  CardField,
+  CardState,
+  ConfirmationCardData,
+  ConversationSummary,
+  Message,
+  RequestStatus,
+  ResultOutcome,
+  TurnResponse,
+  WarningCode,
+} from '../types/chat'
+
+export const MAX_MESSAGE_LENGTH = 1000
+
+/** Suggestion chips of the empty state; picking one sends it as a message. */
+export const CHAT_SUGGESTIONS: readonly string[] = [
+  'I need annual leave next Monday and Tuesday',
+  'Half day sick leave tomorrow afternoon',
+  'Claim HKD 180 for a taxi yesterday',
+  'What is the status of my requests?',
+]
+
+/* ---- Status badges: colour is never the only cue (each tone has an icon and a text label) ---- */
+
+export type Tone = 'amber' | 'green' | 'red' | 'grey'
+export type IconName = 'clock' | 'check' | 'x' | 'alert' | 'ban' | 'pencil'
+
+export interface StatusMeta {
+  label: string
+  tone: Tone
+  icon: IconName
+}
+
+const STATUS_META: Readonly<Record<RequestStatus, StatusMeta>> = {
+  draft: { label: 'Draft', tone: 'grey', icon: 'pencil' },
+  pending_approval: { label: 'Pending approval', tone: 'amber', icon: 'clock' },
+  submission_failed: { label: 'Submission failed', tone: 'red', icon: 'alert' },
+  approved: { label: 'Approved', tone: 'green', icon: 'check' },
+  rejected: { label: 'Rejected', tone: 'red', icon: 'x' },
+  cancelled: { label: 'Cancelled', tone: 'grey', icon: 'ban' },
+}
+
+/** Label, tone and icon for a request status; unknown statuses fall back to a neutral badge. */
+export function statusMeta(status: string, fallbackLabel?: string): StatusMeta {
+  const known = (STATUS_META as Record<string, StatusMeta | undefined>)[status]
+  if (known) return known
+  return { label: fallbackLabel || 'Unknown status', tone: 'grey', icon: 'clock' }
+}
+
+/** CSS class for a tone (palette defined in main.css, contrast >= 4.5:1 in both themes). */
+export function toneClass(tone: Tone): string {
+  return `tone tone-${tone}`
+}
+
+const OUTCOME_META: Readonly<Record<ResultOutcome, { label: string, tone: Tone, icon: IconName }>> = {
+  submitted: { label: 'Submitted', tone: 'green', icon: 'check' },
+  updated: { label: 'Updated', tone: 'green', icon: 'check' },
+  cancelled: { label: 'Cancelled', tone: 'grey', icon: 'ban' },
+  failed: { label: 'Submission failed', tone: 'red', icon: 'alert' },
+}
+
+export function outcomeMeta(outcome: string) {
+  return (OUTCOME_META as Record<string, (typeof OUTCOME_META)[ResultOutcome] | undefined>)[outcome]
+    ?? { label: 'Done', tone: 'grey' as Tone, icon: 'check' as IconName }
+}
+
+const CARD_STATE_META: Readonly<Record<Exclude<CardState, 'open'>, { label: string, tone: Tone, icon: IconName }>> = {
+  used: { label: 'Confirmed', tone: 'green', icon: 'check' },
+  superseded: { label: 'Replaced by a newer card', tone: 'grey', icon: 'ban' },
+  discarded: { label: 'Discarded', tone: 'grey', icon: 'x' },
+}
+
+export function cardStateMeta(state: string) {
+  return (CARD_STATE_META as Record<string, (typeof CARD_STATE_META)[keyof typeof CARD_STATE_META] | undefined>)[state]
+    ?? { label: 'Closed', tone: 'grey' as Tone, icon: 'ban' as IconName }
+}
+
+/** Text of the loading state while a card action runs (the required "API loading state"). */
+export function cardBusyLabel(action: CardAction, decision: 'confirm' | 'discard'): string {
+  if (decision === 'discard') return 'Discarding...'
+  return action === 'cancel' ? 'Cancelling request...' : 'Submitting to ReqRes...'
+}
+
+/* ---- Time ---- */
+
+const MINUTE = 60_000
+const HOUR = 60 * MINUTE
+const DAY = 24 * HOUR
+
+/** "just now", "5 min ago", "3 h ago", "yesterday", "4 d ago", then the ISO date. Bad input gives "". */
+export function relativeTime(iso: string, now: number = Date.now()): string {
+  const then = Date.parse(iso)
+  if (Number.isNaN(then)) return ''
+  const diff = now - then
+  if (diff < MINUTE) return 'just now' // includes small clock skew into the future
+  if (diff < HOUR) return `${Math.floor(diff / MINUTE)} min ago`
+  if (diff < DAY) return `${Math.floor(diff / HOUR)} h ago`
+  if (diff < 2 * DAY) return 'yesterday'
+  if (diff < 7 * DAY) return `${Math.floor(diff / DAY)} d ago`
+  return new Date(then).toISOString().slice(0, 10)
+}
+
+/** Clock time of a message, e.g. "11:05". `timeZone` is only passed by tests. */
+export function formatClock(iso: string, timeZone?: string): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone })
+}
+
+/** Date and time for cards, e.g. "25 Sep 2026, 11:05". */
+export function formatDateTime(iso: string | null | undefined, timeZone?: string): string {
+  if (!iso) return ''
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone,
+  })
+}
+
+/** "640 ms" or "1.2 s". */
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return ''
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  return `${(ms / 1000).toFixed(1)} s`
+}
+
+/* ---- Card fields ---- */
+
+/** Value to show for a card field; blank values become an en dash. */
+export function fieldValue(value: string | null | undefined): string {
+  const text = (value ?? '').trim()
+  return text || '–'
+}
+
+/** True when a field carries a real change (an old value that differs from the new one). */
+export function fieldHasDiff(field: CardField): boolean {
+  return field.old_value !== null && field.old_value !== undefined && field.old_value !== field.value
+}
+
+/* ---- Conversations ---- */
+
+export function sortConversations(list: readonly ConversationSummary[]): ConversationSummary[] {
+  return [...list].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at) || b.id - a.id)
+}
+
+/** Inserts or replaces a summary and keeps the list newest-first. */
+export function upsertConversation(list: readonly ConversationSummary[], summary: ConversationSummary): ConversationSummary[] {
+  return sortConversations([...list.filter(c => c.id !== summary.id), summary])
+}
+
+export interface ConversationBadge {
+  kind: 'card' | 'form'
+  label: string
+}
+
+/** Badges for the sidebar: an open card and/or the form type being filled. */
+export function conversationBadges(summary: ConversationSummary): ConversationBadge[] {
+  const badges: ConversationBadge[] = []
+  if (summary.has_pending_card) badges.push({ kind: 'card', label: 'Awaiting confirmation' })
+  if (summary.active_request_type) {
+    badges.push({ kind: 'form', label: summary.active_request_type === 'leave' ? 'Leave form' : 'Claim form' })
+  }
+  return badges
+}
+
+/** A conversation the user has not typed into yet (safe to reuse instead of creating another). */
+export function isEmptyConversation(summary: ConversationSummary | undefined, messages: readonly Message[]): boolean {
+  return !!summary && messages.length === 0 && !summary.has_pending_card && !summary.active_request_type
+}
+
+/* ---- Messages ---- */
+
+function byTime(a: Message, b: Message): number {
+  return Date.parse(a.created_at) - Date.parse(b.created_at) || a.id - b.id
+}
+
+/** Merges messages by id (incoming wins) and orders them oldest-first. Optimistic (negative-id) messages stay last on ties. */
+export function mergeMessages(existing: readonly Message[], incoming: readonly Message[]): Message[] {
+  const byId = new Map<number, Message>()
+  for (const message of [...existing, ...incoming]) byId.set(message.id, message)
+  return [...byId.values()].sort(byTime)
+}
+
+/** Placeholder for the user's message while the request is in flight (negative id = not yet saved). */
+export function optimisticMessage(tempId: number, content: string, now: Date = new Date(), attachments: AttachmentInfo[] = []): Message {
+  return { id: tempId, sender_type: 'user', content, created_at: now.toISOString(), ui: null, trace: null, attachments }
+}
+
+export function isOptimistic(message: Message): boolean {
+  return message.id < 0
+}
+
+/** Applies a TurnResponse: drops the optimistic message, merges the saved ones (user message first). */
+export function applyTurn(messages: readonly Message[], tempId: number | null, turn: TurnResponse): Message[] {
+  const kept = tempId === null ? messages : messages.filter(m => m.id !== tempId)
+  const incoming = [...(turn.user_message ? [turn.user_message] : []), ...turn.assistant_messages]
+  return mergeMessages(kept, incoming)
+}
+
+function isOpenCard(message: Message): boolean {
+  return message.ui?.type === 'confirmation_card' && message.ui.state === 'open'
+}
+
+function withCardState(message: Message, state: CardState): Message {
+  if (message.ui?.type !== 'confirmation_card') return message
+  const ui: ConfirmationCardData = { ...message.ui, state }
+  return { ...message, ui }
+}
+
+/**
+ * Keeps card states consistent with the contract: only the newest confirmation card can be open, and no card
+ * is open when the conversation has no pending card. `acted` records the decision the user just took.
+ */
+export function reconcileCards(
+  messages: readonly Message[],
+  opts: { hasPendingCard: boolean, acted?: { cardId: string, state: CardState } },
+): Message[] {
+  let next = messages.map(m =>
+    opts.acted && m.ui?.type === 'confirmation_card' && m.ui.card_id === opts.acted.cardId
+      ? withCardState(m, opts.acted.state)
+      : m,
+  )
+  const openIndexes = next.flatMap((m, i) => (isOpenCard(m) ? [i] : []))
+  const last = openIndexes[openIndexes.length - 1]
+  next = next.map((m, i) => {
+    if (!isOpenCard(m)) return m
+    return i === last && opts.hasPendingCard ? m : withCardState(m, 'superseded')
+  })
+  return next
+}
+
+/** True when the newest message is one the user has not seen the answer to (used to decide auto-scroll). */
+export function lastMessageIsUser(messages: readonly Message[]): boolean {
+  return messages[messages.length - 1]?.sender_type === 'user'
+}
+
+/** Text spoken by the aria-live region for a new assistant message. */
+export function announcementFor(message: Message): string {
+  const parts = [message.content.trim()]
+  if (message.ui?.type === 'confirmation_card' && message.ui.state === 'open') {
+    parts.push(`${message.ui.title}. Use the ${message.ui.confirm_label} button or Discard.`)
+  }
+  else if (message.ui?.type === 'status_card') {
+    parts.push(message.ui.requests.length ? `${message.ui.requests.length} request(s) listed.` : 'No matching requests.')
+  }
+  else if (message.ui?.type === 'result_card') {
+    parts.push(message.ui.message)
+  }
+  return parts.filter(Boolean).join(' ')
+}
+
+/* ---- Composer ---- */
+
+/** True when the trimmed text is 1..1000 characters (the backend counts the trimmed text) and no turn is in flight. */
+export function canSend(text: string, busy: boolean): boolean {
+  const length = text.trim().length
+  return !busy && length > 0 && length <= MAX_MESSAGE_LENGTH
+}
+
+/** Characters left, counting the trimmed text like the backend does (negative = over the limit). */
+export function remainingChars(text: string): number {
+  return MAX_MESSAGE_LENGTH - text.trim().length
+}
+
+/** True when the scroll position is within `threshold` px of the bottom (so auto-scroll may follow new messages). */
+export function isNearBottom(metrics: { scrollTop: number, scrollHeight: number, clientHeight: number }, threshold = 80): boolean {
+  return metrics.scrollHeight - metrics.scrollTop - metrics.clientHeight <= threshold
+}
+
+/* ---- Errors ---- */
+
+export type ChatAction = 'load' | 'send' | 'card'
+
+/** User-facing message for a chat API failure (never echoes server text). `status` undefined = network error. */
+export function chatErrorMessage(status: number | undefined, action: ChatAction): string {
+  if (status === undefined) return 'Cannot reach the server. Check your connection and try again.'
+  if (status === 403) return 'The chat is available to employees only.'
+  if (status === 404) return 'That conversation could not be found.'
+  if (status === 409) return 'That card is out of date.'
+  if (status === 422) return action === 'send' ? 'That message could not be sent. Keep it between 1 and 1000 characters.' : 'That request was not accepted.'
+  if (status === 429) return 'Too many requests. Please wait a moment and try again.'
+  if (status >= 500) return 'The server had a problem. Please try again in a moment.'
+  return 'Something went wrong. Please try again.'
+}
+
+const WARNING_MESSAGES: Readonly<Record<WarningCode, string>> = {
+  llm_unavailable: 'The AI service is unavailable, please try again.',
+  llm_invalid_output: 'The AI gave an answer I could not use. Please rephrase and try again.',
+  submission_failed: 'The submission to ReqRes failed. Your request is saved; use Retry on the card to try again.',
+  stale_card: 'That card is out of date.',
+}
+
+/** Banner text for a `warning_code`; null when there is nothing to show (or an unknown code). */
+export function warningMessage(code: string | null | undefined): string | null {
+  if (!code) return null
+  return (WARNING_MESSAGES as Record<string, string | undefined>)[code] ?? 'Something needs your attention. Please try again.'
+}
+export interface ThemeConfig {
+  lightPrimary: string
+  lightSecondary: string
+  lightBackground: string
+  darkPrimary: string
+  darkSecondary: string
+  darkBackground: string
+}
+
+export type ThemeMode = 'light' | 'dark' | 'system'
+
+export const DEFAULT_THEME: Readonly<ThemeConfig> = {
+  lightPrimary: '#32a9e1',
+  lightSecondary: '#1e40af',
+  lightBackground: '#ffffff',
+  darkPrimary: '#7dd3fc',
+  darkSecondary: '#94a3b8',
+  darkBackground: '#020617',
+}
+
+const HEX_RE = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i
+
+export function isValidHex(value: unknown): value is string {
+  return typeof value === 'string' && HEX_RE.test(value.trim())
+}
+
+/** Returns a lower-cased valid hex colour, or the fallback when malformed. */
+export function sanitizeHex(value: unknown, fallback: string): string {
+  return isValidHex(value) ? value.trim().toLowerCase() : fallback
+}
+
+export function resolveTheme(input?: Partial<Record<keyof ThemeConfig, unknown>> | null): ThemeConfig {
+  const source = input ?? {}
+  const out = { ...DEFAULT_THEME }
+  for (const key of Object.keys(DEFAULT_THEME) as (keyof ThemeConfig)[]) {
+    out[key] = sanitizeHex(source[key], DEFAULT_THEME[key])
+  }
+  return out
+}
+
+export function isThemeMode(value: unknown): value is ThemeMode {
+  return value === 'light' || value === 'dark' || value === 'system'
+}
+
+/** Builds the :root CSS for light, prefers-color-scheme dark, and data-theme overrides. */
+export function buildThemeCss(input?: Partial<Record<keyof ThemeConfig, unknown>> | null): string {
+  const t = resolveTheme(input)
+  // --theme-* feed the Tailwind @theme tokens (a token cannot reference its own name);
+  // --color-* carry the same values for direct use.
+  const vars = (p: string, s: string, b: string) =>
+    `--theme-primary:${p};--theme-secondary:${s};--theme-background:${b};--color-primary:${p};--color-secondary:${s};--color-background:${b};`
+  const light = vars(t.lightPrimary, t.lightSecondary, t.lightBackground)
+  const dark = vars(t.darkPrimary, t.darkSecondary, t.darkBackground)
+  return [
+    `:root{${light}}`,
+    `@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){${dark}}}`,
+    `:root[data-theme="light"]{${light}}`,
+    `:root[data-theme="dark"]{${dark}}`,
+  ].join('\n')
+}

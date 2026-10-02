@@ -1,0 +1,909 @@
+"""Persistent conversation state (``conversations.state_json``).
+
+Holds the draft the user is filling in (slots), an optional link to the existing request being
+edited, and the one open confirmation card. Everything is plain JSON so a conversation can be
+reopened later and continue exactly where it stopped.
+"""
+
+import hashlib
+import json
+from datetime import date
+from decimal import Decimal
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, ValidationError
+
+from app.domain.enums import ClaimType, DayPart, LeaveType, RequestType
+
+CardAction = Literal["create", "update", "cancel", "retry"]
+CardState = Literal["open", "used", "superseded", "discarded"]
+
+
+class LeaveSlots(BaseModel):
+    leave_type: LeaveType | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    start_day_part: DayPart | None = None
+    end_day_part: DayPart | None = None
+
+    def is_empty(self) -> bool:
+        return all(v is None for v in self.model_dump().values())
+
+
+class ClaimSlots(BaseModel):
+    claim_type: ClaimType | None = None
+    # Kept as an exact Decimal (JSON string) so "12.345" is remembered and rejected, not rounded.
+    amount: Decimal | None = None
+    currency: str | None = None
+    receipt_date: date | None = None
+
+    def is_empty(self) -> bool:
+        return all(v is None for v in self.model_dump().values())
+
+
+class PendingCard(BaseModel):
+    card_id: str
+    action: CardAction
+    request_type: RequestType
+    request_id: int | None = None
+    payload_hash: str
+    state: CardState = "open"
+
+
+class ConversationState(BaseModel):
+    active_request_type: RequestType | None = None
+    leave: LeaveSlots = Field(default_factory=LeaveSlots)
+    claim: ClaimSlots = Field(default_factory=ClaimSlots)
+    editing_request_id: int | None = None
+    # Values of the request being edited before any change (normalised strings, for diffs).
+    original: dict[str, str | None] | None = None
+    awaiting: str | None = None  # field the assistant last asked for
+    # Uploaded documents that belong to the draft; linked to the request on Confirm so approvers
+    # can open them. Filled by the document-reading step (empty for older stored states).
+    attachment_ids: list[int] = Field(default_factory=list)
+    pending_card: PendingCard | None = None
+    state_version: int = 0
+
+    def has_draft(self) -> bool:
+        return not (self.leave.is_empty() and self.claim.is_empty()) or (
+            self.editing_request_id is not None
+        )
+
+    def open_card(self) -> PendingCard | None:
+        card = self.pending_card
+        return card if card is not None and card.state == "open" else None
+
+    def reset_draft(self) -> None:
+        self.active_request_type = None
+        self.leave = LeaveSlots()
+        self.claim = ClaimSlots()
+        self.editing_request_id = None
+        self.original = None
+        self.awaiting = None
+        self.attachment_ids = []
+
+
+def load_state(
+    raw: dict[str, Any] | None, active_request_type: RequestType | None
+) -> ConversationState:
+    """Parse ``state_json``; NULL or unreadable content yields an empty state (never raises)."""
+    if raw:
+        try:
+            return ConversationState.model_validate(raw)
+        except ValidationError:
+            pass
+    return ConversationState(active_request_type=active_request_type)
+
+
+def dump_state(state: ConversationState) -> dict[str, Any]:
+    return state.model_dump(mode="json")
+
+
+def _amount_text(amount: Decimal | None) -> str | None:
+    """``120`` and ``120.00`` compare equal: quantise to 2 dp unless there are more decimals."""
+    if amount is None:
+        return None
+    if amount.is_finite() and amount.as_tuple().exponent >= -2:  # type: ignore[operator]
+        return format(amount.quantize(Decimal("0.01")), "f")
+    return format(amount, "f")
+
+
+def normalised_values(state: ConversationState, request_type: RequestType) -> dict[str, str | None]:
+    """The slots as comparable strings with defaults applied (day parts full, currency HKD)."""
+    if request_type is RequestType.LEAVE:
+        s = state.leave
+        return {
+            "leave_type": s.leave_type.value if s.leave_type else None,
+            "start_date": s.start_date.isoformat() if s.start_date else None,
+            "end_date": s.end_date.isoformat() if s.end_date else None,
+            "start_day_part": (s.start_day_part or DayPart.FULL).value,
+            "end_day_part": (s.end_day_part or DayPart.FULL).value,
+        }
+    c = state.claim
+    return {
+        "claim_type": c.claim_type.value if c.claim_type else None,
+        "amount": _amount_text(c.amount),
+        "currency": (c.currency or "HKD").upper(),
+        "receipt_date": c.receipt_date.isoformat() if c.receipt_date else None,
+    }
+
+
+def payload_hash(action: str, request_id: int | None, values: dict[str, str | None]) -> str:
+    blob = json.dumps({"a": action, "r": request_id, "v": values}, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+"""Confirmation-card builders (UI payloads, kept apart from workflow state and DB models)."""
+
+import secrets
+from datetime import date
+from decimal import Decimal
+
+from app.chat.format import fmt_date, fmt_date_with_part, fmt_days, fmt_money
+from app.chat.state import CardAction
+from app.domain.enums import DayPart, RequestType
+from app.schemas.chat import CardField, ConfirmationCard
+
+_LABELS = {
+    "employee_email": "Employee",
+    "leave_type": "Leave type",
+    "start_date": "Start",
+    "end_date": "End",
+    "working_days": "Working days",
+    "claim_type": "Claim type",
+    "amount": "Amount",
+    "receipt_date": "Receipt date",
+    "status": "Current status",
+}
+_TITLES = {
+    "create": {"leave": "Confirm leave application", "claim": "Confirm staff claim"},
+}
+CONFIRM_LABELS = {
+    "create": "Submit",
+    "update": "Save changes",
+    "cancel": "Cancel request",
+    "retry": "Retry",
+}
+
+
+def new_card_id() -> str:
+    return "c_" + secrets.token_hex(4)
+
+
+def display_values(
+    request_type: RequestType,
+    values: dict[str, str | None],
+    *,
+    working_days: str | None = None,
+    email: str | None = None,
+    status_label: str | None = None,
+) -> dict[str, str]:
+    """Human-readable card values in display order (skips what is not known)."""
+    out: dict[str, str] = {}
+    if email:
+        out["employee_email"] = email
+    if request_type == RequestType.LEAVE:
+        if values.get("leave_type"):
+            out["leave_type"] = str(values["leave_type"]).title()
+        if values.get("start_date"):
+            out["start_date"] = fmt_date_with_part(
+                date.fromisoformat(str(values["start_date"])),
+                DayPart(values.get("start_day_part") or "full"),
+            )
+        if values.get("end_date"):
+            out["end_date"] = fmt_date_with_part(
+                date.fromisoformat(str(values["end_date"])),
+                DayPart(values.get("end_day_part") or "full"),
+            )
+        if working_days is not None:
+            out["working_days"] = working_days
+    else:
+        if values.get("claim_type"):
+            out["claim_type"] = str(values["claim_type"]).title()
+        if values.get("amount") is not None:
+            out["amount"] = fmt_money(
+                Decimal(str(values["amount"])), values.get("currency") or "HKD"
+            )
+        if values.get("receipt_date"):
+            out["receipt_date"] = fmt_date(date.fromisoformat(str(values["receipt_date"])))
+    if status_label:
+        out["status"] = status_label
+    return out
+
+
+def working_days_text(value: Decimal) -> str:
+    return fmt_days(value)
+
+
+def build_card(
+    *,
+    action: CardAction,
+    request_type: RequestType,
+    request_id: int | None,
+    new: dict[str, str],
+    old: dict[str, str] | None = None,
+    warnings: list[str] | None = None,
+    card_id: str | None = None,
+) -> ConfirmationCard:
+    """``old`` (update cards) marks each changed field with its previous value."""
+    fields: list[CardField] = []
+    for key, value in new.items():
+        previous = old.get(key) if old is not None else None
+        fields.append(
+            CardField(
+                key=key,
+                label=_LABELS[key],
+                value=value,
+                old_value=previous if previous is not None and previous != value else None,
+            )
+        )
+    noun = "leave request" if request_type == RequestType.LEAVE else "claim"
+    if action == "create":
+        title = _TITLES["create"][request_type.value]
+    elif action == "update":
+        title = f"Confirm changes to {noun} #{request_id}"
+    elif action == "cancel":
+        title = f"Confirm cancellation of {noun} #{request_id}"
+    else:
+        title = f"Retry submission of {noun} #{request_id}"
+    return ConfirmationCard(
+        card_id=card_id or new_card_id(),
+        action=action,
+        request_type=request_type,
+        request_id=request_id,
+        title=title,
+        fields=fields,
+        warnings=warnings or [],
+        state="open",
+        confirm_label=CONFIRM_LABELS[action],  # type: ignore[arg-type]
+    )
+"""Chat service: conversations, message turns and card actions for one signed-in employee."""
+
+import logging
+import time
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.agent.graph import Reply, TurnResult, run_turn
+from app.chat.actions import ActionResult, CardActions, StaleCardError
+from app.chat.policy import HISTORY_MESSAGE_CHARS, HISTORY_MESSAGES
+from app.chat.state import ConversationState, load_state
+from app.chat.store import (
+    add_message,
+    cas_save_state,
+    make_title,
+    message_out,
+    set_card_state,
+)
+from app.chat.turn_input import ChatTurnDeps, build_attachment_inputs
+from app.config import Settings, get_settings
+from app.db.models import Attachment, Conversation, ConversationMessage, User
+from app.domain import clock
+from app.domain.enums import ConversationStatus, SenderType
+from app.integrations.base import SubmissionAdapter
+from app.llm.base import LLMProvider
+from app.llm.schemas import ChatTurn
+from app.schemas.chat import (
+    ConversationDetail,
+    ConversationSummary,
+    Message,
+    TraceStep,
+    TurnResponse,
+)
+from app.services.attachments import (
+    attach_to_message,
+    attachments_by_message,
+    load_staged,
+    to_info,
+)
+
+logger = logging.getLogger(__name__)
+
+FILE_ONLY_REPLY = "I received your file(s) but I cannot read documents yet."
+
+
+class ConversationNotFound(Exception):
+    """No such conversation for this user (also used for other users' conversations)."""
+
+
+class ConversationConflict(Exception):
+    """The conversation changed while this request was being processed (HTTP 409)."""
+
+
+class ChatService:
+    def __init__(
+        self,
+        session: Session,
+        user: User,
+        llm: LLMProvider,
+        adapter: SubmissionAdapter,
+        settings: Settings | None = None,
+    ) -> None:
+        self.session = session
+        self.user = user
+        self.llm = llm
+        self.adapter = adapter
+        self.settings = settings or get_settings()
+
+    # ---- queries ------------------------------------------------------------------------------
+    def _owned(self, conversation_id: int) -> Conversation:
+        conv = self.session.get(Conversation, conversation_id)
+        if conv is None or conv.user_id != self.user.id:
+            raise ConversationNotFound
+        return conv
+
+    def _titles(self, conversation_ids: list[int]) -> dict[int, str | None]:
+        if not conversation_ids:
+            return {}
+        first_ids = (
+            select(func.min(ConversationMessage.id))
+            .where(
+                ConversationMessage.conversation_id.in_(conversation_ids),
+                ConversationMessage.sender_type == SenderType.USER,
+            )
+            .group_by(ConversationMessage.conversation_id)
+        )
+        rows = self.session.execute(
+            select(ConversationMessage.conversation_id, ConversationMessage.content).where(
+                ConversationMessage.id.in_(first_ids)
+            )
+        ).all()
+        titles: dict[int, str | None] = {cid: content for cid, content in rows}
+        # A first message without text is titled after its first attachment.
+        blank = [cid for cid, content in titles.items() if not (content or "").strip()]
+        if blank:
+            first_message_ids = {
+                row.conversation_id: row.id
+                for row in self.session.scalars(
+                    select(ConversationMessage).where(ConversationMessage.id.in_(first_ids))
+                )
+            }
+            for cid in blank:
+                name = self.session.scalar(
+                    select(Attachment.original_filename)
+                    .where(Attachment.message_id == first_message_ids.get(cid))
+                    .order_by(Attachment.id)
+                    .limit(1)
+                )
+                if name:
+                    titles[cid] = f"Attachment: {name}"
+        return titles
+
+    def _summaries(self, conversations: list[Conversation]) -> list[ConversationSummary]:
+        first_messages = self._titles([c.id for c in conversations])
+        out: list[ConversationSummary] = []
+        for conv in conversations:
+            state = load_state(conv.state_json, conv.active_request_type)
+            out.append(
+                ConversationSummary(
+                    id=conv.id,
+                    title=make_title(first_messages.get(conv.id)),
+                    status=conv.status.value,
+                    active_request_type=conv.active_request_type,
+                    has_pending_card=state.open_card() is not None,
+                    created_at=conv.created_at,
+                    updated_at=conv.updated_at,
+                )
+            )
+        return out
+
+    def _summary(self, conv: Conversation) -> ConversationSummary:
+        self.session.refresh(conv)
+        return self._summaries([conv])[0]
+
+    def list_conversations(self) -> list[ConversationSummary]:
+        rows = self.session.scalars(
+            select(Conversation)
+            .where(Conversation.user_id == self.user.id)
+            .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+        ).all()
+        return self._summaries(list(rows))
+
+    def create_conversation(self) -> ConversationSummary:
+        conv = Conversation(user_id=self.user.id, status=ConversationStatus.ACTIVE)
+        self.session.add(conv)
+        self.session.commit()
+        return self._summaries([conv])[0]
+
+    def get_conversation(self, conversation_id: int) -> ConversationDetail:
+        conv = self._owned(conversation_id)
+        rows = list(
+            self.session.scalars(
+                select(ConversationMessage)
+                .where(ConversationMessage.conversation_id == conv.id)
+                .order_by(ConversationMessage.id)
+            ).all()
+        )
+        return ConversationDetail(
+            conversation=self._summaries([conv])[0],
+            messages=self._messages_out(rows),
+        )
+
+    def _messages_out(self, rows: list[ConversationMessage]) -> list[Message]:
+        files = attachments_by_message(
+            self.session, [r.id for r in rows if r.sender_type == SenderType.USER]
+        )
+        return [message_out(r, files.get(r.id)) for r in rows]
+
+    # ---- message turn ---------------------------------------------------------------------------
+    def _history(self, conversation_id: int, before_id: int) -> list[ChatTurn]:
+        rows = self.session.scalars(
+            select(ConversationMessage)
+            .where(
+                ConversationMessage.conversation_id == conversation_id,
+                ConversationMessage.id < before_id,
+                ConversationMessage.sender_type != SenderType.SYSTEM,
+            )
+            .order_by(ConversationMessage.id.desc())
+            .limit(HISTORY_MESSAGES)
+        ).all()
+        return [
+            ChatTurn(role=r.sender_type.value, content=r.content[:HISTORY_MESSAGE_CHARS])  # type: ignore[arg-type]
+            for r in reversed(rows)
+        ]
+
+    def post_message(
+        self, conversation_id: int, content: str, attachment_ids: list[int] | None = None
+    ) -> TurnResponse:
+        conv = self._owned(conversation_id)
+        state = load_state(conv.state_json, conv.active_request_type)
+        # Validate the files BEFORE anything is written: a bad id must not create a message.
+        files = load_staged(self.session, self.user.id, conv.id, attachment_ids or [])
+
+        # The user's message is saved first, so it survives any later failure.
+        user_row = add_message(self.session, conv.id, SenderType.USER, content)
+        attach_to_message(self.session, files, user_row.id)
+        conv.status = ConversationStatus.ACTIVE
+        conv.updated_at = clock.utcnow()
+        self.session.commit()
+        user_out = message_out(user_row, [to_info(f) for f in files])
+
+        if files and not content.strip():
+            return self._file_only_reply(conv, user_out, len(files))
+
+        history = self._history(conv.id, before_id=user_row.id)
+        deps = ChatTurnDeps(
+            session=self.session,
+            llm=self.llm,
+            user_id=self.user.id,
+            user_email=self.user.email,
+            user_name=self.user.display_name,
+            today=clock.today_hk(),
+            attachments=build_attachment_inputs(files, self.settings.upload_dir),
+        )
+        started = time.perf_counter()
+        try:
+            result = run_turn(deps, state, content, history)
+        except Exception:
+            logger.exception("Chat turn failed unexpectedly")
+            self.session.rollback()
+            result = TurnResult(
+                reply=Reply(
+                    "Something went wrong on my side, so nothing was changed. "
+                    "Please try again in a moment.",
+                    warning_code="llm_unavailable",
+                ),
+                state=state,
+                trace=[
+                    TraceStep(
+                        step="respond",
+                        label="Turn failed",
+                        detail="unexpected error; conversation left unchanged",
+                        ok=False,
+                        duration_ms=int((time.perf_counter() - started) * 1000),
+                    )
+                ],
+            )
+        self.session.rollback()  # reads only so far; make sure no transaction is left open
+
+        for card_id in result.superseded:
+            set_card_state(self.session, conv.id, card_id, "superseded")
+        assistant_row = add_message(
+            self.session,
+            conv.id,
+            SenderType.ASSISTANT,
+            result.reply.text,
+            ui=result.reply.ui,
+            trace=result.trace,
+        )
+        if result.state_changed and not cas_save_state(
+            self.session, conv.id, state.state_version, result.state
+        ):
+            self.session.rollback()
+            raise ConversationConflict
+        conv.updated_at = clock.utcnow()
+        self.session.commit()
+
+        return TurnResponse(
+            conversation=self._summary(conv),
+            user_message=user_out,
+            assistant_messages=[message_out(assistant_row)],
+            warning_code=result.reply.warning_code,  # type: ignore[arg-type]
+        )
+
+    def _file_only_reply(self, conv: Conversation, user_out: Message, count: int) -> TurnResponse:
+        """A message with files but no text: nothing can be read yet, so answer deterministically
+        (no LLM call, no state change)."""
+        assistant_row = add_message(
+            self.session,
+            conv.id,
+            SenderType.ASSISTANT,
+            FILE_ONLY_REPLY,
+            trace=[
+                TraceStep(
+                    step="respond",
+                    label="File received",
+                    detail=f"{count} file(s) stored; document reading is not available yet",
+                    ok=True,
+                    duration_ms=0,
+                )
+            ],
+        )
+        conv.updated_at = clock.utcnow()
+        self.session.commit()
+        return TurnResponse(
+            conversation=self._summary(conv),
+            user_message=user_out,
+            assistant_messages=[message_out(assistant_row)],
+            warning_code=None,
+        )
+
+    # ---- card actions ------------------------------------------------------------------------
+    def post_action(self, conversation_id: int, card_id: str, action: str) -> TurnResponse:
+        conv = self._owned(conversation_id)
+        state: ConversationState = load_state(conv.state_json, conv.active_request_type)
+        card = state.open_card()
+        if card is None or card.card_id != card_id:
+            raise StaleCardError("This card is no longer active.")
+        actions = CardActions(self.session, self.adapter, self.user, conv, clock.today_hk())
+        result: ActionResult = (
+            actions.discard(state, card) if action == "discard" else actions.confirm(state, card)
+        )
+        return TurnResponse(
+            conversation=self._summary(conv),
+            user_message=None,
+            assistant_messages=[message_out(m) for m in result.messages],
+            warning_code=result.warning_code,  # type: ignore[arg-type]
+        )
+
+
+__all__ = ["ChatService", "ConversationConflict", "ConversationNotFound", "StaleCardError"]
+"""Persistence helpers for conversations: state compare-and-swap, messages and card states."""
+
+from typing import Any
+
+from pydantic import TypeAdapter, ValidationError
+from sqlalchemy import Integer, func, select, update
+from sqlalchemy.orm import Session
+
+from app.chat.policy import TITLE_MAX_CHARS
+from app.chat.state import ConversationState, dump_state
+from app.db.models import Conversation, ConversationMessage
+from app.domain.clock import utcnow
+from app.domain.enums import SenderType
+from app.schemas.chat import AttachmentInfo, ConfirmationCard, Message, TraceStep, UiCard
+
+_UI = TypeAdapter(UiCard)
+_TRACE = TypeAdapter(list[TraceStep])
+NEW_CHAT_TITLE = "New chat"
+
+
+def cas_save_state(
+    session: Session, conversation_id: int, expected_version: int, new_state: ConversationState
+) -> bool:
+    """Atomically replace ``state_json`` only if ``state_version`` is still ``expected_version``.
+
+    The UPDATE takes SQLite's write lock, so two concurrent confirms cannot both win: the loser
+    sees rowcount 0. ``new_state.state_version`` becomes ``expected_version + 1``.
+    """
+    new_state.state_version = expected_version + 1
+    current = func.coalesce(
+        func.json_extract(Conversation.state_json, "$.state_version", type_=Integer),
+        0,
+        type_=Integer,
+    )
+    result = session.execute(
+        update(Conversation)
+        .where(Conversation.id == conversation_id, current == expected_version)
+        .values(
+            state_json=dump_state(new_state),
+            active_request_type=new_state.active_request_type,
+            updated_at=utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
+
+
+def add_message(
+    session: Session,
+    conversation_id: int,
+    sender: SenderType,
+    content: str,
+    *,
+    ui: UiCard | None = None,
+    trace: list[TraceStep] | None = None,
+) -> ConversationMessage:
+    metadata: dict[str, Any] | None = None
+    if sender == SenderType.ASSISTANT:
+        metadata = {
+            "ui": ui.model_dump(mode="json") if ui is not None else None,
+            "trace": [t.model_dump(mode="json") for t in trace] if trace else None,
+        }
+    row = ConversationMessage(
+        conversation_id=conversation_id,
+        sender_type=sender,
+        content=content,
+        ui_metadata_json=metadata,
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def find_card_message(
+    session: Session, conversation_id: int, card_id: str
+) -> ConversationMessage | None:
+    rows = session.scalars(
+        select(ConversationMessage)
+        .where(
+            ConversationMessage.conversation_id == conversation_id,
+            ConversationMessage.sender_type == SenderType.ASSISTANT,
+        )
+        .order_by(ConversationMessage.id.desc())
+    )
+    for row in rows:
+        ui = (row.ui_metadata_json or {}).get("ui")
+        if (
+            isinstance(ui, dict)
+            and ui.get("type") == "confirmation_card"
+            and (ui.get("card_id") == card_id)
+        ):
+            return row
+    return None
+
+
+def set_card_state(session: Session, conversation_id: int, card_id: str, state: str) -> bool:
+    """Update the stored card (used / superseded / discarded) so reopening shows it correctly."""
+    row = find_card_message(session, conversation_id, card_id)
+    if row is None:
+        return False
+    metadata = dict(row.ui_metadata_json or {})
+    ui = dict(metadata["ui"])
+    ui["state"] = state
+    metadata["ui"] = ui
+    row.ui_metadata_json = metadata  # new object so the JSON column is marked dirty
+    return True
+
+
+def stored_card(session: Session, conversation_id: int, card_id: str) -> ConfirmationCard | None:
+    row = find_card_message(session, conversation_id, card_id)
+    if row is None:
+        return None
+    try:
+        card = _UI.validate_python((row.ui_metadata_json or {}).get("ui"))
+    except ValidationError:
+        return None
+    return card if isinstance(card, ConfirmationCard) else None
+
+
+def message_out(
+    row: ConversationMessage, attachments: list[AttachmentInfo] | None = None
+) -> Message:
+    """Serialise a stored message; legacy / unreadable ``ui_metadata_json`` yields no card.
+
+    ``attachments`` are the files of a user message (empty list otherwise)."""
+    meta = row.ui_metadata_json if isinstance(row.ui_metadata_json, dict) else {}
+    ui: UiCard | None = None
+    trace: list[TraceStep] | None = None
+    if row.sender_type == SenderType.ASSISTANT:
+        raw_ui = meta.get("ui")
+        if isinstance(raw_ui, dict):
+            try:
+                ui = _UI.validate_python(raw_ui)
+            except ValidationError:
+                ui = None
+        raw_trace = meta.get("trace")
+        if isinstance(raw_trace, list):
+            try:
+                trace = _TRACE.validate_python(raw_trace)
+            except ValidationError:
+                trace = None
+    return Message(
+        id=row.id,
+        sender_type=row.sender_type.value,
+        content=row.content,
+        created_at=row.created_at,
+        ui=ui,
+        trace=trace,
+        attachments=attachments or [],
+    )
+
+
+def make_title(first_user_message: str | None) -> str:
+    """First user message, whitespace collapsed, at most 60 characters."""
+    if not first_user_message or not first_user_message.strip():
+        return NEW_CHAT_TITLE
+    text = " ".join(first_user_message.split())
+    return text if len(text) <= TITLE_MAX_CHARS else text[: TITLE_MAX_CHARS - 1].rstrip() + "…"
+"""Chat API shapes (see docs/chat-api-contract.md). Timestamps are ISO-8601 UTC ending in ``Z``."""
+
+from datetime import UTC, datetime
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, Field, PlainSerializer
+
+from app.domain.enums import RequestType
+
+
+def iso_z(value: datetime) -> str:
+    """UTC timestamp with second precision and a trailing ``Z`` (naive values are taken as UTC)."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+IsoZ = Annotated[datetime, PlainSerializer(iso_z, return_type=str)]
+
+TraceStepName = Literal["understand", "merge", "validate", "decide", "submit", "status", "respond"]
+WarningCode = Literal["llm_unavailable", "llm_invalid_output", "submission_failed", "stale_card"]
+
+
+class TraceStep(BaseModel):
+    step: TraceStepName
+    label: str
+    detail: str = ""
+    ok: bool = True
+    duration_ms: int = 0
+
+
+class CardField(BaseModel):
+    key: str
+    label: str
+    value: str
+    old_value: str | None = None
+
+
+class ConfirmationCard(BaseModel):
+    type: Literal["confirmation_card"] = "confirmation_card"
+    card_id: str
+    action: Literal["create", "update", "cancel", "retry"]
+    request_type: RequestType
+    request_id: int | None = None
+    title: str
+    fields: list[CardField]
+    warnings: list[str] = Field(default_factory=list)
+    state: Literal["open", "used", "superseded", "discarded"] = "open"
+    confirm_label: Literal["Submit", "Save changes", "Cancel request", "Retry"]
+
+
+class StatusItem(BaseModel):
+    request_type: RequestType
+    id: int
+    status: str
+    status_label: str
+    summary: str
+    submitted_at: IsoZ | None = None
+    reviewed_at: IsoZ | None = None
+    reviewer_note: str | None = None
+    external_reference_id: str | None = None
+
+
+class StatusCard(BaseModel):
+    type: Literal["status_card"] = "status_card"
+    requests: list[StatusItem]
+    empty: bool = False
+
+
+class ResultCard(BaseModel):
+    type: Literal["result_card"] = "result_card"
+    outcome: Literal["submitted", "updated", "cancelled", "failed"]
+    request_type: RequestType
+    request_id: int
+    status: str
+    status_label: str
+    message: str
+    external_reference_id: str | None = None
+
+
+UiCard = Annotated[ConfirmationCard | StatusCard | ResultCard, Field(discriminator="type")]
+
+
+class AttachmentInfo(BaseModel):
+    id: int
+    filename: str
+    content_type: str
+    size_bytes: int
+    url: str  # /api/attachments/{id}
+    created_at: IsoZ
+
+
+class Message(BaseModel):
+    id: int
+    sender_type: Literal["user", "assistant", "system"]
+    content: str
+    created_at: IsoZ
+    ui: UiCard | None = None
+    trace: list[TraceStep] | None = None
+    attachments: list[AttachmentInfo] = Field(default_factory=list)  # user messages only
+
+
+class ConversationSummary(BaseModel):
+    id: int
+    title: str
+    status: Literal["active", "closed"]
+    active_request_type: RequestType | None = None
+    has_pending_card: bool = False
+    created_at: IsoZ
+    updated_at: IsoZ
+
+
+class ConversationList(BaseModel):
+    items: list[ConversationSummary]
+
+
+class ConversationDetail(BaseModel):
+    conversation: ConversationSummary
+    messages: list[Message]
+
+
+class TurnResponse(BaseModel):
+    conversation: ConversationSummary
+    user_message: Message | None = None
+    assistant_messages: list[Message]
+    warning_code: WarningCode | None = None
+
+
+class MessageBody(BaseModel):
+    # The upper bound comes from settings.chat_max_message_chars and is enforced in the route
+    # (422), so it can be configured without changing this schema.
+    # May be empty when at least one attachment is sent (checked in the route). Bounds come
+    # from settings (chat_max_message_chars, max_attachments_per_message) and give a 422.
+    content: str = ""
+    attachment_ids: list[int] = Field(default_factory=list)
+
+
+class ActionBody(BaseModel):
+    card_id: str = Field(min_length=1, max_length=64)
+    action: Literal["confirm", "discard"]
+
+
+STATUS_LABELS = {
+    "draft": "Draft",
+    "pending_approval": "Pending approval",
+    "submission_failed": "Submission failed",
+    "approved": "Approved",
+    "rejected": "Rejected",
+    "cancelled": "Cancelled",
+}
+"""Stand-ins used when a real provider cannot be built (missing key, bad config).
+
+They keep the API up: the chat then answers with a graceful "AI service unavailable" message
+and submissions are saved as ``submission_failed`` so the user can retry later.
+"""
+
+from app.integrations.base import ClaimSubmissionPayload, LeaveSubmissionPayload, SubmissionResult
+from app.llm.base import LLMError
+from app.llm.schemas import AgentTurn, LLMContext
+
+
+class UnavailableLLM:
+    name = "unavailable"
+    model = "none"
+
+    def analyse(self, user_message: str, context: LLMContext) -> AgentTurn:
+        raise LLMError("The LLM provider is not configured or could not be created")
+
+
+class UnavailableAdapter:
+    provider = "unavailable"
+
+    def _fail(self) -> SubmissionResult:
+        return SubmissionResult(
+            ok=False, error_message="The submission service is not configured on this server."
+        )
+
+    def submit_leave(self, payload: LeaveSubmissionPayload) -> SubmissionResult:
+        return self._fail()
+
+    def submit_claim(self, payload: ClaimSubmissionPayload) -> SubmissionResult:
+        return self._fail()

@@ -1,0 +1,500 @@
+# SCMP Internal Operations AI Assistant
+
+This repository contains a coding-assignment proof of concept for the AI Engineer (Internal Automation) role at South China Morning Post.
+
+Repository URL: <https://github.com/SDCC-Ken/scmp-ai-assignment-2026-ken-chan-kwan-wing.git>
+
+## Assignment objective
+
+The PoC provides a unified employee self-service chat experience for two internal operations workflows:
+
+- Leave Application
+- Staff Claim
+
+It demonstrates mock Google SSO, role-aware access, AI-assisted intent detection and structured field extraction, explicit confirmation before submission, mock enterprise API integration, approval workflows, and auditability.
+
+All accounts, requests, dates, policies, and records are fictional demonstration data. No real SCMP, employee, HR, or financial data is used.
+
+## Technology
+
+- Nuxt 4, TypeScript, and Tailwind CSS 4
+- Python FastAPI, Pydantic, and LangGraph
+- Google Gemini API with `gemini-3.8-flash` and low thinking
+- SQLite and SQLAlchemy
+- pytest, Playwright, and Docker Compose
+
+## Engineering documentation
+
+- [Agent engineering guide](AGENTS.md)
+- [Agentic coding prompt log](PROMPT-INSTRUCTION.md)
+- [Validation and business rules](docs/business-rules.md), [test cases](docs/test-cases.md)
+- [Chat API contract](docs/chat-api-contract.md), [Phase 3 approval design](docs/phase3-approval-design.md)
+- [Changing limits and approvers](docs/limits-and-routing.md)
+
+## Development status
+
+**Phases 0 to 3 are implemented:** foundation and Docker; database, seed data and mock Google sign-in with real JWT auth; the AI chat (leave and claims, confirmation cards, ReqRes submission, attachments and documents, status, change and cancel); and the approval workflow (departments, per-user approvers, leave balances, department claim limits, approver screens, reviewer note, audit events and the notification bell). Phase 4 is end-to-end testing and the live Gemini check.
+
+## What the assistant does
+
+- **Employees** (Amy, Ben, Daniel, and Cathy for her own requests) chat in plain English: leave and staff claims, half days, single days, status, balance ("how many annual leave days do I have left?"), change and cancel. Anything the AI reads is validated by the backend, and **nothing is saved or sent until the user presses Submit on a card**. The submission goes to `POST https://reqres.in/api/users` with only the specified fields (`email`, `leave_type` / `claim_type`, dates, `amount`); everything else stays in SQLite.
+- **Documents:** attach an image or PDF (5 MB, 3 files) such as a sick note or receipt; the AI fills the draft, tags values "from document", and asks for anything missing. Sample fictional files are in `backend/samples/`.
+- **Approvers** (Cathy and Helen for leave, Eva for claims) see only the pending requests assigned to them, with the requester's balance or the department budget, an over-limit warning, teammates on leave at the same time, attachments, and an optional note; approving or rejecting is confirmed and audited. Limits are shown but never block: the approver decides.
+- **Everyone** has a bell with unread notifications (new request, change or cancel for approvers; decision for requesters).
+- Rules and limits are listed in [docs/business-rules.md](docs/business-rules.md). Only the four employees can file requests; Helen and Eva have no approver configured, by design.
+
+## AI providers
+
+| Setting | Meaning |
+| --- | --- |
+| `LLM_PROVIDER=ollama` | Local models through Ollama (default model `gemma4:latest` for text and documents). No key, no quota. |
+| `LLM_PROVIDER=gemini` | Google Gemini `gemini-3.8-flash` (free tier has daily limits; see below). |
+| `LLM_FALLBACK_PROVIDER=ollama` | If the primary fails (bad key, quota, outage) the chat switches to the fallback automatically, with a short cooldown. |
+| `LLM_PROVIDER=fake` | Deterministic rules for offline development and tests only. |
+
+Run with local AI only, without editing `.env`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ollama.yml up --build
+```
+
+The containers reach Ollama on your machine through `host.docker.internal`; keep `ollama serve` running and `ollama pull gemma4:latest` done. The first request after a pause loads the model and can take about 30 seconds. Gemini limits apply per Google project (not per key) and the daily quota resets at midnight Pacific time; exact numbers are in Google AI Studio.
+
+## Deployment (Docker Compose)
+
+Prerequisite: Docker Desktop (or Docker Engine) with the Compose plugin. Use `docker compose`, not `docker-compose`.
+
+```bash
+cp .env.example .env      # then edit .env and fill in the secrets (see below)
+docker compose up --build
+```
+
+| Service | URL | Notes |
+| --- | --- | --- |
+| Frontend (Nuxt 4) | <http://localhost:9180> | Redirects to the mock Google sign-in (top-right prompt), then a role-aware home page |
+| Backend (FastAPI) | <http://localhost:9181/health> | Returns `{"status":"ok"}`; interactive docs at `/docs` |
+
+Useful commands:
+
+```bash
+docker compose up --build -d   # run in the background
+docker compose ps              # both services should be Up; api should be (healthy)
+docker compose logs -f         # follow logs
+docker compose down            # stop; add -v to also delete the SQLite volume
+```
+
+The `web` service waits for the `api` healthcheck. SQLite is stored in the named volume `api-data` (mounted at `/app/data`), so data survives restarts.
+
+### Configuration (`.env`)
+
+`.env` is git-ignored and must never be committed. `.env.example` documents every variable.
+
+| Variable | Purpose |
+| --- | --- |
+| `WEB_PORT` / `API_PORT` | Host ports for the frontend / backend (default `9180` / `9181`) |
+| `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_THINKING_LEVEL` | Gemini provider (used from Phase 1; `LLM_PROVIDER=fake` for offline runs) |
+| `REQRES_API_KEY`, `REQRES_BASE_URL` | Hosted ReqRes mock API; requires an `x-api-key` header |
+| `DB_AUTO_SEED` | Create tables and load the fictional demo data on startup when the database is empty (default `true`) |
+| `AUTH_COOKIE_SECURE`, `AUTH_COOKIE_NAME` | Session cookie flags. Set `AUTH_COOKIE_SECURE=true` when served over https (production mode forces it). If you change the name, the frontend's "session expired" notice still expects `scmp_session` |
+| `JWT_SECRET_KEY`, `JWT_EXPIRE_MINUTES`, `JWT_ISSUER` | JWT signing. Empty secret = random per-process secret in development (logins reset when the API restarts); production requires 32+ characters (`openssl rand -hex 32`) |
+| `MOCK_SSO_ENABLED` | Enables the mock Google sign-in endpoints (default `true`) |
+| `NUXT_PUBLIC_API_BASE` | Backend URL as seen by the browser |
+| `NUXT_PUBLIC_THEME_*` | Light and dark theme colours (see below) |
+
+Changing `.env` needs `docker compose up -d` again (recreate) to take effect. The theme and API base are read by Nuxt at runtime, so no image rebuild is needed for them.
+
+### Theme
+
+| Token | Light | Dark |
+| --- | --- | --- |
+| Primary | `#32a9e1` | `#7dd3fc` |
+| Secondary | `#1e40af` | `#94a3b8` |
+| Background | `#ffffff` | `#020617` |
+
+Values are set through `NUXT_PUBLIC_THEME_{LIGHT,DARK}_{PRIMARY,SECONDARY,BACKGROUND}` and exposed as CSS variables and Tailwind tokens (`bg-primary`, `text-secondary`, `bg-background`). Invalid hex values fall back to the defaults. The theme toggle on the page switches light, dark, or system.
+
+## Demo sign-in and seeded users
+
+Open <http://localhost:9180>. A Google One Tap-style prompt is always shown in the top-right corner of the login page (close it with the X or Escape, and reopen it with the **Sign in with Google** button). Pick an account to continue. This is a **mock** sign-in: the page says so, nothing is sent to Google, and choosing an account signs you in immediately as that fictional user (no password). Behind it the backend issues a real signed JWT.
+
+**Session cookie.** The JWT is delivered only in an `httpOnly`, `SameSite=Lax` cookie set by the API, so page scripts and browser storage never see it. The login response body contains no token. Writes (POST, PUT, PATCH, DELETE) must send `X-Requested-With: XMLHttpRequest` and, if an `Origin` header is present, it must be an allowed origin (a second defence against cross-site requests); the frontend does this automatically. The cookie is host-scoped, so it is shared by `localhost:9180` and `localhost:9181`. Deploying the web app and API on different hosts would need a same-origin reverse proxy, which is not part of this PoC. Disabling a user takes effect on the next request, because the API re-reads the user and role from the database every time.
+
+| User | Department | Role | Leave approver | Claim approver | Can do |
+| --- | --- | --- | --- | --- | --- |
+| Amy Lau, Ben Chow | IT | `employee` | Cathy Ng | Eva Cheung | Chat: leave and claims, status, balance, change, cancel |
+| Daniel Wong | HR | `employee` | Helen Yeung | Eva Cheung | Same as above |
+| Cathy Ng | HR | `hr_approver` | Helen Yeung | Eva Cheung | Chat for her own requests, and approves **IT department leave** |
+| Helen Yeung | HR (manager) | `hr_approver` | none | none | Approves **HR department leave** (Cathy, Daniel); no chat |
+| Eva Cheung | Finance | `finance_approver` | none | none | Approves **all claims**; no chat |
+
+Every requester has exactly one approver per request type, stored per user (see [docs/limits-and-routing.md](docs/limits-and-routing.md)). Emails are `firstname.lastname@example.com`.
+
+Auth API (mounted under `/api/auth`): `GET /mock-users`, `POST /mock-google/login`, `GET /me`, `POST /logout`. The backend re-reads the user and role from the database on every request, so the role inside the token is never trusted on its own. Details and error codes are in [backend/README.md](backend/README.md).
+
+## Database and seed data
+
+SQLite (WAL mode, foreign keys enforced) through SQLAlchemy, stored in the `api-data` volume. Tables: `departments`, `leave_entitlements`, `attachments`, `schema_meta`, `users`, `conversations`, `conversation_messages`, `leave_requests`, `claim_requests`, `external_submissions`, `notifications`, `audit_events`, `public_holidays`, `feedback`.
+
+| Seed data | Rows | Notes |
+| --- | ---: | --- |
+| Users | 6 | 3 employees, 2 HR approvers, 1 Finance approver (`@example.com`), 3 departments |
+| Leave requests | 10 | 2 pending, recent approved and rejected, the rest past history; half-day examples; one overlaps a colleague, one exceeds the annual balance |
+| Claim requests | 10 | Same mix, HKD amounts; one pending claim takes HR over its department limit |
+| Audit events | 15 | Creation, confirmation, API submission, a 429 failure then retry, approval, rejection |
+| Conversations | 3 | Short fictional chats |
+| Public holidays | 34 | Hong Kong 2026 and 2027 (17 each) |
+
+Also seeded: external-submission records, notifications for the pending and decided requests, department claim limits, leave entitlements (annual 15 and sick 10 days for 2026 and 2027, with small variations) and 2 feedback rows. Every seeded record is fictional.
+
+**Upgrading from an earlier phase:** Phase 3 changed the database schema (departments, approvers, and the reviewer note is now optional), so an existing database must be recreated once: `docker compose down -v` (or the reset command below). The API detects an old database, keeps running, and logs this instruction. Rebuild the demo data at any time:
+
+```bash
+docker compose exec api python -m app.cli seed --reset --yes   # drops and reseeds the database
+```
+
+**Request status flow** (enforced in the backend): `draft` → `pending_approval` (after confirmation and API submission) or `submission_failed` (retry allowed) → `approved` or `rejected`; `draft` and `submission_failed` can also be `cancelled`. Rejecting needs a reviewer note, and a reviewer cannot act on their own request. HR reviews Leave only; Finance reviews Claims only.
+
+**Half-day leave.** `leave_requests` has `start_day_part` and `end_day_part` (`full`, `am`, `pm`), and `working_days` is a decimal in 0.5 steps.
+
+| Request | start / end date | start_day_part / end_day_part | working_days |
+| --- | --- | --- | ---: |
+| Whole day | same date | `full` / `full` | 1 |
+| Half day, morning or afternoon | same date | `am` / `am` or `pm` / `pm` | 0.5 |
+| Several days, starting at noon | different dates | `pm` / `full` | first day counts 0.5 |
+| Several days, ending at noon | different dates | `full` / `am` | last day counts 0.5 |
+
+The working week is Monday to Friday, excluding Hong Kong public holidays. Those two optional fields are all the chat step needs to fill for "half day tomorrow afternoon".
+
+### Hong Kong public holidays: yearly update
+
+The 2026 and 2027 holidays are bundled from the official 1823 calendar (checked against the gov.hk holiday pages on 2026-09-25). 1823 publishes roughly three years ahead, so each year, once the new year appears, import it:
+
+```bash
+docker compose exec api python -m app.cli import-holidays --year 2028
+# local (no Docker), from backend/
+uv run python -m app.cli import-holidays --year 2028
+# offline, from a downloaded calendar file
+uv run python -m app.cli import-holidays --file path/to/en.ics --year 2028
+```
+
+The import is safe to re-run (it updates by date), and it stops with a clear message if the year is not yet published.
+
+## Testing
+
+Tests run locally, not inside Docker. Docker Compose is only used to run and demonstrate the stack.
+
+| What | Command | Where |
+| --- | --- | --- |
+| Backend unit tests (1,403, offline) | `cd backend && uv run pytest -q` | local |
+| Backend lint | `cd backend && uv run ruff check . && uv run ruff format --check .` | local |
+| Frontend lint, types, unit tests (123) | `cd frontend && bun run lint && bun run typecheck && bun run test` | local |
+| Full-stack smoke check | `docker compose -f docker-compose.yml -f docker-compose.ollama.yml up --build`, then open both URLs above | Docker |
+| Live AI check (opt-in) | `cd backend && RUN_LIVE_LLM=1 uv run python scripts/live_llm_smoke.py --provider ollama` (Gemini also needs `ALLOW_LIVE_GEMINI=1`) | local |
+
+Backend tests use in-memory or temporary SQLite databases, never read `.env`, and never call ReqRes or Gemini.
+
+## Local development (without Docker)
+
+Backend (Python 3.12 via `uv`):
+
+```bash
+cd backend
+uv sync
+uv run pytest -q
+uv run ruff check . && uv run ruff format --check .
+uv run uvicorn app.main:app --port 9181 --reload
+```
+
+Frontend (Bun):
+
+```bash
+cd frontend
+bun install
+bun run lint && bun run typecheck && bun run test
+bun run dev                    # http://localhost:9180
+```
+
+Both dev servers read the shared repo-root `.env`, which is optional for Phase 0.
+# Backend (FastAPI)
+
+Python 3.12 managed by `uv`. Run all commands from `backend/`. Backend port is 9181.
+All data is fictional (`@example.com` users, made-up requests).
+
+- Install: `uv sync`
+- Test: `uv run pytest -q` (offline; never reads the repo-root `.env`)
+- Lint: `uv run ruff check .` and `uv run ruff format --check .`
+- Run: `uv run uvicorn app.main:app --port 9181` then `curl localhost:9181/health`
+- Config: env vars from the repo-root `.env` (see `../.env.example`); the file may be absent.
+- Secrets (`GEMINI_API_KEY`, `REQRES_API_KEY`, `JWT_SECRET_KEY`) are `SecretStr` and never printed.
+
+## Layout
+
+| Path | Responsibility |
+| --- | --- |
+| `app/db/` | SQLAlchemy models, engine/session (SQLite pragmas), column types |
+| `app/domain/` | Pure rules: status state machine, roles, leave day maths (no DB/FastAPI) |
+| `app/schemas/` | Pydantic API and draft-input models |
+| `app/services/` | DB-aware helpers: audit trail, polymorphic-reference checks, holidays, approver routing, balances and budgets (`routing.py`, `balances.py`), CLI org changes (`org_admin.py`) |
+| `app/auth/` | JWT create/verify, `get_current_user`, `require_roles`, CSRF middleware |
+| `app/api/routes/` | HTTP routes, mounted under `/api` (`/health` stays at the root) |
+| `app/seed.py`, `app/cli.py` | Fictional demo data and the `python -m app.cli` tools |
+
+## Database
+
+SQLite through SQLAlchemy 2.x. Tables are created with `create_all` (no migrations). Every
+connection sets `foreign_keys=ON`, `busy_timeout=5000`, `synchronous=NORMAL` and, for file
+databases, `journal_mode=WAL`. Timestamps are timezone-aware UTC. Money and day counts are
+exact `Decimal` values stored as integers (never floats).
+
+On startup the API creates the tables and, when `DB_AUTO_SEED=true` and the `users` table is
+empty, loads the demo data. A startup failure is logged and does not stop the API.
+
+**Phase 3 needs a one-time database reset.** Phase 3 removed a CHECK constraint and added the
+organisation tables, which SQLite cannot do in place. New databases record `schema_version = 3`
+in the `schema_meta` table. If the API finds an older database it does not touch it: it logs one
+`ERROR` ("This database was created before Phase 3. Recreate it: docker compose down -v, or
+`python -m app.cli seed --reset --yes`"), still boots (`/health` works), and every endpoint that
+needs the database answers `503` with the same instruction in `detail`. The CLI commands print
+the same message and exit with 1.
+
+```bash
+uv run python -m app.cli init-db
+uv run python -m app.cli seed                 # idempotent; no-op if users exist
+uv run python -m app.cli seed --reset --yes   # DROP all tables, rebuild, reseed
+```
+
+## Auth (mock Google SSO + real JWT in an httpOnly cookie)
+
+| Endpoint | Result |
+| --- | --- |
+| `GET /api/auth/mock-users` | active seed users (no `google_subject`) |
+| `POST /api/auth/mock-google/login` `{"email": "..."}` | `{expires_in, user}` plus `Set-Cookie`; 401 `Invalid credentials`; 403 `Account is inactive` |
+| `GET /api/auth/me` (cookie or Bearer) | the user (see below); 401 `Invalid or expired token` with `WWW-Authenticate: Bearer` |
+| `POST /api/auth/logout` | always 204 and a cookie-clearing `Set-Cookie`; an `auth.logout` audit row only when a valid user is signed in |
+
+**Cookie.** Login sets `AUTH_COOKIE_NAME` (default `scmp_session`) to the JWT with
+`HttpOnly; SameSite=Lax; Path=/; Max-Age=<expires_in>` and no `Domain` (host-only). `Secure` is
+added when `AUTH_COOKIE_SECURE=true` or `APP_ENV=production`. Logout re-sends the same cookie
+(same name, path and attributes) with `Max-Age=0` and an epoch `Expires`.
+
+**Why the body has no token.** The browser (JavaScript, extensions, XSS, logs, devtools
+storage) must never handle the JWT, so it is not returned in JSON; only the API and the browser
+cookie jar see it.
+
+**Bearer still accepted.** Every authenticated route reads the JWT from the cookie, and also
+accepts `Authorization: Bearer <jwt>` for non-browser clients and tools (the header wins if both
+are sent). To get a token for such a client, read it from the `Set-Cookie` header, e.g.
+`curl -i -H 'X-Requested-With: XMLHttpRequest' -H 'Content-Type: application/json' -d '{"email":"amy.lau@example.com"}' localhost:9181/api/auth/mock-google/login`.
+
+**CSRF.** In addition to `SameSite=Lax`, every unsafe request (POST, PUT, PATCH, DELETE) under
+`/api`, login included, must send `X-Requested-With: XMLHttpRequest`, and an `Origin` header,
+when present, must be one of `CORS_ORIGINS`; otherwise 403 `{"detail": "CSRF check failed"}`
+(see `app/auth/csrf.py`). GET/HEAD/OPTIONS are exempt, so CORS preflights work. CORS allows
+`Authorization`, `Content-Type`, `Accept` and `X-Requested-With`, with credentials and the
+explicit origin list (never `*`).
+
+**Hosts.** Cookies are scoped to the host, not the port, so a cookie set by `localhost:9181` is
+also sent by the browser for `localhost:9180` requests (same site, so `SameSite=Lax` allows the
+`fetch(..., {credentials: "include"})` calls). If the frontend and API are on different hosts
+(for example `app.example.com` and `api.example.com`), the cookie will not be shared: serve both
+behind one same-origin reverse proxy (`/api` to the backend).
+
+Tokens are HS256 with `sub, email, role, iss, iat, exp, jti`. Only HS256 is accepted (`alg: none`
+is rejected). The user, role and `is_active` are re-read from the database on every request, so
+the token's role claim is informational only and disabling a user or changing their role takes
+effect immediately. There are no refresh tokens or server-side sessions: logout clears the cookie
+and a token copied elsewhere simply expires at `exp`. `MOCK_SSO_ENABLED=false` turns the mock
+endpoints into 404. With an empty `JWT_SECRET_KEY` a random per-process secret is used (a warning
+is logged); `APP_ENV=production` requires a secret of at least 32 characters.
+
+The user object (login, `/api/auth/me`, `/api/auth/mock-users`) is `{id, email, display_name,
+role, department: {id, name} | null, job_title, can_request, approves}`. `can_request` is true
+when at least one approver is configured for the user; `approves` is `"leave"` (HR approver),
+`"claim"` (Finance approver) or `null`. `mock-users` lists employees, then HR approvers, then
+the Finance approver, then by id.
+
+Seeded fictional users (all `@example.com`): `amy.lau@` and `ben.chow@` (IT employees),
+`cathy.ng@` (HR approver, HR Business Partner for IT), `daniel.wong@` (HR employee),
+`helen.yeung@` (HR approver, HR Manager), `eva.cheung@` (Finance approver). Amy and Ben have Cathy
+as leave approver, Cathy and Daniel have Helen; everybody has Eva as claim approver.
+
+## Organisation: approvers, leave balances, claim limits (Phase 3)
+
+Routing is **per user**: `users.leave_approver_user_id` and `users.claim_approver_user_id`
+(nullable). The approver is copied onto the request as `approver_user_id` when it is created and
+is the only person notified. A user with no approver for a request type cannot file it (the
+assistant explains and saves nothing); a user with none at all (`can_request` false: Helen and
+Eva in the seed) gets 403 from the chat and from `GET /api/me/balances`. `require_requester`
+(`app/auth`) implements that gate; `require_roles(UserRole.EMPLOYEE)` means "requester".
+
+- `app/services/routing.py`: `resolve_approver(session, user, request_type)` returns the approver
+  or an `ApproverProblem` (not configured, inactive, is the requester, wrong role).
+- `app/services/balances.py`: `leave_balance`, `leave_balances_for_user`, `leave_balance_after`,
+  `department_budget` (+ `budget_after`), `team_overlap`. Approved requests are deducted; pending
+  ones are shown separately; limits are shown, never blocking.
+- `GET /api/me/balances` returns `{"year": <current HK year>, "leave": [{leave_type,
+  entitled_days, approved_days, pending_days, remaining_days}]}` for annual and sick leave.
+- Change the data with `python -m app.cli show-org | set-entitlement | set-claim-limit |
+  set-approvers` (in Docker: `docker compose exec api python -m app.cli ...`). Full guide:
+  [`../docs/limits-and-routing.md`](../docs/limits-and-routing.md).
+
+## Approvals and notifications (Phase 3)
+
+The approver side of the workflow. Contract: [`../docs/phase3-approval-design.md`](../docs/phase3-approval-design.md)
+section 5; every rule with its tests: [`../docs/business-rules.md`](../docs/business-rules.md) section 4c.
+Code: `app/services/approvals.py`, `app/services/notifications.py`, routes
+`app/api/routes/approvals.py` and `notifications.py`, schemas `app/schemas/approvals.py` and
+`notifications.py`. Tests: `tests/approvals/` (offline, seeded in-memory database; the concurrency
+test uses a temporary file database).
+
+| Endpoint | Who | Result |
+| --- | --- | --- |
+| `GET /api/approvals` | `hr_approver` (leave) or `finance_approver` (claims) | `{"items": [...], "count": n}`: the caller's `pending_approval` requests, oldest submitted first, each with a summary and `flags` (`over_limit`, `team_overlap_count`, `has_attachments`). Others: `403` |
+| `GET /api/approvals/{request_type}/{id}` | the assigned approver | fields, attachments (with URLs), `limits` (leave balance or department budget after this request), `team_overlap`, `warnings`. `404` (one body) when unknown, not assigned to you, of the other type, or not pending |
+| `POST /api/approvals/{request_type}/{id}/decision` `{"decision": "approve" or "reject", "note": null or text}` | the assigned approver | `200 {"request_type", "id", "status", "reviewed_at"}`; `409` if it is no longer pending or another decision won; `422` for a bad decision or a note over 500 characters (the note is trimmed, empty becomes null, optional for both decisions) |
+| `GET /api/notifications?limit=20` | any signed-in user | `{"items": [...], "unread_count": n}`, the caller's own, newest first (`limit` 1 to 50) |
+| `POST /api/notifications/{id}/read`, `POST /api/notifications/read-all` | the owner | `204`; someone else's or an unknown id is `404`; both are idempotent |
+
+- **Per-user assignment.** An approver only ever sees requests whose `approver_user_id` is
+  theirs, and never their own. Being a `hr_approver` is not enough (Cathy does not see Helen's
+  staff). The decision goes through the domain rules (`can_decide`, the status machine).
+- **Limits are shown, never blocking.** An over-balance leave or over-budget claim can be
+  approved; the detail carries a sentence such as "Over the annual leave balance by 1.5 days. You
+  decide.". The request itself is excluded from "approved" and "pending other" and reported as
+  "requested". Money is a string with two decimals, days are numbers.
+- **One winner.** The decision is one conditional `UPDATE ... WHERE status = 'pending_approval'`
+  (the status change, the audit row and the notifications share one transaction, committed
+  together). Under two simultaneous decisions one gets `200`, the other `409` and writes nothing.
+- **Audit.** One `audit_events` row per decision (`request.approved` / `request.rejected`) with
+  `note_present`, `over_limit`, a `snapshot` of the numbers the approver saw, `team_overlap_count`
+  (leave) and `employee_id`. The note text is only on the request, never in the audit metadata.
+- **Notifications.** A row stores only recipient, event type and request. `title`, `body` and
+  `link` are composed when read from the row and the current request (plain text; no attachments,
+  no e-mail addresses), so no payload column is needed: the approver's name and the note of a
+  decision are read from `reviewed_by_user_id` / `reviewer_note` of the (final) request. `link` is
+  `/approvals/{type}/{id}` only for the assigned approver while the request is pending, else
+  `null`. Unknown or legacy event types get the neutral title "Update on leave request #12".
+  A decision creates `request.approved` / `request.rejected` for the requester and marks the
+  approver's own unread `request.submitted` / `request.updated` for that request as read.
+- **Attachments of a decided request.** Unchanged `can_download` rule: the owner always; the
+  assigned approver of the matching type while the request is `pending_approval`, `approved` or
+  `rejected` (so a file stays downloadable after the decision, although the approver's detail
+  page is then `404`); nobody else; not for `cancelled`, `draft` or `submission_failed`.
+- **Requester side.** After a decision the requester's balance (`GET /api/me/balances`) and the
+  department budget count the approved request only, the chat status card shows the reviewer note
+  of a rejected request, and the chat refuses to edit or cancel a decided request.
+
+## Chat: balances, approver awareness, stated dates (Phase 3-C)
+
+- **Leave balance on the card**: annual and sick leave cards carry `info` lines (year of the start
+  date; approved days deducted, pending shown but not deducted) and a `warning` line when over the
+  balance. Shown, never blocking. New intent `check_balance` ("how many annual leave days do I have
+  left?") answers with a `balance_card`; the backend writes every number (`app/chat/balance.py`).
+- **Approver awareness**: a new leave or claim is refused up front (no draft, no card) when the user
+  has no valid approver; the result message names the approver; status cards carry `approver_name`.
+- **Stated dates only**: a leave date or receipt date that the user never wrote is dropped
+  (`app/llm/dates.py`, used by the Ollama provider and by the graph merge), so "Claim HKD 180 for a
+  taxi" asks for the receipt date. A scripted test double may set `trust_dates = True` to skip the
+  merge guard. **HKD wording**: a bare `$`, `HK$`, `HKD$`, "dollars" and "HK dollars" are HKD
+  (`app/llm/currency.py`); `USD`, `US$` and "US dollars" are still rejected.
+- Rules: `../docs/business-rules.md` (L-13, L-14, C-06, C-11, section 4d); shapes:
+  `../docs/chat-api-contract.md`. Live check: `RUN_LIVE_LLM=1 uv run python scripts/live_llm_smoke.py
+  --provider ollama --only balance` (also `--only date`, `--only dollar`).
+
+## Public holidays
+
+Leave working days skip Saturdays, Sundays and rows in `public_holidays`. The seed loads 2026 and
+2027 from the bundled `app/data/hk_public_holidays_1823.ics` (snapshot of the official 1823.gov.hk
+iCal, fetched 2026-09-25), with source `seed_2026`.
+
+1823 publishes about three years ahead. Each year, once the next calendar appears:
+
+```bash
+uv run python -m app.cli import-holidays --year 2028
+# or from a downloaded file
+uv run python -m app.cli import-holidays --file path/to/en.ics --year 2028
+# inside Docker Compose
+docker compose exec api python -m app.cli import-holidays --year 2028
+```
+
+The command downloads `https://www.1823.gov.hk/common/ical/en.ics` (override with `--url`),
+upserts by date (safe to re-run, source `1823_ics`) and prints inserted/updated counts. If a
+requested year is not in the feed it exits non-zero with a message and changes nothing.
+
+## Attachments
+
+Employees can upload an image or a PDF to a conversation (a receipt, a sick note). The file is
+stored on disk under `UPLOAD_DIR` (default `./data/uploads`, the Docker volume), never as a
+blob in SQLite and never sent to ReqRes. Contract: `../docs/chat-api-contract.md`
+("Attachments (Phase 2b)"). Code: `app/services/attachments.py`,
+`app/api/routes/attachments.py`, table `attachments` (created by `create_all`, so an existing
+database only gains a new table).
+
+| Endpoint | Result |
+| --- | --- |
+| `POST /api/chat/conversations/{id}/attachments` (multipart field `file`, employee, CSRF header) | `201 {"attachment": {id, filename, content_type, size_bytes, url, created_at}}`; `413` too large, `415` unsupported or mismatching type, `422` empty / no field / more than 10 staged, `404` not your conversation, `403` wrong role |
+| `POST /api/chat/conversations/{id}/messages` `{"content", "attachment_ids": [..]}` | as before; `content` may be empty when 1-3 files are sent; every id must be your own staged upload of this conversation (else `422`) |
+| `GET /api/attachments/{id}` | the file, or `404` (same body for every refusal), `401` without a session |
+
+- **Type is decided by the bytes**, not by the name or the client's content type: JPEG, PNG,
+  WEBP, HEIC/HEIF (ISO-BMFF `ftyp` brand) and PDF (`%PDF-` in the first KB). A declared type that
+  contradicts the bytes is `415`. Everything else (SVG, HTML, EXE, ZIP, GIF, AVIF) is refused.
+- **Size:** `MAX_UPLOAD_MB` (default 5) per file, `MAX_ATTACHMENTS_PER_MESSAGE` (default 3). The
+  body is streamed with `python-multipart` and reading stops at the limit (a declared
+  `Content-Length` over the limit is refused before reading anything).
+- **Storage:** `UPLOAD_DIR/<yyyy>/<mm>/<uuid4hex>.<ext>` with the extension taken from the
+  sniffed type; directories `0700`, files `0600`; written to `UPLOAD_DIR/.incoming/` first and
+  moved with `os.replace`; removed again if the database insert fails. The user's file name is
+  kept only for display (path, control and bidi characters removed, at most 120 characters).
+- **Lifecycle:** *staged* (uploaded, `message_id` NULL, at most 10 per conversation) -> attached
+  to the user message that lists it -> linked to the request (`request_type` + `request_id`)
+  when the card is confirmed. `ConversationState.attachment_ids` (filled by the document-reading
+  step) says which files belong to the draft; `CardActions` calls `link_to_request` on create
+  and on update. `cleanup_staged_uploads(session, upload_dir)` deletes staged files older than
+  24 hours (a function only; nothing schedules it).
+- **Who can download:** the owner always. An approver only when the file is linked to a request
+  that has been submitted (`pending_approval`, `approved` or `rejected`), their role reviews
+  that type (HR: leave, Finance: claim) and it is assigned to them. Everyone else gets `404`.
+- **Response headers:** `Content-Type` from the stored type, `Content-Disposition: inline` with an
+  ASCII `filename` and a percent-encoded `filename*`, `X-Content-Type-Options: nosniff`,
+  `Cache-Control: private, no-store`, `Content-Security-Policy: sandbox`, plus the normal CORS
+  headers (explicit origin, credentials).
+- **Turn input:** a message with files runs the graph with `ChatTurnDeps`
+  (`app/chat/turn_input.py`): `TurnDeps` plus `attachments: list[AttachmentInput]` (id, filename,
+  content type, size and the bytes). The graph reads them (see "Documents" below); a message
+  with files and no text is valid.
+- Tests: `tests/attachments/` (offline; each test uses its own temporary `UPLOAD_DIR`).
+
+## Documents
+
+A message with files runs `provider.analyse(text, context, attachments)` (an empty text becomes
+"The user attached a document with no message."). The provider only READS the files
+(`AgentTurn.documents`, one `DocumentExtraction` each); the backend decides the rest in the
+graph node `documents` (`app/agent/graph.py`) and the merge helpers in `app/chat/documents.py`:
+
+- A readable sick note fills a **sick leave** (`rest_start_date`, `rest_end_date`); a readable
+  receipt fills a **claim** (amount, currency as printed, receipt date, suggested claim type).
+  `days_advised` never becomes an end date: the last day is asked.
+- **Typed values win**: what the user typed in the message or earlier in the draft is never
+  overwritten; a different document value becomes a card warning naming the field and both
+  values. Fields read from a document are remembered in `ConversationState.sources` and tagged
+  `source: "document"` on the card. (In the update flow the stored request values are not
+  "typed", so a document may change them; the card shows old and new and still needs Confirm.)
+- **Missing or unreadable** values get a deterministic question naming the file ("I could not
+  read the receipt date on receipt.png. What date is on the receipt?"), one at a time. A file
+  that cannot be read and comes with no other information: type the details or upload a clearer
+  file. A receipt during a leave draft (or the reverse) asks which one is meant and keeps the
+  document in `ConversationState.held_document` until answered; the two are never mixed.
+- A different name on the document is a card warning ("The name on the document (...) differs
+  from your name; your approver will see this."), never a block.
+- The draft's files are `ConversationState.attachment_ids` (accumulate, at most 3 per request,
+  cleared by discard / supersede / a new draft) and are shown as `card.attachments`. On Confirm
+  they are linked to the created or updated request (`link_to_request`). The provider's
+  extraction is stored in `attachments.extraction_json` (only `DocumentExtraction` fields).
+- Text inside a document is data: nothing in it can approve, submit, change the employee or
+  skip validation. The normal validation and the explicit Confirm always apply.
+- Trace: a `documents` step ("Read 1 document: receipt (readable)", duration, and the answering
+  provider when the provider exposes `last_served_by`); no names, values or file names. With
+  documents the model's rationale is left out of the trace.
+- Tests: `tests/chat/test_documents.py` (scripted provider plus the real `FakeLLMProvider` on
+  `samples/*.fake.pdf`, all offline).

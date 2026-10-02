@@ -1,0 +1,1134 @@
+import type {
+  AttachmentInfo,
+  ConversationDetail,
+  ConversationList,
+  ConversationSummary,
+  Message,
+  TurnResponse,
+} from '~/types/chat'
+
+interface ChatError {
+  text: string
+  /** Set when the failed step can be repeated with the Retry button. */
+  retry: (() => Promise<void>) | null
+}
+
+/**
+ * Chat state and actions for the signed-in employee. Every call goes through `useApi` (session cookie, CSRF
+ * header, 401 sign-out). Responses for a conversation the user has already left are ignored for the thread
+ * but still update the sidebar summary.
+ */
+export function useChat() {
+  const api = useApi()
+
+  const conversations = ref<ConversationSummary[]>([])
+  const activeId = ref<number | null>(null)
+  const messages = ref<Message[]>([])
+  const draft = ref('')
+
+  const initialising = ref(true)
+  const loadingThread = ref(false)
+  /** A message turn is in flight (shows "Thinking..."). */
+  const sending = ref(false)
+  /** The card whose action is in flight, with the decision (shows the card's loading state). */
+  const acting = ref<{ cardId: string, decision: 'confirm' | 'discard' } | null>(null)
+
+  /** Files picked for the next message (uploaded as soon as they are added). */
+  const staged = ref<StagedFile[]>([])
+  /** Validation messages for files that were refused before uploading. */
+  const attachmentErrors = ref<string[]>([])
+
+  const error = ref<ChatError | null>(null)
+  const warning = ref<string | null>(null)
+  const notice = ref<string | null>(null)
+
+  let tempSeq = 0
+  let loadToken = 0
+  let stagedSeq = 0
+
+  const active = computed(() => conversations.value.find(c => c.id === activeId.value) ?? null)
+  const busy = computed(() => sending.value || acting.value !== null)
+  const uploading = computed(() => isUploading(staged.value))
+  const sendable = computed(() => canSendMessage(draft.value, staged.value, busy.value))
+
+  function clearFeedback() {
+    error.value = null
+    warning.value = null
+    notice.value = null
+  }
+
+  function fail(cause: unknown, action: ChatAction, retry: (() => Promise<void>) | null = null) {
+    error.value = { text: chatErrorMessage(extractStatus(cause), action), retry }
+  }
+
+  function upsert(summary: ConversationSummary) {
+    conversations.value = upsertConversation(conversations.value, summary)
+  }
+
+  /** Loads a conversation's messages (restoring open cards) and makes it the active one. */
+  async function openConversation(id: number) {
+    const token = ++loadToken
+    activeId.value = id
+    loadingThread.value = true
+    messages.value = []
+    draft.value = ''
+    discardStaged()
+    clearFeedback()
+    try {
+      const detail = await api<ConversationDetail>(`/api/chat/conversations/${id}`)
+      if (token !== loadToken) return
+      messages.value = reconcileCards(mergeMessages([], detail.messages), { hasPendingCard: detail.conversation.has_pending_card })
+      upsert(detail.conversation)
+    }
+    catch (cause) {
+      if (token !== loadToken) return
+      fail(cause, 'load', () => openConversation(id))
+    }
+    finally {
+      if (token === loadToken) loadingThread.value = false
+    }
+  }
+
+  async function createConversation() {
+    const summary = await api<ConversationSummary>('/api/chat/conversations', { method: 'POST' })
+    upsert(summary)
+    return summary
+  }
+
+  /** Fetches the list, opens the most recent conversation or creates the first one. */
+  async function init() {
+    initialising.value = true
+    error.value = null
+    try {
+      const list = await api<ConversationList>('/api/chat/conversations')
+      conversations.value = sortConversations(list.items)
+      const first = conversations.value[0] ?? await createConversation()
+      await openConversation(first.id)
+    }
+    catch (cause) {
+      fail(cause, 'load', init)
+    }
+    finally {
+      initialising.value = false
+    }
+  }
+
+  /** Starts a new chat; an untouched empty chat is reused instead of piling up blank conversations. */
+  async function newChat() {
+    if (busy.value) return
+    if (isEmptyConversation(active.value ?? undefined, messages.value) && !loadingThread.value) {
+      clearFeedback()
+      return
+    }
+    clearFeedback()
+    try {
+      const summary = await createConversation()
+      await openConversation(summary.id)
+    }
+    catch (cause) {
+      fail(cause, 'load', newChat)
+    }
+  }
+
+  async function select(id: number) {
+    if (id === activeId.value || busy.value) return
+    await openConversation(id)
+  }
+
+  function revokePreview(item: StagedFile) {
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
+  }
+
+  /** Drops every staged file (leaving the conversation, or after a successful send). */
+  function discardStaged() {
+    for (const item of staged.value) revokePreview(item)
+    staged.value = []
+    attachmentErrors.value = []
+  }
+
+  function removeFile(localId: string) {
+    const item = staged.value.find(f => f.localId === localId)
+    if (item) revokePreview(item)
+    staged.value = removeStaged(staged.value, localId)
+  }
+
+  function dismissAttachmentErrors() {
+    attachmentErrors.value = []
+  }
+
+  /** Uploads one staged file to the active conversation; a stale result (chat switched, chip removed) is ignored. */
+  async function uploadFile(localId: string, conversationId: number) {
+    const item = staged.value.find(f => f.localId === localId)
+    if (!item) return
+    const form = new FormData() // no Content-Type header: the browser adds the multipart boundary
+    form.append('file', item.file, item.name)
+    try {
+      const res = await api<{ attachment: AttachmentInfo }>(`/api/chat/conversations/${conversationId}/attachments`, {
+        method: 'POST',
+        body: form,
+      })
+      if (activeId.value === conversationId) staged.value = markUploaded(staged.value, localId, res.attachment)
+    }
+    catch (cause) {
+      if (activeId.value === conversationId) staged.value = markUploadFailed(staged.value, localId, uploadErrorMessage(extractStatus(cause)))
+    }
+  }
+
+  /** Validates picked, dropped or pasted files, stages the valid ones and uploads them. */
+  async function addFiles(files: File[]) {
+    if (!files.length || busy.value) return
+    attachmentErrors.value = []
+    const { accepted, errors } = validateSelection(files, staged.value.length)
+    attachmentErrors.value = errors
+    if (!accepted.length) return
+    let conversationId = activeId.value
+    if (conversationId === null) {
+      try {
+        conversationId = (await createConversation()).id
+        activeId.value = conversationId
+      }
+      catch (cause) {
+        fail(cause, 'load')
+        return
+      }
+    }
+    const added = accepted.map(({ file, mime }) => {
+      // HEIC often has no browser type: give the upload the resolved one so the server sees a matching type.
+      const normalised = file.type === mime ? file : new File([file], file.name, { type: mime })
+      const previewUrl = mime.startsWith('image/') ? URL.createObjectURL(normalised) : null
+      return newStagedFile(`f${++stagedSeq}`, normalised, file.name, mime, previewUrl)
+    })
+    staged.value = [...staged.value, ...added]
+    const id = conversationId
+    await Promise.all(added.map(item => uploadFile(item.localId, id)))
+  }
+
+  async function retryUpload(localId: string) {
+    if (activeId.value === null) return
+    staged.value = markRetrying(staged.value, localId)
+    await uploadFile(localId, activeId.value)
+  }
+
+  async function send(text?: string) {
+    const content = (text ?? draft.value).trim()
+    const ready = staged.value
+    if (!canSendMessage(content, ready, busy.value) || activeId.value === null) return
+    const conversationId = activeId.value
+    const tempId = -(++tempSeq)
+    const attachmentIds = uploadedIds(ready)
+    const attachments = ready.flatMap(f => (f.attachment ? [f.attachment] : []))
+    clearFeedback()
+    attachmentErrors.value = []
+    messages.value = mergeMessages(messages.value, [optimisticMessage(tempId, content, new Date(), attachments)])
+    draft.value = ''
+    staged.value = [] // moved into the message; restored below if the send fails
+    sending.value = true
+    try {
+      const turn = await api<TurnResponse>(`/api/chat/conversations/${conversationId}/messages`, {
+        method: 'POST',
+        body: attachmentIds.length ? { content, attachment_ids: attachmentIds } : { content },
+      })
+      for (const item of ready) revokePreview(item)
+      upsert(turn.conversation)
+      if (activeId.value !== conversationId) return
+      messages.value = reconcileCards(applyTurn(messages.value, tempId, turn), { hasPendingCard: turn.conversation.has_pending_card })
+      warning.value = warningMessage(turn.warning_code)
+    }
+    catch (cause) {
+      if (activeId.value !== conversationId) {
+        for (const item of ready) revokePreview(item)
+        return
+      }
+      messages.value = messages.value.filter(m => m.id !== tempId)
+      if (!draft.value) draft.value = content // keep the text so nothing is lost
+      if (!staged.value.length) staged.value = ready // and the files
+      else for (const item of ready) revokePreview(item)
+      fail(cause, 'send', () => send())
+    }
+    finally {
+      sending.value = false
+    }
+  }
+
+  async function cardAction(cardId: string, decision: 'confirm' | 'discard') {
+    if (busy.value || activeId.value === null) return
+    const conversationId = activeId.value
+    clearFeedback()
+    acting.value = { cardId, decision }
+    try {
+      const turn = await api<TurnResponse>(`/api/chat/conversations/${conversationId}/actions`, {
+        method: 'POST',
+        body: { card_id: cardId, action: decision },
+      })
+      upsert(turn.conversation)
+      if (activeId.value !== conversationId) return
+      // A failed submission answers with a fresh (retry) card; the acted card is then used either way.
+      messages.value = reconcileCards(applyTurn(messages.value, null, turn), {
+        hasPendingCard: turn.conversation.has_pending_card,
+        acted: { cardId, state: decision === 'confirm' ? 'used' : 'discarded' },
+      })
+      warning.value = warningMessage(turn.warning_code)
+    }
+    catch (cause) {
+      if (activeId.value !== conversationId) return
+      if (extractStatus(cause) === 409) {
+        // Stale card: the server is the source of truth, so reload it and explain.
+        acting.value = null
+        await openConversation(conversationId)
+        notice.value = chatErrorMessage(409, 'card')
+        return
+      }
+      fail(cause, 'card', () => cardAction(cardId, decision))
+    }
+    finally {
+      acting.value = null
+    }
+  }
+
+  function dismissWarning() {
+    warning.value = null
+  }
+
+  function dismissNotice() {
+    notice.value = null
+  }
+
+  function dismissError() {
+    error.value = null
+  }
+
+  /** Re-runs the failed step (send, card action or load). */
+  async function retry() {
+    const step = error.value?.retry
+    if (!step) return
+    error.value = null
+    await step()
+  }
+
+  return {
+    conversations,
+    activeId,
+    active,
+    messages,
+    draft,
+    initialising,
+    loadingThread,
+    sending,
+    acting,
+    busy,
+    staged,
+    attachmentErrors,
+    uploading,
+    sendable,
+    error,
+    warning,
+    notice,
+    init,
+    newChat,
+    select,
+    send,
+    addFiles,
+    removeFile,
+    retryUpload,
+    dismissAttachmentErrors,
+    cardAction,
+    retry,
+    dismissWarning,
+    dismissNotice,
+    dismissError,
+  }
+}
+/** Types for the Phase 2 chat API (see docs/chat-api-contract.md). All data is fictional. */
+/* Card payload types carry a "Data" suffix so they never shadow the Vue components of the same name. */
+
+export type RequestType = 'leave' | 'claim'
+
+export interface ConversationSummary {
+  id: number
+  /** First user message (max 60 chars); "New chat" while empty. */
+  title: string
+  status: 'active' | 'closed'
+  /** Form currently being filled. */
+  active_request_type: RequestType | null
+  /** An open confirmation card is waiting. */
+  has_pending_card: boolean
+  created_at: string
+  updated_at: string
+}
+
+/** `(string & {})` keeps autocomplete for the known steps while tolerating names added by a newer backend. */
+export type TraceStepKey = 'understand' | 'documents' | 'merge' | 'validate' | 'decide' | 'submit' | 'status' | 'respond' | (string & {})
+
+export interface TraceStep {
+  step: TraceStepKey
+  label: string
+  detail: string
+  ok: boolean
+  duration_ms: number
+}
+
+export type CardState = 'open' | 'used' | 'superseded' | 'discarded'
+export type CardAction = 'create' | 'update' | 'cancel' | 'retry'
+
+/** A staged or sent file (Phase 2b). `url` is relative to the API base; fetch it with credentials. */
+export interface AttachmentInfo {
+  id: number
+  filename: string
+  content_type: string
+  size_bytes: number
+  url: string
+  created_at: string
+}
+
+export interface CardField {
+  key: string
+  label: string
+  value: string
+  /** Only on updates: the previous value, shown as a struck-through diff. */
+  old_value: string | null
+  /** "document" when the value was read from an attachment. */
+  source?: 'document' | null
+}
+
+/** A line of context on a confirmation card (Phase 3), for example the leave balance. A plain string is tolerated. */
+export type InfoTone = 'info' | 'warning'
+export interface InfoLine {
+  label: string
+  value: string
+  tone: InfoTone
+}
+
+export interface ConfirmationCardData {
+  type: 'confirmation_card'
+  card_id: string
+  action: CardAction
+  request_type: RequestType
+  request_id: number | null
+  title: string
+  fields: CardField[]
+  warnings: string[]
+  state: CardState
+  confirm_label: string
+  /** Extra context lines (Phase 3): shown above the buttons. Objects per the design doc; plain strings are tolerated. */
+  info?: (InfoLine | string)[] | null
+  /** Documents that will be linked to the request (Phase 2b). */
+  attachments?: AttachmentInfo[]
+}
+
+export type RequestStatus = 'draft' | 'pending_approval' | 'submission_failed' | 'approved' | 'rejected' | 'cancelled'
+
+export interface StatusRequest {
+  request_type: RequestType
+  id: number
+  status: RequestStatus
+  status_label: string
+  summary: string
+  submitted_at: string | null
+  reviewed_at: string | null
+  reviewer_note: string | null
+  external_reference_id: string | null
+}
+
+export interface StatusCardData {
+  type: 'status_card'
+  requests: StatusRequest[]
+  empty: boolean
+}
+
+export type ResultOutcome = 'submitted' | 'updated' | 'cancelled' | 'failed'
+
+export interface ResultCardData {
+  type: 'result_card'
+  outcome: ResultOutcome
+  request_type: RequestType
+  request_id: number
+  status: RequestStatus
+  status_label: string
+  message: string
+  external_reference_id: string | null
+}
+
+/** One leave type's balance for a year (days in 0.5 steps). */
+export interface BalanceLine {
+  leave_type: string
+  entitled_days: number
+  approved_days: number
+  pending_days: number
+  remaining_days: number
+}
+
+export interface BalanceCardData {
+  type: 'balance_card'
+  year: number
+  lines: BalanceLine[]
+}
+
+export type MessageUi = ConfirmationCardData | StatusCardData | ResultCardData | BalanceCardData
+
+export interface Message {
+  id: number
+  sender_type: 'user' | 'assistant' | 'system'
+  /** Plain text: always render as text, never as HTML. */
+  content: string
+  created_at: string
+  ui: MessageUi | null
+  trace: TraceStep[] | null
+  /** Files on a user message (Phase 2b); may be absent on older payloads. */
+  attachments?: AttachmentInfo[]
+}
+
+export type WarningCode = 'llm_unavailable' | 'llm_invalid_output' | 'submission_failed' | 'stale_card'
+
+export interface TurnResponse {
+  conversation: ConversationSummary
+  user_message: Message | null
+  assistant_messages: Message[]
+  warning_code: WarningCode | null
+}
+
+export interface ConversationDetail {
+  conversation: ConversationSummary
+  messages: Message[]
+}
+
+export interface ConversationList {
+  items: ConversationSummary[]
+}
+/** Pure, framework-free chat helpers (unit-tested offline in tests/chat.test.ts). */
+import type {
+  AttachmentInfo,
+  CardAction,
+  CardField,
+  CardState,
+  ConfirmationCardData,
+  ConversationSummary,
+  Message,
+  RequestStatus,
+  ResultOutcome,
+  TurnResponse,
+  WarningCode,
+} from '../types/chat'
+
+export const MAX_MESSAGE_LENGTH = 1000
+
+/** Suggestion chips of the empty state; picking one sends it as a message. */
+export const CHAT_SUGGESTIONS: readonly string[] = [
+  'I need annual leave next Monday and Tuesday',
+  'Half day sick leave tomorrow afternoon',
+  'Claim HKD 180 for a taxi yesterday',
+  'What is the status of my requests?',
+]
+
+/* ---- Status badges: colour is never the only cue (each tone has an icon and a text label) ---- */
+
+export type Tone = 'amber' | 'green' | 'red' | 'grey'
+export type IconName = 'clock' | 'check' | 'x' | 'alert' | 'ban' | 'pencil'
+
+export interface StatusMeta {
+  label: string
+  tone: Tone
+  icon: IconName
+}
+
+const STATUS_META: Readonly<Record<RequestStatus, StatusMeta>> = {
+  draft: { label: 'Draft', tone: 'grey', icon: 'pencil' },
+  pending_approval: { label: 'Pending approval', tone: 'amber', icon: 'clock' },
+  submission_failed: { label: 'Submission failed', tone: 'red', icon: 'alert' },
+  approved: { label: 'Approved', tone: 'green', icon: 'check' },
+  rejected: { label: 'Rejected', tone: 'red', icon: 'x' },
+  cancelled: { label: 'Cancelled', tone: 'grey', icon: 'ban' },
+}
+
+/** Label, tone and icon for a request status; unknown statuses fall back to a neutral badge. */
+export function statusMeta(status: string, fallbackLabel?: string): StatusMeta {
+  const known = (STATUS_META as Record<string, StatusMeta | undefined>)[status]
+  if (known) return known
+  return { label: fallbackLabel || 'Unknown status', tone: 'grey', icon: 'clock' }
+}
+
+/** CSS class for a tone (palette defined in main.css, contrast >= 4.5:1 in both themes). */
+export function toneClass(tone: Tone): string {
+  return `tone tone-${tone}`
+}
+
+const OUTCOME_META: Readonly<Record<ResultOutcome, { label: string, tone: Tone, icon: IconName }>> = {
+  submitted: { label: 'Submitted', tone: 'green', icon: 'check' },
+  updated: { label: 'Updated', tone: 'green', icon: 'check' },
+  cancelled: { label: 'Cancelled', tone: 'grey', icon: 'ban' },
+  failed: { label: 'Submission failed', tone: 'red', icon: 'alert' },
+}
+
+export function outcomeMeta(outcome: string) {
+  return (OUTCOME_META as Record<string, (typeof OUTCOME_META)[ResultOutcome] | undefined>)[outcome]
+    ?? { label: 'Done', tone: 'grey' as Tone, icon: 'check' as IconName }
+}
+
+const CARD_STATE_META: Readonly<Record<Exclude<CardState, 'open'>, { label: string, tone: Tone, icon: IconName }>> = {
+  used: { label: 'Confirmed', tone: 'green', icon: 'check' },
+  superseded: { label: 'Replaced by a newer card', tone: 'grey', icon: 'ban' },
+  discarded: { label: 'Discarded', tone: 'grey', icon: 'x' },
+}
+
+export function cardStateMeta(state: string) {
+  return (CARD_STATE_META as Record<string, (typeof CARD_STATE_META)[keyof typeof CARD_STATE_META] | undefined>)[state]
+    ?? { label: 'Closed', tone: 'grey' as Tone, icon: 'ban' as IconName }
+}
+
+/** Text of the loading state while a card action runs (the required "API loading state"). */
+export function cardBusyLabel(action: CardAction, decision: 'confirm' | 'discard'): string {
+  if (decision === 'discard') return 'Discarding...'
+  return action === 'cancel' ? 'Cancelling request...' : 'Submitting to ReqRes...'
+}
+
+/* ---- Time ---- */
+
+const MINUTE = 60_000
+const HOUR = 60 * MINUTE
+const DAY = 24 * HOUR
+
+/** "just now", "5 min ago", "3 h ago", "yesterday", "4 d ago", then the ISO date. Bad input gives "". */
+export function relativeTime(iso: string, now: number = Date.now()): string {
+  const then = Date.parse(iso)
+  if (Number.isNaN(then)) return ''
+  const diff = now - then
+  if (diff < MINUTE) return 'just now' // includes small clock skew into the future
+  if (diff < HOUR) return `${Math.floor(diff / MINUTE)} min ago`
+  if (diff < DAY) return `${Math.floor(diff / HOUR)} h ago`
+  if (diff < 2 * DAY) return 'yesterday'
+  if (diff < 7 * DAY) return `${Math.floor(diff / DAY)} d ago`
+  return new Date(then).toISOString().slice(0, 10)
+}
+
+/** Clock time of a message, e.g. "11:05". `timeZone` is only passed by tests. */
+export function formatClock(iso: string, timeZone?: string): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone })
+}
+
+/** Date and time for cards, e.g. "25 Sep 2026, 11:05". */
+export function formatDateTime(iso: string | null | undefined, timeZone?: string): string {
+  if (!iso) return ''
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone,
+  })
+}
+
+/** "640 ms" or "1.2 s". */
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return ''
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  return `${(ms / 1000).toFixed(1)} s`
+}
+
+/* ---- Card fields ---- */
+
+/** Value to show for a card field; blank values become an en dash. */
+export function fieldValue(value: string | null | undefined): string {
+  const text = (value ?? '').trim()
+  return text || '–'
+}
+
+/** True when a field carries a real change (an old value that differs from the new one). */
+export function fieldHasDiff(field: CardField): boolean {
+  return field.old_value !== null && field.old_value !== undefined && field.old_value !== field.value
+}
+
+/* ---- Conversations ---- */
+
+export function sortConversations(list: readonly ConversationSummary[]): ConversationSummary[] {
+  return [...list].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at) || b.id - a.id)
+}
+
+/** Inserts or replaces a summary and keeps the list newest-first. */
+export function upsertConversation(list: readonly ConversationSummary[], summary: ConversationSummary): ConversationSummary[] {
+  return sortConversations([...list.filter(c => c.id !== summary.id), summary])
+}
+
+export interface ConversationBadge {
+  kind: 'card' | 'form'
+  label: string
+}
+
+/** Badges for the sidebar: an open card and/or the form type being filled. */
+export function conversationBadges(summary: ConversationSummary): ConversationBadge[] {
+  const badges: ConversationBadge[] = []
+  if (summary.has_pending_card) badges.push({ kind: 'card', label: 'Awaiting confirmation' })
+  if (summary.active_request_type) {
+    badges.push({ kind: 'form', label: summary.active_request_type === 'leave' ? 'Leave form' : 'Claim form' })
+  }
+  return badges
+}
+
+/** A conversation the user has not typed into yet (safe to reuse instead of creating another). */
+export function isEmptyConversation(summary: ConversationSummary | undefined, messages: readonly Message[]): boolean {
+  return !!summary && messages.length === 0 && !summary.has_pending_card && !summary.active_request_type
+}
+
+/* ---- Messages ---- */
+
+function byTime(a: Message, b: Message): number {
+  return Date.parse(a.created_at) - Date.parse(b.created_at) || a.id - b.id
+}
+
+/** Merges messages by id (incoming wins) and orders them oldest-first. Optimistic (negative-id) messages stay last on ties. */
+export function mergeMessages(existing: readonly Message[], incoming: readonly Message[]): Message[] {
+  const byId = new Map<number, Message>()
+  for (const message of [...existing, ...incoming]) byId.set(message.id, message)
+  return [...byId.values()].sort(byTime)
+}
+
+/** Placeholder for the user's message while the request is in flight (negative id = not yet saved). */
+export function optimisticMessage(tempId: number, content: string, now: Date = new Date(), attachments: AttachmentInfo[] = []): Message {
+  return { id: tempId, sender_type: 'user', content, created_at: now.toISOString(), ui: null, trace: null, attachments }
+}
+
+export function isOptimistic(message: Message): boolean {
+  return message.id < 0
+}
+
+/** Applies a TurnResponse: drops the optimistic message, merges the saved ones (user message first). */
+export function applyTurn(messages: readonly Message[], tempId: number | null, turn: TurnResponse): Message[] {
+  const kept = tempId === null ? messages : messages.filter(m => m.id !== tempId)
+  const incoming = [...(turn.user_message ? [turn.user_message] : []), ...turn.assistant_messages]
+  return mergeMessages(kept, incoming)
+}
+
+function isOpenCard(message: Message): boolean {
+  return message.ui?.type === 'confirmation_card' && message.ui.state === 'open'
+}
+
+function withCardState(message: Message, state: CardState): Message {
+  if (message.ui?.type !== 'confirmation_card') return message
+  const ui: ConfirmationCardData = { ...message.ui, state }
+  return { ...message, ui }
+}
+
+/**
+ * Keeps card states consistent with the contract: only the newest confirmation card can be open, and no card
+ * is open when the conversation has no pending card. `acted` records the decision the user just took.
+ */
+export function reconcileCards(
+  messages: readonly Message[],
+  opts: { hasPendingCard: boolean, acted?: { cardId: string, state: CardState } },
+): Message[] {
+  let next = messages.map(m =>
+    opts.acted && m.ui?.type === 'confirmation_card' && m.ui.card_id === opts.acted.cardId
+      ? withCardState(m, opts.acted.state)
+      : m,
+  )
+  const openIndexes = next.flatMap((m, i) => (isOpenCard(m) ? [i] : []))
+  const last = openIndexes[openIndexes.length - 1]
+  next = next.map((m, i) => {
+    if (!isOpenCard(m)) return m
+    return i === last && opts.hasPendingCard ? m : withCardState(m, 'superseded')
+  })
+  return next
+}
+
+/** True when the newest message is one the user has not seen the answer to (used to decide auto-scroll). */
+export function lastMessageIsUser(messages: readonly Message[]): boolean {
+  return messages[messages.length - 1]?.sender_type === 'user'
+}
+
+/** Text spoken by the aria-live region for a new assistant message. */
+export function announcementFor(message: Message): string {
+  const parts = [message.content.trim()]
+  if (message.ui?.type === 'confirmation_card' && message.ui.state === 'open') {
+    parts.push(`${message.ui.title}. Use the ${message.ui.confirm_label} button or Discard.`)
+  }
+  else if (message.ui?.type === 'status_card') {
+    parts.push(message.ui.requests.length ? `${message.ui.requests.length} request(s) listed.` : 'No matching requests.')
+  }
+  else if (message.ui?.type === 'result_card') {
+    parts.push(message.ui.message)
+  }
+  else if (message.ui?.type === 'balance_card') {
+    parts.push(`Leave balance for ${message.ui.year}: ${message.ui.lines.length} leave type(s) shown.`)
+  }
+  return parts.filter(Boolean).join(' ')
+}
+
+/* ---- Composer ---- */
+
+/** True when the trimmed text is 1..1000 characters (the backend counts the trimmed text) and no turn is in flight. */
+export function canSend(text: string, busy: boolean): boolean {
+  const length = text.trim().length
+  return !busy && length > 0 && length <= MAX_MESSAGE_LENGTH
+}
+
+/** Characters left, counting the trimmed text like the backend does (negative = over the limit). */
+export function remainingChars(text: string): number {
+  return MAX_MESSAGE_LENGTH - text.trim().length
+}
+
+/** True when the scroll position is within `threshold` px of the bottom (so auto-scroll may follow new messages). */
+export function isNearBottom(metrics: { scrollTop: number, scrollHeight: number, clientHeight: number }, threshold = 80): boolean {
+  return metrics.scrollHeight - metrics.scrollTop - metrics.clientHeight <= threshold
+}
+
+/* ---- Errors ---- */
+
+export type ChatAction = 'load' | 'send' | 'card'
+
+/** User-facing message for a chat API failure (never echoes server text). `status` undefined = network error. */
+export function chatErrorMessage(status: number | undefined, action: ChatAction): string {
+  if (status === undefined) return 'Cannot reach the server. Check your connection and try again.'
+  if (status === 403) return 'The chat is available to employees only.'
+  if (status === 404) return 'That conversation could not be found.'
+  if (status === 409) return 'That card is out of date.'
+  if (status === 422) return action === 'send' ? 'That message could not be sent. Keep it between 1 and 1000 characters.' : 'That request was not accepted.'
+  if (status === 429) return 'Too many requests. Please wait a moment and try again.'
+  if (status >= 500) return 'The server had a problem. Please try again in a moment.'
+  return 'Something went wrong. Please try again.'
+}
+
+const WARNING_MESSAGES: Readonly<Record<WarningCode, string>> = {
+  llm_unavailable: 'The AI service is unavailable, please try again.',
+  llm_invalid_output: 'The AI gave an answer I could not use. Please rephrase and try again.',
+  submission_failed: 'The submission to ReqRes failed. Your request is saved; use Retry on the card to try again.',
+  stale_card: 'That card is out of date.',
+}
+
+/** Banner text for a `warning_code`; null when there is nothing to show (or an unknown code). */
+export function warningMessage(code: string | null | undefined): string | null {
+  if (!code) return null
+  return (WARNING_MESSAGES as Record<string, string | undefined>)[code] ?? 'Something needs your attention. Please try again.'
+}
+<script setup lang="ts">
+import type { Message } from '~/types/chat'
+
+const props = defineProps<{
+  conversationId: number | null
+  messages: Message[]
+  loading: boolean
+  sending: boolean
+  acting: { cardId: string, decision: 'confirm' | 'discard' } | null
+  busy: boolean
+}>()
+const emit = defineEmits<{
+  action: [cardId: string, decision: 'confirm' | 'discard']
+  suggest: [text: string]
+}>()
+
+const scroller = ref<HTMLElement | null>(null)
+/** True while the view follows new messages; turns false as soon as the user scrolls up. */
+const following = ref(true)
+const announcement = ref('')
+
+// Instant (not smooth) on purpose: a smooth scroll fires scroll events that would look like the user scrolling up.
+function scrollToBottom() {
+  const el = scroller.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function onScroll() {
+  const el = scroller.value
+  if (el) following.value = isNearBottom(el)
+}
+
+function jumpToLatest() {
+  following.value = true
+  scrollToBottom()
+}
+
+// A different conversation: start at the bottom and stay silent (only NEW assistant messages are announced).
+watch(() => props.conversationId, () => {
+  following.value = true
+  announcement.value = ''
+})
+
+// Messages that are on screen when a conversation finishes loading are not "new".
+let announcedUpTo = 0
+watch(() => props.loading, (loading) => {
+  if (!loading) announcedUpTo = props.messages.reduce((max, m) => Math.max(max, m.id), 0)
+}, { immediate: true })
+
+watch(() => props.messages, async (list, previous) => {
+  if (props.loading) return
+  const fresh = list.filter(m => m.sender_type === 'assistant' && m.id > announcedUpTo)
+  if (fresh.length && previous.length) {
+    announcement.value = fresh.map(announcementFor).join(' ')
+  }
+  announcedUpTo = Math.max(announcedUpTo, ...list.map(m => m.id))
+  // Own message: always show it. Otherwise only follow when the user has not scrolled up.
+  if (lastMessageIsUser(list)) following.value = true
+  await nextTick()
+  if (following.value) scrollToBottom()
+})
+
+watch(() => [props.loading, props.sending, props.acting], async () => {
+  await nextTick()
+  if (following.value) scrollToBottom()
+})
+
+const isEmpty = computed(() => !props.loading && props.messages.length === 0)
+</script>
+
+<template>
+  <div class="relative min-h-0 flex-1">
+    <div
+      ref="scroller"
+      class="h-full overflow-y-auto overscroll-contain px-3 py-4 sm:px-5"
+      tabindex="0"
+      role="region"
+      aria-label="Conversation messages"
+      @scroll.passive="onScroll"
+    >
+      <div v-if="loading" class="flex h-full items-center justify-center gap-2 text-sm" role="status">
+        <IconGlyph name="spinner" class="h-4 w-4" />
+        Loading conversation...
+      </div>
+
+      <div v-else-if="isEmpty" class="mx-auto flex h-full max-w-xl flex-col items-center justify-center gap-4 py-6 text-center">
+        <span class="flex h-12 w-12 items-center justify-center rounded-full border border-secondary/40" aria-hidden="true">
+          <IconGlyph name="chat" class="h-6 w-6" />
+        </span>
+        <div>
+          <h2 class="text-lg font-semibold">
+            How can I help today?
+          </h2>
+          <p class="mt-1 text-sm opacity-90">
+            Tell me in your own words about a leave application or a staff claim. I will ask for anything missing
+            and show a card to confirm before anything is submitted.
+          </p>
+        </div>
+        <SuggestionChips :disabled="busy" @pick="text => emit('suggest', text)" />
+      </div>
+
+      <ol v-else class="mx-auto flex max-w-3xl flex-col gap-4" aria-label="Messages">
+        <ChatMessage
+          v-for="message in messages"
+          :key="message.id"
+          :message="message"
+          :pending="acting"
+          :locked="busy"
+          @action="(id, decision) => emit('action', id, decision)"
+        />
+        <li v-if="sending" class="flex items-start" role="status">
+          <span class="inline-flex items-center gap-2 rounded-2xl rounded-bl-md border border-secondary/30 bg-secondary/5 px-3.5 py-2 text-sm">
+            <span class="flex items-center gap-1" aria-hidden="true"><span class="chat-dot" /><span class="chat-dot" /><span class="chat-dot" /></span>
+            Thinking...
+          </span>
+        </li>
+      </ol>
+    </div>
+
+    <button
+      v-if="!following && messages.length"
+      type="button"
+      class="focus-ring absolute bottom-3 left-1/2 inline-flex -translate-x-1/2 items-center gap-1 rounded-full bg-secondary px-3 py-1.5 text-xs font-semibold text-background shadow-md hover:opacity-90"
+      @click="jumpToLatest"
+    >
+      <IconGlyph name="down" class="h-3.5 w-3.5" />
+      Jump to latest
+    </button>
+
+    <div class="sr-only" aria-live="polite" aria-atomic="true">
+      {{ announcement }}
+    </div>
+  </div>
+</template>
+<script setup lang="ts">
+import type { Message } from '~/types/chat'
+
+defineProps<{
+  message: Message
+  /** Decision in flight for a card of this message (only ever set for that card). */
+  pending: { cardId: string, decision: 'confirm' | 'discard' } | null
+  /** A turn or card action is running: card buttons are disabled. */
+  locked: boolean
+}>()
+defineEmits<{ action: [cardId: string, decision: 'confirm' | 'discard'] }>()
+</script>
+
+<template>
+  <li v-if="message.sender_type === 'system'" class="flex justify-center">
+    <p class="chat-text rounded-full border border-secondary/30 px-3 py-1 text-center text-xs">
+      {{ message.content }}
+    </p>
+  </li>
+
+  <li v-else-if="message.sender_type === 'user'" class="flex flex-col items-end">
+    <ul v-if="message.attachments?.length" class="mb-1 flex max-w-[85%] flex-wrap justify-end gap-2" aria-label="Attached files">
+      <li v-for="attachment in message.attachments" :key="attachment.id" class="max-w-full">
+        <AttachmentItem :attachment="attachment" />
+      </li>
+    </ul>
+    <p
+      v-if="message.content.trim()"
+      class="chat-text max-w-[85%] rounded-2xl rounded-br-md bg-secondary px-3.5 py-2 text-sm text-background"
+      :class="isOptimistic(message) ? 'opacity-80' : ''"
+    >
+      {{ message.content }}
+    </p>
+    <p class="mt-0.5 px-1 text-xs opacity-80">
+      <span v-if="isOptimistic(message)">Sending...</span>
+      <time v-else :datetime="message.created_at">{{ formatClock(message.created_at) }}</time>
+    </p>
+  </li>
+
+  <li v-else class="flex flex-col items-start">
+    <p
+      v-if="message.content.trim()"
+      class="chat-text max-w-[85%] rounded-2xl rounded-bl-md border border-secondary/30 bg-secondary/5 px-3.5 py-2 text-sm"
+    >
+      <span class="sr-only">Assistant: </span>{{ message.content }}
+    </p>
+    <div v-if="message.ui" class="mt-2 w-full max-w-[min(100%,34rem)]">
+      <ConfirmationCard
+        v-if="message.ui.type === 'confirmation_card'"
+        :card="message.ui"
+        :pending="pending && pending.cardId === message.ui.card_id ? pending.decision : null"
+        :locked="locked"
+        @action="(id, decision) => $emit('action', id, decision)"
+      />
+      <StatusCard v-else-if="message.ui.type === 'status_card'" :card="message.ui" />
+      <ResultCard v-else-if="message.ui.type === 'result_card'" :card="message.ui" />
+      <BalanceCard v-else-if="message.ui.type === 'balance_card'" :card="message.ui" />
+    </div>
+    <TraceDisclosure v-if="message.trace && message.trace.length" :steps="message.trace" />
+    <p class="mt-0.5 px-1 text-xs opacity-80">
+      <time :datetime="message.created_at">{{ formatClock(message.created_at) }}</time>
+    </p>
+  </li>
+</template>
+<script setup lang="ts">
+import type { ConfirmationCardData } from '~/types/chat'
+
+const props = defineProps<{
+  card: ConfirmationCardData
+  /** The action in flight for THIS card, if any. */
+  pending: 'confirm' | 'discard' | null
+  /** Any turn or card action is running elsewhere: buttons stay disabled. */
+  locked: boolean
+}>()
+defineEmits<{ action: [cardId: string, decision: 'confirm' | 'discard'] }>()
+
+const isOpen = computed(() => props.card.state === 'open')
+const stateMeta = computed(() => cardStateMeta(props.card.state))
+const disabled = computed(() => props.locked || props.pending !== null)
+const infoLines = computed(() => normalizeInfoLines(props.card.info))
+const titleId = computed(() => `card-title-${props.card.card_id}`)
+</script>
+
+<template>
+  <section
+    class="rounded-xl border p-3"
+    :class="isOpen ? 'border-secondary/60 bg-background shadow-sm' : 'border-dashed border-secondary/30 bg-secondary/5'"
+    :aria-labelledby="titleId"
+    :aria-busy="pending !== null"
+  >
+    <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+      <h3 :id="titleId" class="text-sm font-semibold">
+        {{ card.title }}
+      </h3>
+      <span
+        v-if="!isOpen"
+        class="inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-semibold"
+        :class="toneClass(stateMeta.tone)"
+      >
+        <IconGlyph :name="stateMeta.icon" class="h-3.5 w-3.5 shrink-0" />
+        {{ stateMeta.label }}
+      </span>
+    </div>
+
+    <dl class="mt-2 divide-y divide-secondary/15 text-sm">
+      <div v-for="field in card.fields" :key="field.key" class="grid grid-cols-[minmax(0,7rem)_1fr] gap-x-3 py-1.5">
+        <dt class="font-medium opacity-90">
+          {{ field.label }}
+        </dt>
+        <dd class="chat-text min-w-0">
+          <template v-if="fieldHasDiff(field)">
+            <del class="opacity-80">{{ fieldValue(field.old_value) }}</del>
+            <span class="sr-only"> changed to </span>
+            <span aria-hidden="true"> &rarr; </span>
+            <ins class="font-semibold no-underline">{{ fieldValue(field.value) }}</ins>
+          </template>
+          <template v-else>
+            {{ fieldValue(field.value) }}
+          </template>
+          <span
+            v-if="field.source === 'document'"
+            class="ml-1.5 inline-flex items-center gap-1 whitespace-nowrap rounded-full px-1.5 py-0.5 align-middle text-xs font-semibold"
+            :class="toneClass('grey')"
+          >
+            <IconGlyph name="file" class="h-3 w-3 shrink-0" />
+            from document
+          </span>
+        </dd>
+      </div>
+    </dl>
+
+    <div v-if="card.attachments?.length" class="mt-2 border-t border-secondary/15 pt-2">
+      <p class="text-xs font-medium">
+        Attached documents that will be sent to your approver with the request
+      </p>
+      <ul class="mt-1.5 flex flex-wrap gap-2" aria-label="Attached documents">
+        <li v-for="attachment in card.attachments" :key="attachment.id" class="max-w-full">
+          <AttachmentItem :attachment="attachment" size="small" />
+        </li>
+      </ul>
+    </div>
+
+    <div
+      v-for="(warning, index) in card.warnings"
+      :key="index"
+      class="mt-2 flex items-start gap-2 rounded-lg px-2.5 py-2 text-xs"
+      :class="toneClass('amber')"
+      role="note"
+    >
+      <IconGlyph name="alert" class="mt-0.5 h-4 w-4 shrink-0" />
+      <span class="chat-text"><span class="font-semibold">Note: </span>{{ warning }}</span>
+    </div>
+
+    <ul v-if="infoLines.length" class="mt-2 space-y-1.5" aria-label="More information">
+      <li
+        v-for="(line, index) in infoLines"
+        :key="index"
+        class="flex items-start gap-2 rounded-lg px-2.5 py-2 text-xs"
+        :class="toneClass(line.tone === 'warning' ? 'amber' : 'grey')"
+      >
+        <IconGlyph :name="line.tone === 'warning' ? 'alert' : 'info'" class="mt-0.5 h-4 w-4 shrink-0" />
+        <span class="chat-text"><span v-if="line.label" class="font-semibold">{{ line.label }}: </span>{{ line.value }}</span>
+      </li>
+    </ul>
+
+    <template v-if="isOpen">
+      <div class="mt-3 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          class="focus-ring inline-flex min-h-10 items-center gap-2 rounded-lg bg-secondary px-4 py-2 text-sm font-semibold text-background hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+          :disabled="disabled"
+          @click="$emit('action', card.card_id, 'confirm')"
+        >
+          <IconGlyph v-if="pending === 'confirm'" name="spinner" class="h-4 w-4" />
+          {{ pending === 'confirm' ? cardBusyLabel(card.action, 'confirm') : card.confirm_label }}
+        </button>
+        <button
+          type="button"
+          class="focus-ring inline-flex min-h-10 items-center gap-2 rounded-lg border border-secondary/50 px-4 py-2 text-sm font-medium hover:bg-secondary/10 disabled:cursor-not-allowed disabled:opacity-60"
+          :disabled="disabled"
+          @click="$emit('action', card.card_id, 'discard')"
+        >
+          <IconGlyph v-if="pending === 'discard'" name="spinner" class="h-4 w-4" />
+          {{ pending === 'discard' ? cardBusyLabel(card.action, 'discard') : 'Discard' }}
+        </button>
+      </div>
+      <p class="mt-2 text-xs opacity-90">
+        Or just keep typing to change something.
+      </p>
+      <p v-if="pending" class="sr-only" role="status">
+        {{ cardBusyLabel(card.action, pending) }}
+      </p>
+    </template>
+  </section>
+</template>

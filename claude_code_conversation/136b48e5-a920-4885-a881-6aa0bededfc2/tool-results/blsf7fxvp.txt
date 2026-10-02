@@ -1,0 +1,854 @@
+=== app/db/models.py
+"""SQLAlchemy models. Persistence only: business rules live in ``app.domain``.
+
+Polymorphic references (deliberately NO foreign key, because one column points at either
+``leave_requests`` or ``claim_requests`` depending on a type column):
+
+* ``external_submissions.request_type`` + ``request_id``
+* ``notifications.request_type`` + ``request_id``
+* ``audit_events.entity_type`` + ``entity_id``
+
+The service layer (``app.services.references``) validates these before writing.
+
+Money and day counts are exact ``Decimal`` values (see ``app.db.types.ScaledDecimal``);
+all timestamps are timezone-aware UTC.
+"""
+
+from datetime import date, datetime
+from decimal import Decimal
+from enum import StrEnum
+from typing import Any, ClassVar
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    Date,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.base import Base
+from app.db.types import ScaledDecimal, UTCDateTime
+from app.domain.clock import utcnow
+from app.domain.enums import (
+    ClaimType,
+    ConversationStatus,
+    DayPart,
+    HolidaySource,
+    LeaveType,
+    RequestStatus,
+    RequestType,
+    SenderType,
+    SubmissionStatus,
+    UserRole,
+)
+
+
+def enum_col(enum_cls: type[StrEnum], name: str) -> Enum:
+    """VARCHAR + CHECK constraint (no native enum); stores the enum *values*."""
+    return Enum(
+        enum_cls,
+        name=name,
+        native_enum=False,
+        create_constraint=True,
+        length=max(len(m.value) for m in enum_cls),
+        values_callable=lambda cls: [m.value for m in cls],
+    )
+
+
+_REVIEW_CHECKS = (
+    "status != 'rejected' OR reviewer_note IS NOT NULL",
+    "status NOT IN ('approved', 'rejected') "
+    "OR (reviewed_by_user_id IS NOT NULL AND reviewed_at IS NOT NULL)",
+)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    google_subject: Mapped[str] = mapped_column(String(128), unique=True)
+    email: Mapped[str] = mapped_column(String(254), unique=True)
+    display_name: Mapped[str] = mapped_column(String(120))
+    role: Mapped[UserRole] = mapped_column(enum_col(UserRole, "role"))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[ConversationStatus] = mapped_column(
+        enum_col(ConversationStatus, "status"), default=ConversationStatus.ACTIVE
+    )
+    active_request_type: Mapped[RequestType | None] = mapped_column(
+        enum_col(RequestType, "active_request_type"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
+
+    messages: Mapped[list["ConversationMessage"]] = relationship(
+        back_populates="conversation",
+        order_by="ConversationMessage.id",
+        cascade="all, delete-orphan",
+    )
+
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id"), index=True)
+    sender_type: Mapped[SenderType] = mapped_column(enum_col(SenderType, "sender_type"))
+    content: Mapped[str] = mapped_column(Text)
+    ui_metadata_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+    conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+class LeaveRequest(Base):
+    __tablename__ = "leave_requests"
+    __table_args__ = (
+        CheckConstraint("end_date >= start_date", name="date_order"),
+        CheckConstraint("working_days > 0", name="working_days_positive"),
+        CheckConstraint("calendar_days > 0", name="calendar_days_positive"),
+        CheckConstraint("required_approver_role = 'hr_approver'", name="approver_is_hr"),
+        CheckConstraint(_REVIEW_CHECKS[0], name="reject_needs_note"),
+        CheckConstraint(_REVIEW_CHECKS[1], name="review_needs_reviewer"),
+        Index("ix_leave_requests_employee_id_status", "employee_id", "status"),
+    )
+    request_type: ClassVar[RequestType] = RequestType.LEAVE
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    leave_type: Mapped[LeaveType] = mapped_column(enum_col(LeaveType, "leave_type"))
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date] = mapped_column(Date)
+    start_day_part: Mapped[DayPart] = mapped_column(
+        enum_col(DayPart, "start_day_part"), default=DayPart.FULL
+    )
+    end_day_part: Mapped[DayPart] = mapped_column(
+        enum_col(DayPart, "end_day_part"), default=DayPart.FULL
+    )
+    calendar_days: Mapped[Decimal] = mapped_column(ScaledDecimal(1))
+    working_days: Mapped[Decimal] = mapped_column(ScaledDecimal(1))
+    status: Mapped[RequestStatus] = mapped_column(
+        enum_col(RequestStatus, "status"), default=RequestStatus.DRAFT
+    )
+    required_approver_role: Mapped[UserRole] = mapped_column(
+        enum_col(UserRole, "required_approver_role"), default=UserRole.HR_APPROVER
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    reviewed_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    reviewer_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
+
+
+class ClaimRequest(Base):
+    __tablename__ = "claim_requests"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="amount_positive"),
+        CheckConstraint("required_approver_role = 'finance_approver'", name="approver_is_finance"),
+        CheckConstraint(_REVIEW_CHECKS[0], name="reject_needs_note"),
+        CheckConstraint(_REVIEW_CHECKS[1], name="review_needs_reviewer"),
+        Index("ix_claim_requests_employee_id_status", "employee_id", "status"),
+    )
+    request_type: ClassVar[RequestType] = RequestType.CLAIM
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    claim_type: Mapped[ClaimType] = mapped_column(enum_col(ClaimType, "claim_type"))
+    amount: Mapped[Decimal] = mapped_column(ScaledDecimal(2))
+    currency: Mapped[str] = mapped_column(String(3), default="HKD", server_default="HKD")
+    receipt_date: Mapped[date] = mapped_column(Date)
+    status: Mapped[RequestStatus] = mapped_column(
+        enum_col(RequestStatus, "status"), default=RequestStatus.DRAFT
+    )
+    required_approver_role: Mapped[UserRole] = mapped_column(
+        enum_col(UserRole, "required_approver_role"), default=UserRole.FINANCE_APPROVER
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    reviewed_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    reviewer_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
+
+
+class ExternalSubmission(Base):
+    """One attempt to send a request to the mock API. ``request_id`` is polymorphic (no FK)."""
+
+    __tablename__ = "external_submissions"
+    __table_args__ = (Index("ix_external_submissions_request", "request_type", "request_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    request_type: Mapped[RequestType] = mapped_column(enum_col(RequestType, "request_type"))
+    request_id: Mapped[int] = mapped_column(Integer)
+    provider: Mapped[str] = mapped_column(String(32), default="reqres")
+    status: Mapped[SubmissionStatus] = mapped_column(enum_col(SubmissionStatus, "status"))
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    external_reference_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    response_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class Notification(Base):
+    """In-app notification. ``request_id`` is polymorphic (no FK)."""
+
+    __tablename__ = "notifications"
+    __table_args__ = (
+        Index("ix_notifications_recipient_user_id_read_at", "recipient_user_id", "read_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    recipient_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    event_type: Mapped[str] = mapped_column(String(64))
+    request_type: Mapped[RequestType] = mapped_column(enum_col(RequestType, "request_type"))
+    request_id: Mapped[int] = mapped_column(Integer)
+    read_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class AuditEvent(Base):
+    """Append-only audit trail. ``entity_id`` is polymorphic (no FK) and NULL for events that
+    have no entity (e.g. a login attempt for an unknown e-mail); ``actor_user_id`` is NULL
+    for failed logins and system actions."""
+
+    __tablename__ = "audit_events"
+    __table_args__ = (Index("ix_audit_events_entity", "entity_type", "entity_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    entity_type: Mapped[str] = mapped_column(String(32))
+    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    event_type: Mapped[str] = mapped_column(String(64))
+    from_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    to_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class PublicHoliday(Base):
+    __tablename__ = "public_holidays"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    holiday_date: Mapped[date] = mapped_column(Date, unique=True)
+    name: Mapped[str] = mapped_column(String(200))
+    source: Mapped[HolidaySource] = mapped_column(enum_col(HolidaySource, "source"))
+    source_updated_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+    __table_args__ = (CheckConstraint("rating BETWEEN 1 AND 5", name="rating_range"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    conversation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("conversations.id"), nullable=True, index=True
+    )
+    rating: Mapped[int] = mapped_column(Integer)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+=== app/db/base.py
+from sqlalchemy import MetaData
+from sqlalchemy.orm import DeclarativeBase
+
+NAMING_CONVENTION = {
+    "ix": "ix_%(column_0_label)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
+
+class Base(DeclarativeBase):
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
+=== app/db/session.py
+"""Engine factory, SQLite safety pragmas, ``init_db`` and the ``get_db`` dependency."""
+
+import logging
+from collections.abc import Iterator
+from functools import cached_property
+from pathlib import Path
+from typing import Any
+
+from fastapi import Request
+from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.db.base import Base
+
+logger = logging.getLogger(__name__)
+
+BUSY_TIMEOUT_MS = 5000
+
+
+def _is_memory(database: str | None) -> bool:
+    return database in (None, "", ":memory:") or bool(
+        database and database.startswith("file::memory:")
+    )
+
+
+def _set_sqlite_pragmas(dbapi_connection: Any, in_memory: bool) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        if not in_memory:
+            cursor.execute("PRAGMA journal_mode=WAL")
+    finally:
+        cursor.close()
+
+
+def create_db_engine(url: str) -> Engine:
+    """Create a SQLite engine with safety pragmas applied on every connection."""
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "sqlite":
+        raise ValueError("Only SQLite database URLs are supported")
+    in_memory = _is_memory(parsed.database)
+    kwargs: dict[str, Any] = {"connect_args": {"check_same_thread": False}}
+    if in_memory:
+        kwargs["poolclass"] = StaticPool  # one shared connection so :memory: survives sessions
+    else:
+        Path(parsed.database).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(url, **kwargs)
+
+    @event.listens_for(engine, "connect")
+    def _on_connect(dbapi_connection: Any, _record: Any) -> None:
+        _set_sqlite_pragmas(dbapi_connection, in_memory)
+
+    return engine
+
+
+def init_db(engine: Engine) -> None:
+    """Create all tables that do not exist yet (no migrations in this PoC)."""
+    from app.db import models  # noqa: F401  (register models on Base.metadata)
+
+    Base.metadata.create_all(engine)
+
+
+def drop_all(engine: Engine) -> None:
+    from app.db import models  # noqa: F401
+
+    Base.metadata.drop_all(engine)
+
+
+class Database:
+    """Lazy holder for the engine and session factory (nothing touches disk until used)."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    @cached_property
+    def engine(self) -> Engine:
+        return create_db_engine(self.url)
+
+    @cached_property
+    def session_factory(self) -> sessionmaker[Session]:
+        return sessionmaker(self.engine, expire_on_commit=False)
+
+    def init_db(self) -> None:
+        init_db(self.engine)
+
+    def dispose(self) -> None:
+        if "engine" in self.__dict__:
+            self.engine.dispose()
+
+
+def get_db(request: Request) -> Iterator[Session]:
+    """FastAPI dependency: one session per request, always closed."""
+    database: Database = request.app.state.database
+    session = database.session_factory()
+    try:
+        yield session
+    finally:
+        session.close()
+=== app/db/types.py
+"""Column types that keep SQLite round-trips exact."""
+
+from datetime import UTC, datetime
+from decimal import Decimal
+
+from sqlalchemy import BigInteger, DateTime
+from sqlalchemy.engine import Dialect
+from sqlalchemy.types import TypeDecorator
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    """Timezone-aware UTC datetimes.
+
+    SQLite drops tzinfo, so values are normalised to UTC on the way in (naive values are
+    rejected, not guessed) and re-attached as UTC on the way out.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Naive datetime is not allowed; use a timezone-aware datetime")
+        return value.astimezone(UTC).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        return None if value is None else value.replace(tzinfo=UTC)
+
+
+class ScaledDecimal(TypeDecorator[Decimal]):
+    """Exact decimals stored as INTEGER (value * 10**places); never a float.
+
+    SQLite has no decimal type, and SQLAlchemy's Numeric would silently round-trip through
+    float. Integers keep ordering/aggregation correct and precision exact. Values with
+    more decimal places than ``places`` are rejected rather than rounded.
+    """
+
+    impl = BigInteger
+    cache_ok = True
+
+    def __init__(self, places: int) -> None:
+        super().__init__()
+        self.places = places
+
+    def process_bind_param(self, value: Decimal | int | None, dialect: Dialect) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, float) or not isinstance(value, Decimal | int):
+            raise TypeError("Use Decimal (not float) for exact decimal columns")
+        scaled = Decimal(value) * (Decimal(10) ** self.places)
+        if scaled != scaled.to_integral_value():
+            raise ValueError(f"More than {self.places} decimal places: {value}")
+        return int(scaled)
+
+    def process_result_value(self, value: int | None, dialect: Dialect) -> Decimal | None:
+        if value is None:
+            return None
+        return (Decimal(value) / (Decimal(10) ** self.places)).quantize(
+            Decimal(1).scaleb(-self.places)
+        )
+=== app/db/__init__.py
+"""Persistence layer (SQLAlchemy 2.x, SQLite)."""
+=== app/domain/__init__.py
+"""Pure domain rules: no database, FastAPI or network imports."""
+=== app/domain/clock.py
+"""Clock helpers. Hong Kong has no DST, so a fixed UTC+8 offset avoids a tzdata dependency."""
+
+from datetime import UTC, date, datetime, timedelta, timezone
+
+HK_TZ = timezone(timedelta(hours=8), "HKT")
+
+
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def today_hk() -> date:
+    return datetime.now(HK_TZ).date()
+=== app/domain/enums.py
+"""String enums shared by the domain, the DB models and the API schemas."""
+
+from enum import StrEnum
+
+
+class UserRole(StrEnum):
+    EMPLOYEE = "employee"
+    HR_APPROVER = "hr_approver"
+    FINANCE_APPROVER = "finance_approver"
+
+
+class RequestType(StrEnum):
+    LEAVE = "leave"
+    CLAIM = "claim"
+
+
+class RequestStatus(StrEnum):
+    DRAFT = "draft"
+    PENDING_APPROVAL = "pending_approval"
+    SUBMISSION_FAILED = "submission_failed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+
+class LeaveType(StrEnum):
+    ANNUAL = "annual"
+    SICK = "sick"
+    PERSONAL = "personal"
+    UNPAID = "unpaid"
+
+
+class ClaimType(StrEnum):
+    TRAVEL = "travel"
+    MEAL = "meal"
+    EQUIPMENT = "equipment"
+    TRAINING = "training"
+    OTHER = "other"
+
+
+class DayPart(StrEnum):
+    FULL = "full"
+    AM = "am"
+    PM = "pm"
+
+
+class ConversationStatus(StrEnum):
+    ACTIVE = "active"
+    CLOSED = "closed"
+
+
+class SenderType(StrEnum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+
+class SubmissionStatus(StrEnum):
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class HolidaySource(StrEnum):
+    SEED_2026 = "seed_2026"
+    ICS_1823 = "1823_ics"
+=== app/domain/errors.py
+"""Typed domain errors. Routes/services map these to HTTP responses."""
+
+
+class DomainError(Exception):
+    """Base class for every business-rule violation."""
+
+
+class InvalidTransitionError(DomainError):
+    """The requested status change is not an edge of the state machine."""
+
+    def __init__(self, from_status: str, to_status: str) -> None:
+        super().__init__(f"Invalid status transition: {from_status} -> {to_status}")
+        self.from_status = from_status
+        self.to_status = to_status
+
+
+class NotAuthorizedError(DomainError):
+    """The actor may not perform the action (wrong role, inactive, or self-review)."""
+
+
+class ReviewNoteRequiredError(DomainError):
+    """Rejecting a request needs a non-empty reviewer note."""
+
+
+class LeaveCalculationError(DomainError):
+    """Leave dates / day parts are invalid or cover no working day."""
+=== app/domain/leave.py
+"""Leave day calculation with half-day support (pure)."""
+
+from collections.abc import Collection
+from dataclasses import dataclass
+from datetime import date, timedelta
+from decimal import Decimal
+
+from app.domain.enums import DayPart
+from app.domain.errors import LeaveCalculationError
+
+ONE = Decimal("1")
+HALF = Decimal("0.5")
+
+
+def is_working_day(day: date, holidays: Collection[date]) -> bool:
+    """Mon-Fri and not a public holiday."""
+    return day.weekday() < 5 and day not in holidays
+
+
+@dataclass(frozen=True)
+class LeaveDays:
+    calendar_days: Decimal
+    working_days: Decimal
+
+
+def validate_day_parts(
+    start_date: date, end_date: date, start_day_part: DayPart, end_day_part: DayPart
+) -> None:
+    """Structural rules (no holiday data needed).
+
+    * end_date >= start_date
+    * single day: start part == end part (full = 1 day, am/pm = 0.5)
+    * multi day: start part in {full, pm}, end part in {full, am}
+    """
+    start_day_part, end_day_part = DayPart(start_day_part), DayPart(end_day_part)
+    if end_date < start_date:
+        raise LeaveCalculationError("end_date must not be before start_date")
+    if start_date == end_date:
+        if start_day_part != end_day_part:
+            raise LeaveCalculationError(
+                "A single-day leave needs the same day part at the start and the end"
+            )
+        return
+    if start_day_part == DayPart.AM:
+        raise LeaveCalculationError("A multi-day leave cannot start in the morning half only")
+    if end_day_part == DayPart.PM:
+        raise LeaveCalculationError("A multi-day leave cannot end in the afternoon half only")
+
+
+def calculate_leave_days(
+    start_date: date,
+    end_date: date,
+    start_day_part: DayPart = DayPart.FULL,
+    end_day_part: DayPart = DayPart.FULL,
+    holidays: Collection[date] = (),
+) -> LeaveDays:
+    """Working days (Mon-Fri minus public holidays) and calendar days, in 0.5 steps.
+
+    A half-day on a weekend/holiday counts 0 working days. A request covering zero
+    working days is rejected.
+    """
+    start_day_part, end_day_part = DayPart(start_day_part), DayPart(end_day_part)
+    validate_day_parts(start_date, end_date, start_day_part, end_day_part)
+
+    def weight(day: date) -> Decimal:
+        if day == start_date and start_date == end_date:
+            return ONE if start_day_part == DayPart.FULL else HALF
+        if day == start_date and start_day_part == DayPart.PM:
+            return HALF
+        if day == end_date and end_day_part == DayPart.AM:
+            return HALF
+        return ONE
+
+    calendar = Decimal(0)
+    working = Decimal(0)
+    day = start_date
+    while day <= end_date:
+        w = weight(day)
+        calendar += w
+        if is_working_day(day, holidays):
+            working += w
+        day += timedelta(days=1)
+
+    if working == 0:
+        raise LeaveCalculationError("The selected dates contain no working days")
+    return LeaveDays(calendar_days=calendar, working_days=working)
+=== app/domain/roles.py
+"""Role resolution and access rules (pure functions)."""
+
+from collections.abc import Iterable
+from typing import Protocol
+
+from app.domain.enums import RequestType, UserRole
+
+
+class UserLike(Protocol):
+    id: int
+    email: str
+    role: UserRole
+    is_active: bool
+
+
+class RequestLike(Protocol):
+    request_type: RequestType
+    employee_id: int
+
+
+_APPROVER_BY_TYPE: dict[RequestType, UserRole] = {
+    RequestType.LEAVE: UserRole.HR_APPROVER,
+    RequestType.CLAIM: UserRole.FINANCE_APPROVER,
+}
+
+
+def required_approver_role(request_type: RequestType) -> UserRole:
+    """leave -> hr_approver, claim -> finance_approver."""
+    return _APPROVER_BY_TYPE[RequestType(request_type)]
+
+
+def can_review(user: UserLike, request_type: RequestType) -> bool:
+    """Only the matching approver role may approve/reject; employees never; inactive never."""
+    if not user.is_active:
+        return False
+    return user.role == required_approver_role(request_type)
+
+
+def can_view_request(user: UserLike, request: RequestLike) -> bool:
+    """Employees see only their own requests; approvers see only their request type."""
+    if not user.is_active:
+        return False
+    if user.role == UserRole.EMPLOYEE:
+        return request.employee_id == user.id
+    return can_review(user, request.request_type)
+
+
+def resolve_role[U: UserLike](email: str, users: Iterable[U]) -> U | None:
+    """Return the active user with this e-mail (case-insensitive), or None.
+
+    The returned object carries the role (``.role``); inactive users never resolve.
+    """
+    wanted = email.strip().casefold()
+    for user in users:
+        if user.is_active and user.email.strip().casefold() == wanted:
+            return user
+    return None
+=== app/domain/transitions.py
+"""Request status state machine shared by leave and claim requests."""
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
+
+from app.domain.clock import utcnow
+from app.domain.enums import RequestStatus as S
+from app.domain.enums import RequestType
+from app.domain.errors import InvalidTransitionError, NotAuthorizedError, ReviewNoteRequiredError
+from app.domain.roles import UserLike, can_review
+
+TRANSITIONS: dict[S, frozenset[S]] = {
+    S.DRAFT: frozenset({S.PENDING_APPROVAL, S.SUBMISSION_FAILED, S.CANCELLED}),
+    S.SUBMISSION_FAILED: frozenset({S.PENDING_APPROVAL, S.CANCELLED}),
+    S.PENDING_APPROVAL: frozenset({S.APPROVED, S.REJECTED}),
+    S.APPROVED: frozenset(),
+    S.REJECTED: frozenset(),
+    S.CANCELLED: frozenset(),
+}
+TERMINAL_STATUSES = frozenset(s for s, targets in TRANSITIONS.items() if not targets)
+
+
+class TransitionableRequest(Protocol):
+    request_type: RequestType
+    employee_id: int
+    status: S
+    submitted_at: datetime | None
+    reviewed_by_user_id: int | None
+    reviewed_at: datetime | None
+    reviewer_note: str | None
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class TransitionResult:
+    """Audit-event fields describing an applied transition."""
+
+    from_status: S
+    to_status: S
+
+
+def can_transition(from_status: S, to_status: S) -> bool:
+    return S(to_status) in TRANSITIONS[S(from_status)]
+
+
+def assert_transition(from_status: S, to_status: S) -> None:
+    if not can_transition(from_status, to_status):
+        raise InvalidTransitionError(str(from_status), str(to_status))
+
+
+def apply_transition(
+    request: TransitionableRequest,
+    to_status: S,
+    *,
+    actor: UserLike | None = None,
+    note: str | None = None,
+    now: datetime | None = None,
+) -> TransitionResult:
+    """Validate and apply a status change in place; return (from_status, to_status).
+
+    * Approve/reject need an actor who may review this request type and who is not the
+      request's own employee (no self-approval). Reject also needs a non-empty note.
+    * Moving to ``pending_approval`` stamps ``submitted_at`` (first time only).
+    Nothing is mutated when a rule is violated.
+    """
+    to_status = S(to_status)
+    from_status = S(request.status)
+    assert_transition(from_status, to_status)
+    now = now or utcnow()
+    clean_note = note.strip() if note and note.strip() else None
+
+    if to_status in (S.APPROVED, S.REJECTED):
+        if actor is None or not can_review(actor, request.request_type):
+            raise NotAuthorizedError("Actor may not review this request type")
+        if actor.id == request.employee_id:
+            raise NotAuthorizedError("Reviewers cannot review their own requests")
+        if to_status == S.REJECTED and clean_note is None:
+            raise ReviewNoteRequiredError("A reviewer note is required to reject a request")
+        request.reviewed_by_user_id = actor.id
+        request.reviewed_at = now
+        request.reviewer_note = clean_note
+    elif to_status == S.PENDING_APPROVAL and request.submitted_at is None:
+        request.submitted_at = now
+
+    request.status = to_status
+    request.updated_at = now
+    return TransitionResult(from_status=from_status, to_status=to_status)
+=== app/schemas/drafts.py
+"""Validated draft inputs the later (LLM extraction) phase fills in.
+
+Kept apart from the DB models. ``start_day_part`` / ``end_day_part`` are the two optional
+fields the extractor sets to apply half-day leave; both default to ``full``.
+"""
+
+from datetime import date
+from decimal import Decimal
+from typing import Literal, Self
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+from app.domain.clock import today_hk
+from app.domain.enums import ClaimType, DayPart, LeaveType
+from app.domain.errors import LeaveCalculationError
+from app.domain.leave import validate_day_parts
+
+
+class LeaveDraft(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    employee_email: EmailStr
+    leave_type: LeaveType
+    start_date: date
+    end_date: date
+    start_day_part: DayPart = DayPart.FULL
+    end_day_part: DayPart = DayPart.FULL
+
+    @model_validator(mode="after")
+    def _check_dates_and_parts(self) -> Self:
+        try:
+            validate_day_parts(
+                self.start_date, self.end_date, self.start_day_part, self.end_day_part
+            )
+        except LeaveCalculationError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
+class ClaimDraft(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    employee_email: EmailStr
+    claim_type: ClaimType
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    currency: Literal["HKD"] = "HKD"
+    receipt_date: date
+
+    @field_validator("receipt_date")
+    @classmethod
+    def _not_in_future(cls, value: date) -> date:
+        if value > today_hk():
+            raise ValueError("receipt_date must not be in the future")
+        return value

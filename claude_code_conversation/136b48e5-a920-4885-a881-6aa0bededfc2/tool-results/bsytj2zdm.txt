@@ -1,0 +1,928 @@
+<script setup lang="ts">
+import type { ApprovalDetail, Decision } from '~/types/approvals'
+
+const route = useRoute()
+const api = useApi()
+const queue = useApprovalQueue()
+const { user } = useAuth()
+
+const type = computed(() => String(route.params.type))
+const id = computed(() => String(route.params.id))
+
+type LoadState = 'loading' | 'ready' | 'missing' | 'error'
+const state = ref<LoadState>('loading')
+const loadError = ref('')
+const detail = ref<ApprovalDetail | null>(null)
+
+const note = ref('')
+const confirming = ref<Decision | null>(null)
+/** The decision being posted (kept after a failure so Retry can repeat it). */
+const posting = ref<Decision | null>(null)
+const postError = ref<string | null>(null)
+const lastDecision = ref<Decision | null>(null)
+
+const noteRest = computed(() => noteRemaining(note.value))
+const noteInvalid = computed(() => noteTooLong(note.value))
+const overLimit = computed(() => overLimitSummary(detail.value?.limits))
+const requestLabel = computed(() => `${type.value === 'claim' ? 'Claim' : 'Leave request'} #${id.value}`)
+const employeeName = computed(() => detail.value?.request.employee.display_name ?? 'the employee')
+const busy = computed(() => posting.value !== null)
+
+useHead(() => ({ title: `${requestLabel.value} - SCMP Internal Operations AI Assistant` }))
+
+async function load() {
+  state.value = 'loading'
+  loadError.value = ''
+  if (!isRequestTypeParam(type.value) || !/^\d+$/.test(id.value)) {
+    state.value = 'missing'
+    return
+  }
+  try {
+    detail.value = await api<ApprovalDetail>(`/api/approvals/${type.value}/${id.value}`)
+    state.value = 'ready'
+  }
+  catch (cause) {
+    const status = extractStatus(cause)
+    if (status === 404) {
+      state.value = 'missing'
+    }
+    else {
+      loadError.value = approvalErrorMessage(status, 'detail')
+      state.value = 'error'
+    }
+  }
+}
+
+onMounted(load)
+
+function ask(decision: Decision) {
+  if (busy.value || noteInvalid.value) return
+  postError.value = null
+  confirming.value = decision
+}
+
+function cancelConfirm() {
+  if (busy.value) return
+  confirming.value = null
+}
+
+async function submit(decision: Decision) {
+  if (busy.value) return
+  posting.value = decision
+  lastDecision.value = decision
+  postError.value = null
+  try {
+    await api(`/api/approvals/${type.value}/${id.value}/decision`, { method: 'POST', body: buildDecisionBody(decision, note.value) })
+    const text = decisionSuccessMessage(decision, type.value, Number(id.value), employeeName.value)
+    queue.items.value = queue.items.value.filter(i => !(i.request_type === type.value && String(i.id) === id.value))
+    queue.flash.value = { tone: 'green', text }
+    confirming.value = null
+    await navigateTo('/approvals')
+  }
+  catch (cause) {
+    const status = extractStatus(cause)
+    confirming.value = null
+    if (status === 409) {
+      queue.flash.value = { tone: 'amber', text: `${approvalErrorMessage(409, 'decision')} The list was reloaded.` }
+      await queue.refresh({ background: true })
+      await navigateTo('/approvals')
+    }
+    else if (status === 404) {
+      state.value = 'missing'
+      void queue.refresh({ background: true })
+    }
+    else {
+      postError.value = approvalErrorMessage(status, 'decision')
+    }
+  }
+  finally {
+    posting.value = null
+  }
+}
+
+function retry() {
+  if (lastDecision.value) void submit(lastDecision.value)
+}
+
+const confirmLabels = computed(() => (confirming.value ? decisionLabels(confirming.value) : null))
+</script>
+
+<template>
+  <main class="mx-auto max-w-5xl space-y-4 px-4 py-6" aria-labelledby="request-title">
+    <NuxtLink
+      to="/approvals"
+      class="focus-ring inline-flex items-center gap-1 rounded-md py-1 pr-2 text-sm font-medium underline-offset-2 hover:underline"
+    >
+      <IconGlyph name="back" class="h-4 w-4" />
+      Back to {{ approvalsHeading(user?.approves).toLowerCase() }}
+    </NuxtLink>
+
+    <p v-if="state === 'loading'" role="status" class="flex items-center gap-2 py-10 text-sm">
+      <IconGlyph name="spinner" class="h-4 w-4" />
+      Loading request...
+    </p>
+
+    <section v-else-if="state === 'missing'" class="rounded-2xl border border-dashed border-secondary/40 p-8 text-center" role="status">
+      <IconGlyph name="ban" class="mx-auto h-8 w-8" />
+      <h1 id="request-title" class="mt-2 text-lg font-semibold">
+        This request is no longer available
+      </h1>
+      <p class="mt-1 text-sm">
+        It may have been decided already, or it is not assigned to you.
+      </p>
+    </section>
+
+    <div v-else-if="state === 'error'" class="flex items-start gap-2 rounded-lg px-3 py-2 text-sm" :class="toneClass('red')" role="alert">
+      <IconGlyph name="alert" class="mt-0.5 h-4 w-4 shrink-0" />
+      <p class="min-w-0 flex-1">
+        {{ loadError }}
+      </p>
+      <button type="button" class="focus-ring shrink-0 rounded-md border border-current px-2 py-0.5 text-xs font-semibold" @click="load">
+        Retry
+      </button>
+    </div>
+
+    <template v-else-if="detail">
+      <header class="rounded-xl border border-secondary/40 p-4">
+        <div class="flex flex-wrap items-start justify-between gap-2">
+          <div class="min-w-0">
+            <h1 id="request-title" class="text-xl font-bold">
+              {{ requestLabel }}
+            </h1>
+            <p class="chat-text mt-1 text-sm">
+              <span class="font-semibold">{{ detail.request.employee.display_name }}</span>
+              <template v-if="detail.request.employee.department">
+                · {{ detail.request.employee.department }}
+              </template>
+            </p>
+          </div>
+          <StatusBadge :status="detail.request.status" />
+        </div>
+        <p class="mt-1 text-xs">
+          <template v-if="detail.request.submitted_at">
+            Submitted {{ formatDateTime(detail.request.submitted_at) }}
+          </template>
+          <template v-if="detail.request.external_reference_id">
+            · Reference {{ detail.request.external_reference_id }}
+          </template>
+        </p>
+      </header>
+
+      <div v-if="detail.warnings.length" class="space-y-2">
+        <div
+          v-for="(warning, index) in detail.warnings"
+          :key="index"
+          class="flex items-start gap-2 rounded-lg px-3 py-2 text-sm"
+          :class="toneClass('amber')"
+          role="note"
+        >
+          <IconGlyph name="alert" class="mt-0.5 h-4 w-4 shrink-0" />
+          <p class="chat-text min-w-0">
+            {{ warning }}
+          </p>
+        </div>
+      </div>
+
+      <div class="approval-grid gap-4">
+        <ApprovalLimits class="approval-limits" :limits="detail.limits" :request-type="detail.request.request_type" />
+
+        <div class="approval-main space-y-4">
+          <section class="rounded-xl border border-secondary/40 p-4" aria-labelledby="fields-title">
+            <h2 id="fields-title" class="text-base font-semibold">
+              Request details
+            </h2>
+            <dl class="mt-2 divide-y divide-secondary/15 text-sm">
+              <div v-for="field in detail.request.fields" :key="field.key" class="grid grid-cols-1 gap-x-4 gap-y-0.5 py-2 sm:grid-cols-[11rem_1fr]">
+                <dt class="font-medium">
+                  {{ field.label }}
+                </dt>
+                <dd class="chat-text min-w-0">
+                  {{ fieldValue(field.value) }}
+                </dd>
+              </div>
+            </dl>
+          </section>
+
+          <section class="rounded-xl border border-secondary/40 p-4" aria-labelledby="attachments-title">
+            <h2 id="attachments-title" class="text-base font-semibold">
+              Attachments
+            </h2>
+            <p v-if="!detail.request.attachments.length" class="mt-2 text-sm">
+              No documents were attached.
+            </p>
+            <ul v-else class="mt-2 flex flex-wrap gap-3" aria-label="Attached documents">
+              <li v-for="attachment in detail.request.attachments" :key="attachment.id" class="max-w-full">
+                <AttachmentItem :attachment="attachment" />
+              </li>
+            </ul>
+          </section>
+
+          <section v-if="detail.request.request_type === 'leave'" class="rounded-xl border border-secondary/40 p-4" aria-labelledby="team-title">
+            <h2 id="team-title" class="text-base font-semibold">
+              Team on leave at the same time
+            </h2>
+            <p v-if="!detail.team_overlap.length" class="mt-2 text-sm">
+              Nobody else in the team is on leave then.
+            </p>
+            <ul v-else class="mt-2 divide-y divide-secondary/15 text-sm">
+              <li v-for="(entry, index) in detail.team_overlap" :key="index" class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-2">
+                <div class="min-w-0">
+                  <p class="chat-text font-semibold">
+                    {{ entry.employee }}
+                  </p>
+                  <p class="text-xs">
+                    {{ leaveTypeLabel(entry.leave_type) }}, {{ dateRange(entry.start_date, entry.end_date) }}, {{ formatDays(entry.working_days) }}
+                  </p>
+                </div>
+                <StatusBadge :status="entry.status" />
+              </li>
+            </ul>
+          </section>
+        </div>
+
+        <section class="approval-decision rounded-xl border border-secondary/60 p-4" aria-labelledby="decision-title">
+          <h2 id="decision-title" class="text-base font-semibold">
+            Your decision
+          </h2>
+          <label for="reviewer-note" class="mt-2 block text-sm font-medium">Note for the employee (optional)</label>
+          <textarea
+            id="reviewer-note"
+            v-model="note"
+            rows="3"
+            :maxlength="NOTE_MAX"
+            :disabled="busy"
+            aria-describedby="note-counter"
+            class="focus-ring mt-1 w-full resize-y rounded-lg border border-secondary/50 bg-background p-2 text-sm text-secondary disabled:opacity-60"
+          />
+          <p id="note-counter" class="mt-1 text-right text-xs" :class="noteRest < 20 ? 'font-semibold' : ''">
+            {{ noteRest }} characters left
+          </p>
+
+          <div v-if="postError" class="mt-2 flex items-start gap-2 rounded-lg px-2.5 py-2 text-sm" :class="toneClass('red')" role="alert">
+            <IconGlyph name="alert" class="mt-0.5 h-4 w-4 shrink-0" />
+            <p class="min-w-0 flex-1">
+              {{ postError }}
+            </p>
+            <button type="button" class="focus-ring shrink-0 rounded-md border border-current px-2 py-0.5 text-xs font-semibold" @click="retry">
+              Retry
+            </button>
+          </div>
+
+          <div class="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              class="focus-ring inline-flex min-h-10 flex-1 items-center justify-center rounded-lg bg-secondary px-4 py-2 text-sm font-semibold text-background hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="busy || noteInvalid"
+              @click="ask('approve')"
+            >
+              Approve
+            </button>
+            <button
+              type="button"
+              class="focus-ring inline-flex min-h-10 flex-1 items-center justify-center rounded-lg border border-secondary/60 px-4 py-2 text-sm font-semibold hover:bg-secondary/10 disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="busy || noteInvalid"
+              @click="ask('reject')"
+            >
+              Reject
+            </button>
+          </div>
+          <p class="mt-2 text-xs">
+            You will be asked to confirm. The employee is notified of your decision and note.
+          </p>
+        </section>
+      </div>
+
+      <ModalDialog
+        :open="confirming !== null"
+        alert
+        labelledby="confirm-title"
+        describedby="confirm-summary"
+        :busy="busy"
+        @close="cancelConfirm"
+      >
+        <template v-if="confirming && confirmLabels">
+          <h2 id="confirm-title" class="text-lg font-bold">
+            {{ confirmLabels.button }} {{ requestLabel.toLowerCase() }}?
+          </h2>
+          <dl id="confirm-summary" class="mt-3 divide-y divide-secondary/15 text-sm">
+            <div class="grid grid-cols-[6rem_1fr] gap-x-3 py-1.5">
+              <dt class="font-medium">
+                Employee
+              </dt>
+              <dd class="chat-text">
+                {{ detail.request.employee.display_name }}<template v-if="detail.request.employee.department">
+                  · {{ detail.request.employee.department }}
+                </template>
+              </dd>
+            </div>
+            <div class="grid grid-cols-[6rem_1fr] gap-x-3 py-1.5">
+              <dt class="font-medium">
+                Request
+              </dt>
+              <dd class="chat-text">
+                {{ detail.request.fields.map(f => `${f.label}: ${fieldValue(f.value)}`).slice(0, 4).join('; ') }}
+              </dd>
+            </div>
+            <div class="grid grid-cols-[6rem_1fr] gap-x-3 py-1.5">
+              <dt class="font-medium">
+                Decision
+              </dt>
+              <dd class="font-semibold">
+                {{ confirmLabels.button }}
+              </dd>
+            </div>
+            <div class="grid grid-cols-[6rem_1fr] gap-x-3 py-1.5">
+              <dt class="font-medium">
+                Note
+              </dt>
+              <dd class="chat-text">
+                {{ buildDecisionBody(confirming, note).note ?? 'No note' }}
+              </dd>
+            </div>
+          </dl>
+          <div v-if="overLimit" class="mt-3 flex items-start gap-2 rounded-lg px-2.5 py-2 text-sm" :class="toneClass('amber')" role="note">
+            <IconGlyph name="alert" class="mt-0.5 h-4 w-4 shrink-0" />
+            <p><span class="font-semibold">Over limit. </span>{{ overLimit }}</p>
+          </div>
+          <p v-if="busy" class="sr-only" role="status">
+            {{ confirmLabels.busy }}
+          </p>
+          <div class="mt-4 flex flex-wrap justify-end gap-2">
+            <button
+              type="button"
+              class="focus-ring inline-flex min-h-10 items-center rounded-lg border border-secondary/50 px-4 py-2 text-sm font-medium hover:bg-secondary/10 disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="busy"
+              @click="cancelConfirm"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="focus-ring inline-flex min-h-10 items-center gap-2 rounded-lg bg-secondary px-4 py-2 text-sm font-semibold text-background hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="busy"
+              @click="submit(confirming)"
+            >
+              <IconGlyph v-if="busy" name="spinner" class="h-4 w-4" />
+              {{ busy ? confirmLabels.busy : confirmLabels.confirm }}
+            </button>
+          </div>
+        </template>
+      </ModalDialog>
+    </template>
+  </main>
+</template>
+
+<style scoped>
+/* One column on phones (limits, details, decision in reading order); from 1024px the limits and the decision sit in a right column. */
+.approval-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@media (min-width: 1024px) {
+  .approval-grid {
+    grid-template-columns: minmax(0, 1fr) 22rem;
+    grid-template-areas: "main limits" "main decision";
+    grid-template-rows: auto 1fr;
+    align-items: start;
+  }
+
+  .approval-main { grid-area: main; }
+  .approval-limits { grid-area: limits; }
+  .approval-decision { grid-area: decision; }
+}
+</style>
+/** Types for the Phase 3 approval API (see docs/phase3-approval-design.md, section 5). All data is fictional. */
+import type { AttachmentInfo, RequestStatus, RequestType } from './chat'
+
+export interface ApprovalEmployee {
+  id: number
+  display_name: string
+  department: string | null
+}
+
+export interface ApprovalFlags {
+  over_limit: boolean
+  team_overlap_count: number
+  has_attachments: boolean
+}
+
+export interface ApprovalListItem {
+  request_type: RequestType
+  id: number
+  employee: ApprovalEmployee
+  summary: string
+  submitted_at: string | null
+  flags: ApprovalFlags
+}
+
+export interface ApprovalList {
+  items: ApprovalListItem[]
+  count: number
+}
+
+export interface ApprovalField {
+  key: string
+  label: string
+  value: string
+}
+
+export interface LeaveBalanceLimit {
+  leave_type: string
+  year: number
+  entitled_days: number
+  approved_days: number
+  pending_other_days: number
+  requested_days: number
+  remaining_after_days: number
+  over_limit: boolean
+}
+
+/** Money values are decimal strings (for example "60000.00"). */
+export interface DepartmentBudgetLimit {
+  department: string
+  year: number
+  limit_amount: string
+  approved_amount: string
+  pending_other_amount: string
+  requested_amount: string
+  remaining_after_amount: string
+  over_limit: boolean
+  currency: string
+}
+
+export interface TeamOverlapEntry {
+  employee: string
+  leave_type: string
+  start_date: string
+  end_date: string
+  status: RequestStatus | string
+  working_days: number
+}
+
+export interface ApprovalDetail {
+  request: {
+    request_type: RequestType
+    id: number
+    status: RequestStatus | string
+    submitted_at: string | null
+    employee: ApprovalEmployee
+    fields: ApprovalField[]
+    attachments: AttachmentInfo[]
+    external_reference_id: string | null
+  }
+  limits: {
+    leave_balance: LeaveBalanceLimit | null
+    department_budget: DepartmentBudgetLimit | null
+  }
+  team_overlap: TeamOverlapEntry[]
+  warnings: string[]
+}
+
+export type Decision = 'approve' | 'reject'
+
+export interface DecisionBody {
+  decision: Decision
+  note: string | null
+}
+
+export interface DecisionResult {
+  request_type: RequestType
+  id: number
+  status: string
+  reviewed_at: string | null
+}
+/** Pure approval helpers: formatting, limit bars, decision bodies, flags, errors (tests/approvals.test.ts). */
+import type {
+  ApprovalDetail,
+  ApprovalFlags,
+  Decision,
+  DecisionBody,
+  DepartmentBudgetLimit,
+  LeaveBalanceLimit,
+} from '../types/approvals'
+import type { IconName, Tone } from './chat'
+
+export const NOTE_MAX = 500
+
+export function isRequestTypeParam(value: unknown): value is 'leave' | 'claim' {
+  return value === 'leave' || value === 'claim'
+}
+
+export function approvalPath(type: string, id: number | string): string {
+  return `/approvals/${type}/${id}`
+}
+
+/* ---- Numbers and money ---- */
+
+/** "3 days", "1 day", "2.5 days", "0 days", "-1.5 days". Non-numbers give an en dash. */
+export function formatDays(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '–'
+  const rounded = Math.round(value * 100) / 100
+  return `${rounded} ${Math.abs(rounded) === 1 ? 'day' : 'days'}`
+}
+
+/** Decimal strings from the API ("60000.00") to numbers; anything unusable is 0. */
+export function parseAmount(value: string | number | null | undefined): number {
+  const n = typeof value === 'number' ? value : Number.parseFloat(String(value ?? ''))
+  return Number.isFinite(n) ? n : 0
+}
+
+/** "HKD 47,520.00" (always two decimals; negatives as "HKD -1,500.00"). */
+export function formatMoney(value: string | number | null | undefined, currency = 'HKD'): string {
+  const n = parseAmount(value)
+  const text = new Intl.NumberFormat('en-HK', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n)
+  return `${currency} ${text}`
+}
+
+export function leaveTypeLabel(type: string | null | undefined): string {
+  const key = (type ?? '').trim().toLowerCase()
+  if (!key) return 'Leave'
+  return `${key.charAt(0).toUpperCase()}${key.slice(1)} leave`
+}
+
+/* ---- Limit bar ---- */
+
+export interface BarInput {
+  limit: number
+  approved: number
+  /** Other pending requests (shown, not deducted). */
+  pending: number
+  /** This request. */
+  requested: number
+}
+
+export interface BarView {
+  /** Percentages of the bar width (0..100), stacked in this order: approved, this request, other pending. */
+  approvedPct: number
+  requestedPct: number
+  pendingPct: number
+  /** Where the limit sits on the bar (100 when nothing exceeds it). */
+  limitPct: number
+  /** approved + requested is beyond the limit (pending by others is not deducted). */
+  exceeds: boolean
+}
+
+const pct = (part: number, scale: number) => (scale > 0 ? Math.round(Math.max(0, part) / scale * 1000) / 10 : 0)
+
+/**
+ * Segment widths for the limit bar. The scale is the larger of the limit and everything shown, so an over-limit
+ * bar stays inside its box and the limit marker moves left. A zero limit gives a marker at 0 and full-width bars.
+ */
+export function limitBar(input: BarInput): BarView {
+  const limit = Math.max(0, input.limit)
+  const approved = Math.max(0, input.approved)
+  const requested = Math.max(0, input.requested)
+  const pending = Math.max(0, input.pending)
+  const total = approved + requested + pending
+  const scale = Math.max(limit, total)
+  return {
+    approvedPct: pct(approved, scale),
+    requestedPct: pct(requested, scale),
+    pendingPct: pct(pending, scale),
+    limitPct: scale > 0 ? pct(limit, scale) : 0,
+    exceeds: approved + requested > limit,
+  }
+}
+
+export function leaveBarInput(lb: Pick<LeaveBalanceLimit, 'entitled_days' | 'approved_days' | 'pending_other_days' | 'requested_days'>): BarInput {
+  return { limit: lb.entitled_days, approved: lb.approved_days, pending: lb.pending_other_days, requested: lb.requested_days }
+}
+
+export function budgetBarInput(b: Pick<DepartmentBudgetLimit, 'limit_amount' | 'approved_amount' | 'pending_other_amount' | 'requested_amount'>): BarInput {
+  return {
+    limit: parseAmount(b.limit_amount),
+    approved: parseAmount(b.approved_amount),
+    pending: parseAmount(b.pending_other_amount),
+    requested: parseAmount(b.requested_amount),
+  }
+}
+
+export interface LimitRow {
+  key: string
+  label: string
+  value: string
+  /** The row that answers "what is left after this request". */
+  emphasis?: boolean
+}
+
+export function leaveBalanceRows(lb: LeaveBalanceLimit): LimitRow[] {
+  return [
+    { key: 'entitled', label: `Entitled in ${lb.year}`, value: formatDays(lb.entitled_days) },
+    { key: 'approved', label: 'Already approved', value: formatDays(lb.approved_days) },
+    { key: 'pending', label: 'Pending (other requests)', value: formatDays(lb.pending_other_days) },
+    { key: 'requested', label: 'This request', value: formatDays(lb.requested_days) },
+    { key: 'remaining', label: 'Remaining after this request', value: formatDays(lb.remaining_after_days), emphasis: true },
+  ]
+}
+
+export function budgetRows(b: DepartmentBudgetLimit): LimitRow[] {
+  const money = (v: string) => formatMoney(v, b.currency)
+  return [
+    { key: 'limit', label: `${b.department} limit for ${b.year}`, value: money(b.limit_amount) },
+    { key: 'approved', label: 'Already approved', value: money(b.approved_amount) },
+    { key: 'pending', label: 'Pending (other requests)', value: money(b.pending_other_amount) },
+    { key: 'requested', label: 'This request', value: money(b.requested_amount) },
+    { key: 'remaining', label: 'Remaining after this request', value: money(b.remaining_after_amount), emphasis: true },
+  ]
+}
+
+/** One sentence for the over-limit warning (also repeated in the confirmation dialog); null when within limits. */
+export function overLimitSummary(limits: ApprovalDetail['limits'] | null | undefined): string | null {
+  const lb = limits?.leave_balance
+  if (lb?.over_limit) {
+    const by = lb.remaining_after_days < 0 ? ` by ${formatDays(-lb.remaining_after_days)}` : ''
+    return `Over the ${leaveTypeLabel(lb.leave_type).toLowerCase()} balance${by}.`
+  }
+  const budget = limits?.department_budget
+  if (budget?.over_limit) {
+    const left = parseAmount(budget.remaining_after_amount)
+    const by = left < 0 ? ` by ${formatMoney(-left, budget.currency)}` : ''
+    return `Over the ${budget.department} department claim limit${by}.`
+  }
+  return null
+}
+
+/** Accessible description of a bar: numbers, not colours. */
+export function limitBarLabel(title: string, parts: { limit: string, approved: string, requested: string, pending: string, over: boolean }): string {
+  return `${title}: limit ${parts.limit}, approved ${parts.approved}, this request ${parts.requested}, other pending ${parts.pending}.${parts.over ? ' This request goes over the limit.' : ''}`
+}
+
+/* ---- Decision ---- */
+
+/** Characters typed (code points, like the backend's count); the counter and the textarea limit use this. */
+export function noteLength(note: string): number {
+  return Array.from(note).length
+}
+
+export function noteRemaining(note: string): number {
+  return NOTE_MAX - noteLength(note)
+}
+
+export function noteTooLong(note: string): boolean {
+  return noteLength(note) > NOTE_MAX
+}
+
+/** POST body of a decision: the note is trimmed and an empty note is sent as null. */
+export function buildDecisionBody(decision: Decision, note: string | null | undefined): DecisionBody {
+  const trimmed = (note ?? '').trim()
+  return { decision, note: trimmed ? trimmed : null }
+}
+
+export interface DecisionLabels {
+  button: string
+  confirm: string
+  busy: string
+  past: string
+  tone: Tone
+}
+
+export function decisionLabels(decision: Decision): DecisionLabels {
+  return decision === 'approve'
+    ? { button: 'Approve', confirm: 'Confirm approve', busy: 'Approving...', past: 'approved', tone: 'green' }
+    : { button: 'Reject', confirm: 'Confirm reject', busy: 'Rejecting...', past: 'rejected', tone: 'red' }
+}
+
+export function decisionSuccessMessage(decision: Decision, type: string, id: number, employee: string): string {
+  return `You ${decisionLabels(decision).past} ${type === 'claim' ? 'claim' : 'leave request'} #${id} from ${employee}.`
+}
+
+/* ---- List flags ---- */
+
+export interface FlagBadge {
+  key: 'over_limit' | 'team_overlap' | 'attachments'
+  label: string
+  tone: Tone
+  icon: IconName | 'users' | 'paperclip'
+}
+
+/** Badges for a list row: only the flags that apply; each has an icon and text (colour is never the only cue). */
+export function flagBadges(flags: ApprovalFlags | null | undefined): FlagBadge[] {
+  const out: FlagBadge[] = []
+  if (!flags) return out
+  if (flags.over_limit) out.push({ key: 'over_limit', label: 'Over limit', tone: 'amber', icon: 'alert' })
+  if (flags.team_overlap_count > 0) {
+    out.push({ key: 'team_overlap', label: `${flags.team_overlap_count} on leave in the team`, tone: 'grey', icon: 'users' })
+  }
+  if (flags.has_attachments) out.push({ key: 'attachments', label: 'Has attachment', tone: 'grey', icon: 'paperclip' })
+  return out
+}
+
+/* ---- Errors ---- */
+
+export type ApprovalPhase = 'list' | 'detail' | 'decision'
+
+/** User-facing message for an approvals API failure (never echoes server text). `status` undefined = network error. */
+export function approvalErrorMessage(status: number | undefined, phase: ApprovalPhase): string {
+  if (status === undefined) return 'Cannot reach the server. Check your connection and try again.'
+  if (status === 409) return 'This request was already decided or changed.'
+  if (status === 404) return phase === 'list' ? 'Approvals are not available.' : 'This request is no longer available.'
+  if (status === 403) return 'You are not allowed to do that.'
+  if (status === 422) return 'That decision was not accepted. Keep the note under 500 characters.'
+  if (status === 429) return 'Too many requests. Please wait a moment and try again.'
+  if (status >= 500) return 'The server had a problem. Please try again in a moment.'
+  return 'Something went wrong. Please try again.'
+}
+
+/** Dates for the team list, "2026-10-06" or "2026-10-05 to 2026-10-07". */
+export function dateRange(start: string, end: string): string {
+  return start === end || !end ? start : `${start} to ${end}`
+}
+<script setup lang="ts">
+import type { ApprovalDetail } from '~/types/approvals'
+
+const props = defineProps<{ limits: ApprovalDetail['limits'], requestType: string }>()
+
+const leave = computed(() => props.limits.leave_balance)
+const budget = computed(() => props.limits.department_budget)
+const over = computed(() => overLimitSummary(props.limits))
+
+const view = computed(() => {
+  if (leave.value) {
+    const lb = leave.value
+    return {
+      title: `${leaveTypeLabel(lb.leave_type)} balance ${lb.year}`,
+      rows: leaveBalanceRows(lb),
+      bar: limitBar(leaveBarInput(lb)),
+      label: limitBarLabel(`${leaveTypeLabel(lb.leave_type)} balance`, {
+        limit: formatDays(lb.entitled_days),
+        approved: formatDays(lb.approved_days),
+        requested: formatDays(lb.requested_days),
+        pending: formatDays(lb.pending_other_days),
+        over: lb.over_limit,
+      }),
+      over: lb.over_limit,
+    }
+  }
+  if (budget.value) {
+    const b = budget.value
+    return {
+      title: `${b.department} department claim budget ${b.year}`,
+      rows: budgetRows(b),
+      bar: limitBar(budgetBarInput(b)),
+      label: limitBarLabel(`${b.department} claim budget`, {
+        limit: formatMoney(b.limit_amount, b.currency),
+        approved: formatMoney(b.approved_amount, b.currency),
+        requested: formatMoney(b.requested_amount, b.currency),
+        pending: formatMoney(b.pending_other_amount, b.currency),
+        over: b.over_limit,
+      }),
+      over: b.over_limit,
+    }
+  }
+  return null
+})
+</script>
+
+<template>
+  <section class="rounded-xl border border-secondary/40 p-4" aria-labelledby="limits-title">
+    <h2 id="limits-title" class="text-base font-semibold">
+      Limits
+    </h2>
+
+    <p v-if="!view" class="mt-2 text-sm">
+      <template v-if="requestType === 'leave'">
+        No balance applies to personal or unpaid leave.
+      </template>
+      <template v-else>
+        No department budget information is available for this claim.
+      </template>
+    </p>
+
+    <template v-else>
+      <p class="mt-1 text-sm font-medium">
+        {{ view.title }}
+      </p>
+      <div
+        v-if="view.over"
+        class="mt-2 flex items-start gap-2 rounded-lg px-2.5 py-2 text-sm"
+        :class="toneClass('amber')"
+        role="note"
+      >
+        <IconGlyph name="alert" class="mt-0.5 h-4 w-4 shrink-0" />
+        <p>
+          <span class="font-semibold">Over limit. </span>{{ over }} The limit does not block the request; you decide.
+        </p>
+      </div>
+      <LimitBar class="mt-3" :bar="view.bar" :label="view.label" show-requested />
+      <dl class="mt-3 divide-y divide-secondary/15 text-sm">
+        <div v-for="row in view.rows" :key="row.key" class="flex items-baseline justify-between gap-3 py-1.5">
+          <dt :class="row.emphasis ? 'font-semibold' : ''">
+            {{ row.label }}
+          </dt>
+          <dd class="text-right tabular-nums" :class="row.emphasis ? 'font-bold' : ''">
+            {{ row.value }}
+          </dd>
+        </div>
+      </dl>
+    </template>
+  </section>
+</template>
+<script setup lang="ts">
+import type { BarView } from '~/utils/approvals'
+
+/**
+ * Stacked bar: approved | this request | other pending, with a marker at the limit. It is a picture of numbers that
+ * the parent lists as text, so it is exposed as one labelled image (colour is never the only cue).
+ */
+const props = defineProps<{
+  bar: BarView
+  label: string
+  /** Show the "this request" legend entry (balance cards in chat have no current request). */
+  showRequested?: boolean
+}>()
+</script>
+
+<template>
+  <div>
+    <div class="limit-track" role="img" :aria-label="label">
+      <div class="limit-seg-approved h-full" :style="{ width: `${bar.approvedPct}%` }" />
+      <div v-if="bar.requestedPct > 0" class="limit-seg-requested h-full" :class="bar.exceeds ? 'is-over' : ''" :style="{ width: `${bar.requestedPct}%` }" />
+      <div v-if="bar.pendingPct > 0" class="limit-seg-pending h-full" :style="{ width: `${bar.pendingPct}%` }" />
+      <div v-if="bar.limitPct > 0 && bar.limitPct < 100" class="limit-marker" :style="{ left: `calc(${bar.limitPct}% - 1px)` }" />
+    </div>
+    <p class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-xs" aria-hidden="true">
+      <span><span class="limit-swatch limit-seg-approved" /> Approved</span>
+      <span v-if="props.showRequested"><span class="limit-swatch limit-seg-requested" :class="bar.exceeds ? 'is-over' : ''" /> This request</span>
+      <span><span class="limit-swatch limit-seg-pending" /> Pending</span>
+    </p>
+  </div>
+</template>
+<script setup lang="ts">
+const props = defineProps<{
+  status: string
+  /** Label from the API (shown when the status is not one we know). */
+  label?: string
+}>()
+
+const meta = computed(() => statusMeta(props.status, props.label))
+</script>
+
+<template>
+  <span
+    class="inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-semibold"
+    :class="toneClass(meta.tone)"
+  >
+    <IconGlyph :name="meta.icon" class="h-3.5 w-3.5 shrink-0" />
+    {{ meta.label }}
+  </span>
+</template>
+<script setup lang="ts">
+/**
+ * Accessible modal built on the native <dialog>: showModal() gives a focus trap, an inert page behind it, Escape to
+ * close and focus return to the opener. `busy` blocks every way of closing (Escape, backdrop, the parent's buttons
+ * are disabled by the parent). Mount the content with `v-if` from the parent only when it needs to be created lazily.
+ */
+const props = defineProps<{
+  open: boolean
+  /** Accessible name (the visible heading is referenced by `labelledby` instead when given). */
+  label?: string
+  labelledby?: string
+  describedby?: string
+  busy?: boolean
+  /** Use role="alertdialog" for a confirmation that needs an answer. */
+  alert?: boolean
+}>()
+const emit = defineEmits<{ close: [] }>()
+
+const dialog = ref<HTMLDialogElement | null>(null)
+
+watch(() => props.open, async (open) => {
+  await nextTick()
+  const el = dialog.value
+  if (!el) return
+  if (open && !el.open) el.showModal()
+  else if (!open && el.open) el.close()
+}, { immediate: true, flush: 'post' })
+
+onMounted(() => {
+  if (props.open && dialog.value && !dialog.value.open) dialog.value.showModal()
+})
+
+function onCancel(event: Event) {
+  event.preventDefault() // the parent decides (it flips `open`), so state and DOM never disagree
+  if (!props.busy) emit('close')
+}
+
+function onBackdrop(event: MouseEvent) {
+  if (event.target === dialog.value && !props.busy) emit('close')
+}
+</script>
+
+<template>
+  <dialog
+    ref="dialog"
+    :role="alert ? 'alertdialog' : 'dialog'"
+    :aria-label="labelledby ? undefined : label"
+    :aria-labelledby="labelledby"
+    :aria-describedby="describedby"
+    :aria-busy="busy ? 'true' : undefined"
+    class="modal-dialog m-auto w-[min(32rem,calc(100vw-1.5rem))] rounded-xl border border-secondary/50 bg-background p-0 text-secondary shadow-2xl"
+    @cancel="onCancel"
+    @click="onBackdrop"
+  >
+    <div v-if="open" class="p-4 sm:p-5">
+      <slot />
+    </div>
+  </dialog>
+</template>

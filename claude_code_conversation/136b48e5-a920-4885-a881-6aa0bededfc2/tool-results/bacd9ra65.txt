@@ -1,0 +1,852 @@
+"""Card actions: what happens when the user presses Confirm or Discard.
+
+Transaction discipline (never hold a write transaction across an HTTP call):
+
+1. one short transaction: compare-and-swap the conversation state (the card becomes ``used``
+   and ``state_version`` is bumped, so a double click loses with 409), re-validate, write the
+   request (create) and its audit rows, COMMIT;
+2. call the submission adapter with NO transaction open;
+3. a new short transaction records the ``external_submissions`` row (including the exact
+   request body), the status change, audit rows, notifications and the result message.
+
+Only the fields defined by ``LeaveSubmissionPayload`` / ``ClaimSubmissionPayload`` are sent;
+everything else stays in SQLite.
+"""
+
+import logging
+import time
+from dataclasses import dataclass
+from datetime import date
+
+from sqlalchemy.orm import Session
+
+from app.chat import cards as card_builders
+from app.chat.policy import EDITABLE_STATUSES, RETRYABLE_STATUSES
+from app.chat.resolver import not_editable_message, noun
+from app.chat.state import ConversationState, PendingCard, normalised_values, payload_hash
+from app.chat.store import add_message, cas_save_state, set_card_state, stored_card
+from app.chat.text import scrub
+from app.chat.validation import (
+    Missing,
+    Problem,
+    ValidClaim,
+    ValidLeave,
+    validate_claim,
+    validate_leave,
+)
+from app.db.models import ClaimRequest, Conversation, ConversationMessage, LeaveRequest, User
+from app.domain.clock import utcnow
+from app.domain.enums import RequestStatus, RequestType, SenderType, SubmissionStatus
+from app.domain.errors import DomainError
+from app.domain.transitions import apply_transition
+from app.integrations.base import (
+    ClaimSubmissionPayload,
+    LeaveSubmissionPayload,
+    SubmissionAdapter,
+    SubmissionResult,
+)
+from app.schemas.chat import ConfirmationCard, ResultCard, TraceStep, UiCard
+from app.services.attachments import link_to_request
+from app.services.audit import create_notification, record_audit, record_external_submission
+from app.services.requests import (
+    MODELS,
+    Req,
+    approver_user_ids,
+    entity_type,
+    get_own_request,
+    request_values,
+    status_label,
+)
+
+logger = logging.getLogger(__name__)
+
+Outcome = ValidLeave | ValidClaim
+
+
+class StaleCardError(Exception):
+    """The card is used, superseded, discarded or unknown: the API answers 409."""
+
+
+@dataclass
+class ActionResult:
+    messages: list[ConversationMessage]
+    warning_code: str | None = None
+
+
+def _ms(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
+
+
+def _step(label: str, detail: str, started: float, ok: bool = True) -> TraceStep:
+    return TraceStep(step="submit", label=label, detail=detail, ok=ok, duration_ms=_ms(started))
+
+
+class CardActions:
+    def __init__(
+        self,
+        session: Session,
+        adapter: SubmissionAdapter,
+        user: User,
+        conversation: Conversation,
+        today: date,
+    ) -> None:
+        self.session = session
+        self.adapter = adapter
+        self.user = user
+        self.conv = conversation
+        self.today = today
+
+    # ---- entry points -------------------------------------------------------------------------
+    def discard(self, state: ConversationState, card: PendingCard) -> ActionResult:
+        new_state = state.model_copy(deep=True)
+        new_state.pending_card = None
+        if card.action in ("create", "update") or (
+            new_state.editing_request_id is not None
+            and new_state.editing_request_id == card.request_id
+        ):
+            new_state.reset_draft()
+        if not cas_save_state(self.session, self.conv.id, state.state_version, new_state):
+            self.session.rollback()
+            raise StaleCardError("The conversation changed; this card is no longer active.")
+        set_card_state(self.session, self.conv.id, card.card_id, "discarded")
+        text = {
+            "create": "Okay, I discarded that draft. Nothing was saved or submitted.",
+            "update": "Okay, nothing was changed. The request keeps its current details.",
+            "cancel": "Okay, I kept the request as it is. Nothing was cancelled.",
+            "retry": (
+                "Okay. The request stays as Submission failed. Ask me to retry it whenever "
+                "you like."
+            ),
+        }[card.action]
+        started = time.perf_counter()
+        msg = add_message(
+            self.session,
+            self.conv.id,
+            SenderType.ASSISTANT,
+            text,
+            trace=[
+                TraceStep(
+                    step="decide",
+                    label="Card discarded by you",
+                    detail=f"{card.action} {card.request_type.value}: nothing saved",
+                    ok=True,
+                    duration_ms=_ms(started),
+                )
+            ],
+        )
+        self.session.commit()
+        return ActionResult([msg])
+
+    def confirm(self, state: ConversationState, card: PendingCard) -> ActionResult:
+        if card.action == "create":
+            return self._confirm_create(state, card)
+        if card.action == "update":
+            return self._confirm_update(state, card)
+        if card.action == "cancel":
+            return self._confirm_cancel(state, card)
+        return self._confirm_retry(state, card)
+
+    # ---- shared pieces ------------------------------------------------------------------------
+    def _claim_card(
+        self, state: ConversationState, new_state: ConversationState, card: PendingCard
+    ) -> None:
+        """Phase 1a: win the compare-and-swap (raises ``StaleCardError`` when we lose)."""
+        if not cas_save_state(self.session, self.conv.id, state.state_version, new_state):
+            self.session.rollback()
+            raise StaleCardError("This card was already used or replaced.")
+        set_card_state(self.session, self.conv.id, card.card_id, "used")
+
+    def _revalidate(
+        self, state: ConversationState, rtype: RequestType
+    ) -> Outcome | Problem | Missing:
+        kwargs = {
+            "employee_id": self.user.id,
+            "employee_email": self.user.email,
+            "today": self.today,
+            "editing_request_id": state.editing_request_id,
+        }
+        if rtype == RequestType.LEAVE:
+            return validate_leave(self.session, state.leave, **kwargs)
+        return validate_claim(self.session, state.claim, **kwargs)
+
+    def _abort(
+        self,
+        cas_state: ConversationState,
+        keep: ConversationState,
+        card: PendingCard,
+        text: str,
+        detail: str,
+    ) -> ActionResult:
+        """The world changed since the card was shown: drop the card, keep the draft, explain."""
+        restored = keep.model_copy(deep=True)
+        restored.pending_card = None
+        cas_save_state(self.session, self.conv.id, cas_state.state_version, restored)
+        set_card_state(self.session, self.conv.id, card.card_id, "superseded")
+        msg = add_message(
+            self.session,
+            self.conv.id,
+            SenderType.ASSISTANT,
+            text,
+            trace=[
+                TraceStep(
+                    step="validate",
+                    label="Re-checked before saving",
+                    detail=detail,
+                    ok=False,
+                    duration_ms=0,
+                )
+            ],
+        )
+        self.session.commit()
+        return ActionResult([msg])
+
+    def _payload(self, req: Req) -> LeaveSubmissionPayload | ClaimSubmissionPayload:
+        if isinstance(req, LeaveRequest):
+            return LeaveSubmissionPayload(
+                employee_email=self.user.email,
+                leave_type=req.leave_type,
+                start_date=req.start_date,
+                end_date=req.end_date,
+            )
+        return ClaimSubmissionPayload(
+            employee_email=self.user.email,
+            claim_type=req.claim_type,
+            amount=req.amount,
+            receipt_date=req.receipt_date,
+        )
+
+    def _payload_from_outcome(
+        self, outcome: Outcome
+    ) -> LeaveSubmissionPayload | ClaimSubmissionPayload:
+        if isinstance(outcome, ValidLeave):
+            d = outcome.draft
+            return LeaveSubmissionPayload(
+                employee_email=self.user.email,
+                leave_type=d.leave_type,
+                start_date=d.start_date,
+                end_date=d.end_date,
+            )
+        c = outcome.draft
+        return ClaimSubmissionPayload(
+            employee_email=self.user.email,
+            claim_type=c.claim_type,
+            amount=c.amount,
+            receipt_date=c.receipt_date,
+        )
+
+    def _send(self, payload: LeaveSubmissionPayload | ClaimSubmissionPayload) -> SubmissionResult:
+        """Call the adapter with no DB transaction open; never raises."""
+        try:
+            if isinstance(payload, LeaveSubmissionPayload):
+                return self.adapter.submit_leave(payload)
+            return self.adapter.submit_claim(payload)
+        except Exception:
+            logger.exception("Submission adapter raised unexpectedly")
+            return SubmissionResult(
+                ok=False, error_message="Unexpected error while contacting the submission service."
+            )
+
+    def _record_submission(
+        self, req: Req, result: SubmissionResult, wire: dict[str, object]
+    ) -> None:
+        record_external_submission(
+            self.session,
+            request_type=req.request_type,
+            request_id=req.id,
+            status=SubmissionStatus.SUCCESS if result.ok else SubmissionStatus.FAILED,
+            http_status=result.http_status,
+            external_reference_id=result.external_reference_id,
+            response_summary=result.response_summary,
+            error_message=None if result.ok else (result.error_message or "Submission failed"),
+            provider=self.adapter.provider,
+            request_payload=dict(wire),
+        )
+
+    def _notify(self, req: Req, event_type: str) -> None:
+        for user_id in approver_user_ids(self.session, req.request_type):
+            create_notification(
+                self.session,
+                recipient_user_id=user_id,
+                event_type=event_type,
+                request_type=req.request_type,
+                request_id=req.id,
+            )
+
+    def _provider_label(self) -> str:
+        if self.adapter.provider == "reqres":
+            return "the ReqRes mock API"
+        return f'the offline "{self.adapter.provider}" adapter (not ReqRes)'
+
+    def _failure_text(self, result: SubmissionResult) -> str:
+        return scrub(result.error_message or "the mock API did not accept it", 160)
+
+    def _retry_card(self, req: Req) -> ConfirmationCard:
+        values = request_values(req)
+        new = card_builders.display_values(
+            req.request_type,
+            values,
+            working_days=values.get("working_days"),
+            email=self.user.email,
+            status_label=status_label(req.status),
+        )
+        return card_builders.build_card(
+            action="retry", request_type=req.request_type, request_id=req.id, new=new
+        )
+
+    def _state_with_card(
+        self, base: ConversationState, card: ConfirmationCard, hash_: str
+    ) -> ConversationState:
+        state = base.model_copy(deep=True)
+        state.pending_card = PendingCard(
+            card_id=card.card_id,
+            action=card.action,
+            request_type=card.request_type,
+            request_id=card.request_id,
+            payload_hash=hash_,
+        )
+        return state
+
+    def _result_message(self, text: str, ui: UiCard, steps: list[TraceStep]) -> ConversationMessage:
+        return add_message(
+            self.session, self.conv.id, SenderType.ASSISTANT, text, ui=ui, trace=steps
+        )
+
+    def _check_hash(self, state: ConversationState, card: PendingCard) -> None:
+        if card.action in ("create", "update"):
+            expected = payload_hash(
+                card.action, card.request_id, normalised_values(state, card.request_type)
+            )
+            if expected != card.payload_hash:
+                raise StaleCardError("The draft changed after this card was shown.")
+
+    # ---- submit + finish (create / retry) ----------------------------------------------------
+    def _submit_and_finish(
+        self, req: Req, cas_state: ConversationState, steps: list[TraceStep], *, retry: bool
+    ) -> ActionResult:
+        rtype, rid = req.request_type, req.id
+        payload = self._payload(req)
+        wire = payload.to_wire()
+        started = time.perf_counter()
+        result = self._send(payload)  # <- no transaction is open here
+        steps.append(
+            _step(
+                f"Sent to {self._provider_label()}",
+                f"HTTP {result.http_status}" if result.http_status else "no HTTP response",
+                started,
+                ok=result.ok,
+            )
+        )
+
+        started = time.perf_counter()
+        req = self.session.get(MODELS[rtype], rid)  # type: ignore[assignment]
+        assert req is not None
+        self._record_submission(req, result, wire)
+        old_status = req.status
+        approver = "HR" if rtype == RequestType.LEAVE else "Finance"
+        if result.ok:
+            apply_transition(req, RequestStatus.PENDING_APPROVAL, actor=None)
+            record_audit(
+                self.session,
+                entity_type=entity_type(rtype),
+                entity_id=rid,
+                event_type="submission.succeeded",
+                actor_user_id=self.user.id,
+                from_status=old_status,
+                to_status=req.status,
+                metadata={
+                    "http_status": result.http_status,
+                    "external_reference_id": result.external_reference_id,
+                    "provider": self.adapter.provider,
+                    "retry": retry,
+                },
+            )
+            self._notify(req, "request.submitted")
+            ref = result.external_reference_id
+            ref_text = f" (reference {ref})" if ref else ""
+            card = ResultCard(
+                outcome="submitted",
+                request_type=rtype,
+                request_id=rid,
+                status=req.status.value,
+                status_label=status_label(req.status),
+                message=f"Submitted to {self._provider_label()}{ref_text}.",
+                external_reference_id=ref,
+            )
+            steps.append(
+                _step("Recorded the result", f"{rtype.value} #{rid} is now pending", started)
+            )
+            msg = self._result_message(
+                f"Done. Your {noun(rtype)} #{rid} was submitted to {self._provider_label()}"
+                f"{ref_text} and is now pending {approver} approval.",
+                card,
+                steps,
+            )
+            self.session.commit()
+            return ActionResult([msg])
+
+        if old_status == RequestStatus.DRAFT:
+            apply_transition(req, RequestStatus.SUBMISSION_FAILED, actor=None)
+        record_audit(
+            self.session,
+            entity_type=entity_type(rtype),
+            entity_id=rid,
+            event_type="submission.failed",
+            actor_user_id=self.user.id,
+            from_status=old_status,
+            to_status=req.status,
+            metadata={
+                "http_status": result.http_status,
+                "error": self._failure_text(result),
+                "provider": self.adapter.provider,
+                "retry": retry,
+            },
+        )
+        steps.append(
+            _step(
+                "Recorded the failure",
+                f"{rtype.value} #{rid} kept as submission_failed",
+                started,
+                ok=False,
+            )
+        )
+        return self._failed_messages(req, cas_state, result, steps, headline=None)
+
+    def _failed_messages(
+        self,
+        req: Req,
+        cas_state: ConversationState,
+        result: SubmissionResult,
+        steps: list[TraceStep],
+        *,
+        headline: str | None,
+    ) -> ActionResult:
+        """Result card (failed) + a fresh retry card; commits."""
+        rtype, rid = req.request_type, req.id
+        why = self._failure_text(result)
+        failed = ResultCard(
+            outcome="failed",
+            request_type=rtype,
+            request_id=rid,
+            status=req.status.value,
+            status_label=status_label(req.status),
+            message=f"Could not submit to {self._provider_label()}: {why}",
+        )
+        first = self._result_message(
+            headline
+            or (
+                f"Your {noun(rtype)} was saved as #{rid}, but sending it to "
+                f"{self._provider_label()} failed ({why}). It is marked Submission failed."
+            ),
+            failed,
+            steps,
+        )
+        retry_card = self._retry_card(req)
+        new_state = self._state_with_card(cas_state, retry_card, payload_hash("retry", rid, {}))
+        messages = [first]
+        if cas_save_state(self.session, self.conv.id, cas_state.state_version, new_state):
+            messages.append(
+                add_message(
+                    self.session,
+                    self.conv.id,
+                    SenderType.ASSISTANT,
+                    "Press Retry to send it again, or tell me what to change first.",
+                    ui=retry_card,
+                )
+            )
+        self.session.commit()
+        return ActionResult(messages, warning_code="submission_failed")
+
+    # ---- create ------------------------------------------------------------------------------
+    def _confirm_create(self, state: ConversationState, card: PendingCard) -> ActionResult:
+        rtype = card.request_type
+        self._check_hash(state, card)
+        new_state = state.model_copy(deep=True)
+        new_state.reset_draft()
+        new_state.pending_card = None
+        started = time.perf_counter()
+        self._claim_card(state, new_state, card)
+
+        outcome = self._revalidate(state, rtype)
+        if isinstance(outcome, (Problem, Missing)):
+            text = (
+                outcome.message
+                if isinstance(outcome, Problem)
+                else "Some details are missing now; please tell me again."
+            )
+            return self._abort(
+                new_state,
+                state,
+                card,
+                f"I re-checked before saving and something changed. {text}",
+                "re-validation failed",
+            )
+        assert isinstance(outcome, (ValidLeave, ValidClaim))
+
+        if isinstance(outcome, ValidLeave):
+            d, days = outcome.draft, outcome.days
+            req: Req = LeaveRequest(
+                employee_id=self.user.id,
+                leave_type=d.leave_type,
+                start_date=d.start_date,
+                end_date=d.end_date,
+                start_day_part=d.start_day_part,
+                end_day_part=d.end_day_part,
+                calendar_days=days.calendar_days,
+                working_days=days.working_days,
+                status=RequestStatus.DRAFT,
+                conversation_id=self.conv.id,
+            )
+        else:
+            c = outcome.draft
+            req = ClaimRequest(
+                employee_id=self.user.id,
+                claim_type=c.claim_type,
+                amount=c.amount,
+                currency=c.currency,
+                receipt_date=c.receipt_date,
+                status=RequestStatus.DRAFT,
+                conversation_id=self.conv.id,
+            )
+        self.session.add(req)
+        self.session.flush()
+        link_to_request(self.session, state.attachment_ids, rtype, req.id, self.user.id)
+        etype = entity_type(rtype)
+        record_audit(
+            self.session,
+            entity_type=etype,
+            entity_id=req.id,
+            event_type="request.created",
+            actor_user_id=self.user.id,
+            to_status=RequestStatus.DRAFT,
+            metadata={"conversation_id": self.conv.id},
+        )
+        record_audit(
+            self.session,
+            entity_type=etype,
+            entity_id=req.id,
+            event_type="request.confirmed",
+            actor_user_id=self.user.id,
+            metadata={"confirmed_by": "employee", "card_id": card.card_id},
+        )
+        self.session.commit()  # end of phase 1: the request exists locally as a draft
+        steps = [
+            _step("Saved to the database", f"{rtype.value} #{req.id} created as draft", started)
+        ]
+        return self._submit_and_finish(req, new_state, steps, retry=False)
+
+    # ---- retry -------------------------------------------------------------------------------
+    def _confirm_retry(self, state: ConversationState, card: PendingCard) -> ActionResult:
+        rtype = card.request_type
+        assert card.request_id is not None
+        new_state = state.model_copy(deep=True)
+        new_state.pending_card = None
+        started = time.perf_counter()
+        self._claim_card(state, new_state, card)
+        req = get_own_request(self.session, self.user.id, rtype, card.request_id)
+        if req is None or req.status not in RETRYABLE_STATUSES:
+            text = (
+                not_editable_message(req, "change")
+                if req is not None
+                else "I can't find that request any more."
+            )
+            if req is not None and req.status == RequestStatus.PENDING_APPROVAL:
+                text = f"{noun(rtype).capitalize()} #{req.id} was already submitted successfully."
+            return self._abort(new_state, state, card, text, "request is not retryable")
+        self.session.commit()
+        steps = [_step("Loaded the saved request", f"{rtype.value} #{req.id}", started)]
+        return self._submit_and_finish(req, new_state, steps, retry=True)
+
+    # ---- cancel ------------------------------------------------------------------------------
+    def _confirm_cancel(self, state: ConversationState, card: PendingCard) -> ActionResult:
+        rtype = card.request_type
+        assert card.request_id is not None
+        new_state = state.model_copy(deep=True)
+        new_state.pending_card = None
+        if new_state.editing_request_id == card.request_id:
+            new_state.reset_draft()
+        started = time.perf_counter()
+        self._claim_card(state, new_state, card)
+        req = get_own_request(self.session, self.user.id, rtype, card.request_id)
+        if req is None:
+            return self._abort(
+                new_state, state, card, "I can't find that request any more.", "request not found"
+            )
+        if req.status not in EDITABLE_STATUSES:
+            return self._abort(
+                new_state, state, card, not_editable_message(req, "cancel"), "request is final"
+            )
+        old_status = req.status
+        try:
+            apply_transition(req, RequestStatus.CANCELLED, actor=self.user)
+        except DomainError as exc:  # defensive: the status check above makes this unreachable
+            return self._abort(
+                new_state, state, card, f"That can't be cancelled ({exc}).", "transition refused"
+            )
+        record_audit(
+            self.session,
+            entity_type=entity_type(rtype),
+            entity_id=req.id,
+            event_type="request.cancelled",
+            actor_user_id=self.user.id,
+            from_status=old_status,
+            to_status=RequestStatus.CANCELLED,
+            metadata={"cancelled_by": "employee", "conversation_id": self.conv.id},
+        )
+        result_card = ResultCard(
+            outcome="cancelled",
+            request_type=rtype,
+            request_id=req.id,
+            status=req.status.value,
+            status_label=status_label(req.status),
+            message=(
+                f"{noun(rtype).capitalize()} #{req.id} was cancelled "
+                "(nothing was sent to the mock API)."
+            ),
+        )
+        msg = self._result_message(
+            f"Done. {noun(rtype).capitalize()} #{req.id} has been cancelled.",
+            result_card,
+            [
+                _step(
+                    "Cancelled locally",
+                    f"{old_status.value} -> cancelled; no external call",
+                    started,
+                )
+            ],
+        )
+        self.session.commit()
+        return ActionResult([msg])
+
+    # ---- update ------------------------------------------------------------------------------
+    def _apply_values(self, req: Req, outcome: Outcome) -> None:
+        if isinstance(req, LeaveRequest) and isinstance(outcome, ValidLeave):
+            d = outcome.draft
+            req.leave_type = d.leave_type
+            req.start_date = d.start_date
+            req.end_date = d.end_date
+            req.start_day_part = d.start_day_part
+            req.end_day_part = d.end_day_part
+            req.calendar_days = outcome.days.calendar_days
+            req.working_days = outcome.days.working_days
+        elif isinstance(req, ClaimRequest) and isinstance(outcome, ValidClaim):
+            c = outcome.draft
+            req.claim_type = c.claim_type
+            req.amount = c.amount
+            req.currency = c.currency
+            req.receipt_date = c.receipt_date
+        req.updated_at = utcnow()
+
+    def _confirm_update(self, state: ConversationState, card: PendingCard) -> ActionResult:
+        rtype = card.request_type
+        assert card.request_id is not None
+        rid = card.request_id
+        self._check_hash(state, card)
+        new_state = state.model_copy(deep=True)
+        new_state.reset_draft()
+        new_state.pending_card = None
+        started = time.perf_counter()
+        self._claim_card(state, new_state, card)
+
+        req = get_own_request(self.session, self.user.id, rtype, rid)
+        if req is None:
+            return self._abort(
+                new_state, state, card, "I can't find that request any more.", "request not found"
+            )
+        if req.status not in EDITABLE_STATUSES:
+            return self._abort(
+                new_state, state, card, not_editable_message(req, "change"), "request is final"
+            )
+        outcome = self._revalidate(state, rtype)
+        if isinstance(outcome, (Problem, Missing)):
+            text = outcome.message if isinstance(outcome, Problem) else "Some details are missing."
+            return self._abort(
+                new_state,
+                state,
+                card,
+                f"I re-checked before saving and something changed. {text}",
+                "re-validation failed",
+            )
+        assert isinstance(outcome, (ValidLeave, ValidClaim))
+        was_status = req.status
+        before = request_values(req)
+        self.session.commit()  # end of phase 1: nothing about the request has changed yet
+
+        payload = self._payload_from_outcome(outcome)
+        wire = payload.to_wire()
+        steps = [_step("Checked the change", f"{rtype.value} #{rid} may still be edited", started)]
+        sent = time.perf_counter()
+        result = self._send(payload)  # <- no transaction is open here
+        steps.append(
+            _step(
+                f"Re-sent to {self._provider_label()}",
+                f"HTTP {result.http_status}" if result.http_status else "no HTTP response",
+                sent,
+                ok=result.ok,
+            )
+        )
+
+        started = time.perf_counter()
+        req = self.session.get(MODELS[rtype], rid)  # type: ignore[assignment]
+        assert req is not None
+        self._record_submission(req, result, wire)
+        if req.status != was_status:
+            # e.g. an approver reviewed it while we were talking to the mock API
+            record_audit(
+                self.session,
+                entity_type=entity_type(rtype),
+                entity_id=rid,
+                event_type="submission.failed",
+                actor_user_id=self.user.id,
+                metadata={"during": "update", "reason": "request changed meanwhile"},
+            )
+            msg = add_message(
+                self.session,
+                self.conv.id,
+                SenderType.ASSISTANT,
+                f"{noun(rtype).capitalize()} #{rid} changed status while I was saving "
+                f"({status_label(req.status)}), so I did not apply your changes.",
+                trace=steps,
+            )
+            self.session.commit()
+            return ActionResult([msg])
+
+        apply_changes = result.ok or was_status == RequestStatus.SUBMISSION_FAILED
+        if apply_changes:
+            self._apply_values(req, outcome)
+            link_to_request(self.session, state.attachment_ids, rtype, rid, self.user.id)
+            after = request_values(req)
+            changes = {
+                k: {"from": before.get(k), "to": after[k]}
+                for k in after
+                if before.get(k) != after[k]
+            }
+            record_audit(
+                self.session,
+                entity_type=entity_type(rtype),
+                entity_id=rid,
+                event_type="request.updated",
+                actor_user_id=self.user.id,
+                from_status=was_status,
+                to_status=req.status,
+                metadata={"changes": changes, "conversation_id": self.conv.id},
+            )
+        if result.ok:
+            if was_status == RequestStatus.SUBMISSION_FAILED:
+                apply_transition(req, RequestStatus.PENDING_APPROVAL, actor=None)
+            record_audit(
+                self.session,
+                entity_type=entity_type(rtype),
+                entity_id=rid,
+                event_type="submission.succeeded",
+                actor_user_id=self.user.id,
+                from_status=was_status,
+                to_status=req.status,
+                metadata={
+                    "http_status": result.http_status,
+                    "external_reference_id": result.external_reference_id,
+                    "provider": self.adapter.provider,
+                    "during": "update",
+                },
+            )
+            self._notify(
+                req,
+                "request.submitted"
+                if was_status == RequestStatus.SUBMISSION_FAILED
+                else "request.updated",
+            )
+            ref = result.external_reference_id
+            ref_text = f" (reference {ref})" if ref else ""
+            steps.append(_step("Recorded the result", f"{rtype.value} #{rid} updated", started))
+            card_out = ResultCard(
+                outcome="updated",
+                request_type=rtype,
+                request_id=rid,
+                status=req.status.value,
+                status_label=status_label(req.status),
+                message=f"Changes saved and re-submitted to {self._provider_label()}{ref_text}.",
+                external_reference_id=ref,
+            )
+            msg = self._result_message(
+                f"Done. Your changes to {noun(rtype)} #{rid} were saved and re-submitted to "
+                f"{self._provider_label()}{ref_text}.",
+                card_out,
+                steps,
+            )
+            self.session.commit()
+            return ActionResult([msg])
+
+        why = self._failure_text(result)
+        record_audit(
+            self.session,
+            entity_type=entity_type(rtype),
+            entity_id=rid,
+            event_type="submission.failed",
+            actor_user_id=self.user.id,
+            from_status=was_status,
+            to_status=req.status,
+            metadata={
+                "http_status": result.http_status,
+                "error": why,
+                "provider": self.adapter.provider,
+                "during": "update",
+            },
+        )
+        steps.append(
+            _step(
+                "Recorded the failure",
+                "the update was not applied" if not apply_changes else "kept as submission_failed",
+                started,
+                ok=False,
+            )
+        )
+        if was_status == RequestStatus.SUBMISSION_FAILED:
+            return self._failed_messages(
+                req,
+                new_state,
+                result,
+                steps,
+                headline=(
+                    f"I saved your changes to {noun(rtype)} #{rid}, but sending it to "
+                    f"{self._provider_label()} failed again ({why}). It is still marked "
+                    "Submission failed."
+                ),
+            )
+        # pending_approval: nothing changed; offer the same update again with a fresh card
+        failed = ResultCard(
+            outcome="failed",
+            request_type=rtype,
+            request_id=rid,
+            status=req.status.value,
+            status_label=status_label(req.status),
+            message=f"Could not re-submit to {self._provider_label()}: {why}. Nothing was changed.",
+        )
+        first = self._result_message(
+            f"I couldn't send your changes to {self._provider_label()} ({why}), so nothing "
+            f"was changed: {noun(rtype)} #{rid} keeps its original details and stays "
+            f"{status_label(req.status)}.",
+            failed,
+            steps,
+        )
+        messages = [first]
+        old_card = stored_card(self.session, self.conv.id, card.card_id)
+        if old_card is not None:
+            again = old_card.model_copy(
+                update={"card_id": card_builders.new_card_id(), "state": "open"}
+            )
+            restore = self._state_with_card(state, again, card.payload_hash)
+            if cas_save_state(self.session, self.conv.id, new_state.state_version, restore):
+                messages.append(
+                    add_message(
+                        self.session,
+                        self.conv.id,
+                        SenderType.ASSISTANT,
+                        "Press Save changes to try sending the update again, or tell me "
+                        "what to adjust.",
+                        ui=again,
+                    )
+                )
+        self.session.commit()
+        return ActionResult(messages, warning_code="submission_failed")
+
+
+__all__ = ["ActionResult", "CardActions", "StaleCardError"]

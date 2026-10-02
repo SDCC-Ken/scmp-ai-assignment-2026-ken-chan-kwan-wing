@@ -1,0 +1,961 @@
+"""Engine factory, SQLite safety pragmas, ``init_db`` and the ``get_db`` dependency."""
+
+import logging
+from collections.abc import Iterator
+from functools import cached_property
+from pathlib import Path
+from typing import Any
+
+from fastapi import HTTPException, Request, status
+from sqlalchemy import Engine, create_engine, event, inspect, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.db.base import Base
+
+logger = logging.getLogger(__name__)
+
+BUSY_TIMEOUT_MS = 5000
+
+# Bump when a change cannot be applied additively (see app.db.migrate). Phase 3 = 3: it removed
+# the "reject needs a note" CHECK and added the organisation tables, which SQLite cannot do in
+# place, so a database created earlier must be recreated.
+SCHEMA_VERSION = 3
+SCHEMA_VERSION_KEY = "schema_version"
+SCHEMA_RESET_MESSAGE = (
+    "This database was created before Phase 3. Recreate it: docker compose down -v, "
+    "or python -m app.cli seed --reset --yes"
+)
+
+
+def _is_memory(database: str | None) -> bool:
+    return database in (None, "", ":memory:") or bool(
+        database and database.startswith("file::memory:")
+    )
+
+
+def _set_sqlite_pragmas(dbapi_connection: Any, in_memory: bool) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        if not in_memory:
+            cursor.execute("PRAGMA journal_mode=WAL")
+    finally:
+        cursor.close()
+
+
+def create_db_engine(url: str) -> Engine:
+    """Create a SQLite engine with safety pragmas applied on every connection."""
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "sqlite":
+        raise ValueError("Only SQLite database URLs are supported")
+    in_memory = _is_memory(parsed.database)
+    kwargs: dict[str, Any] = {"connect_args": {"check_same_thread": False}}
+    if in_memory:
+        kwargs["poolclass"] = StaticPool  # one shared connection so :memory: survives sessions
+    else:
+        Path(parsed.database).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(url, **kwargs)
+
+    @event.listens_for(engine, "connect")
+    def _on_connect(dbapi_connection: Any, _record: Any) -> None:
+        _set_sqlite_pragmas(dbapi_connection, in_memory)
+
+    return engine
+
+
+def stored_schema_version(engine: Engine) -> int | None:
+    """The ``schema_version`` stored in the database, or None when missing / unreadable."""
+    if not inspect(engine).has_table("schema_meta"):
+        return None
+    with engine.connect() as conn:
+        value = conn.execute(
+            text("SELECT value FROM schema_meta WHERE key = :key"), {"key": SCHEMA_VERSION_KEY}
+        ).scalar()
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def schema_problem(engine: Engine) -> str | None:
+    """Why this existing database cannot be used as is (None = fine or brand new).
+
+    An empty file is fine. A database that already has the application's tables but a lower or
+    missing ``schema_version`` predates Phase 3 and needs to be recreated.
+    """
+    tables = set(inspect(engine).get_table_names())
+    if not tables:
+        return None
+    version = stored_schema_version(engine)
+    if version is None and "users" not in tables:
+        return None  # not one of ours (nothing to protect); create_all just adds our tables
+    if version is None or version < SCHEMA_VERSION:
+        return SCHEMA_RESET_MESSAGE
+    return None
+
+
+def _stamp_schema_version(engine: Engine) -> None:
+    from app.db.models import SchemaMeta
+
+    with Session(engine) as session:
+        row = session.scalar(select(SchemaMeta).where(SchemaMeta.key == SCHEMA_VERSION_KEY))
+        if row is None:
+            session.add(SchemaMeta(key=SCHEMA_VERSION_KEY, value=str(SCHEMA_VERSION)))
+        elif row.value != str(SCHEMA_VERSION):
+            row.value = str(SCHEMA_VERSION)
+        session.commit()
+
+
+def init_db(engine: Engine) -> str | None:
+    """Create missing tables, then add missing nullable columns/indexes to existing ones.
+
+    Returns None on success. A database from before Phase 3 is NOT touched: the reason (an
+    instruction for the operator) is logged as one clear ERROR and returned, and the caller
+    keeps running so the API can still boot and explain (503). There is no Alembic in this PoC:
+    ``sync_schema`` only keeps a current-version database working when a later change is purely
+    additive. See ``app.db.migrate``.
+    """
+    from app.db import models  # noqa: F401  (register models on Base.metadata)
+    from app.db.migrate import sync_schema
+
+    problem = schema_problem(engine)
+    if problem is not None:
+        logger.error(problem)
+        return problem
+    Base.metadata.create_all(engine)
+    sync_schema(engine)
+    _stamp_schema_version(engine)
+    return None
+
+
+def drop_all(engine: Engine) -> None:
+    from app.db import models  # noqa: F401
+
+    Base.metadata.drop_all(engine)
+
+
+class Database:
+    """Lazy holder for the engine and session factory (nothing touches disk until used)."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        # Set by init_db(): why the file cannot be used (an operator instruction) or None.
+        self.schema_error: str | None = None
+
+    @cached_property
+    def engine(self) -> Engine:
+        return create_db_engine(self.url)
+
+    @cached_property
+    def session_factory(self) -> sessionmaker[Session]:
+        return sessionmaker(self.engine, expire_on_commit=False)
+
+    def init_db(self) -> str | None:
+        self.schema_error = init_db(self.engine)
+        return self.schema_error
+
+    def dispose(self) -> None:
+        if "engine" in self.__dict__:
+            self.engine.dispose()
+
+
+def get_db(request: Request) -> Iterator[Session]:
+    """FastAPI dependency: one session per request, always closed."""
+    database: Database = request.app.state.database
+    if database.schema_error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=database.schema_error
+        )
+    session = database.session_factory()
+    try:
+        yield session
+    finally:
+        session.close()
+"""Clock helpers. Hong Kong has no DST, so a fixed UTC+8 offset avoids a tzdata dependency."""
+
+from datetime import UTC, date, datetime, timedelta, timezone
+
+HK_TZ = timezone(timedelta(hours=8), "HKT")
+
+
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def today_hk() -> date:
+    return datetime.now(HK_TZ).date()
+"""Typed domain errors. Routes/services map these to HTTP responses."""
+
+
+class DomainError(Exception):
+    """Base class for every business-rule violation."""
+
+
+class InvalidTransitionError(DomainError):
+    """The requested status change is not an edge of the state machine."""
+
+    def __init__(self, from_status: str, to_status: str) -> None:
+        super().__init__(f"Invalid status transition: {from_status} -> {to_status}")
+        self.from_status = from_status
+        self.to_status = to_status
+
+
+class NotAuthorizedError(DomainError):
+    """The actor may not perform the action (wrong role, inactive, or self-review)."""
+
+
+class LeaveCalculationError(DomainError):
+    """Leave dates / day parts are invalid or cover no working day."""
+"""Validation of polymorphic references (no DB foreign key can express them)."""
+
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from app.db.models import ClaimRequest, Conversation, LeaveRequest, User
+from app.domain.enums import RequestType
+
+REQUEST_MODELS: dict[RequestType, type[LeaveRequest] | type[ClaimRequest]] = {
+    RequestType.LEAVE: LeaveRequest,
+    RequestType.CLAIM: ClaimRequest,
+}
+
+# audit_events.entity_type values -> model that must contain entity_id.
+ENTITY_MODELS: dict[str, Any] = {
+    "leave_request": LeaveRequest,
+    "claim_request": ClaimRequest,
+    "user": User,
+    "conversation": Conversation,
+}
+
+
+class InvalidReferenceError(ValueError):
+    """A polymorphic reference points at a row that does not exist / an unknown type."""
+
+
+def ensure_request_exists(session: Session, request_type: RequestType, request_id: int) -> None:
+    model = REQUEST_MODELS[RequestType(request_type)]
+    if session.get(model, request_id) is None:
+        raise InvalidReferenceError(f"{request_type} request {request_id} does not exist")
+
+
+def ensure_entity_exists(session: Session, entity_type: str, entity_id: int | None) -> None:
+    """Unknown entity types are rejected; ``entity_id=None`` is allowed (no entity)."""
+    model = ENTITY_MODELS.get(entity_type)
+    if model is None:
+        raise InvalidReferenceError(f"Unknown entity type: {entity_type}")
+    if entity_id is not None and session.get(model, entity_id) is None:
+        raise InvalidReferenceError(f"{entity_type} {entity_id} does not exist")
+"""Builders for a tiny fictional organisation (bare tables, no seed) used by the org tests."""
+
+from datetime import date
+from decimal import Decimal
+
+from sqlalchemy.orm import Session
+
+from app.db.models import ClaimRequest, Department, LeaveEntitlement, LeaveRequest, User
+from app.domain.clock import utcnow
+from app.domain.enums import (
+    ClaimType,
+    LeaveType,
+    RequestStatus,
+    UserRole,
+)
+
+S = RequestStatus
+DECIDED = (S.APPROVED, S.REJECTED)
+
+
+def add_department(session: Session, name: str = "IT", limit: str = "1000.00") -> Department:
+    row = Department(name=name, claim_limit_amount=Decimal(limit))
+    session.add(row)
+    session.flush()
+    return row
+
+
+def add_user(
+    session: Session,
+    name: str,
+    role: UserRole = UserRole.EMPLOYEE,
+    department: Department | None = None,
+    *,
+    active: bool = True,
+    leave_approver: User | None = None,
+    claim_approver: User | None = None,
+) -> User:
+    first, last = name.lower().split()
+    n = session.query(User).count() + 1
+    row = User(
+        google_subject=f"mock-google-sub-{n:03d}",
+        email=f"{first}.{last}@example.com",
+        display_name=name,
+        role=role,
+        is_active=active,
+        department_id=department.id if department else None,
+        leave_approver_user_id=leave_approver.id if leave_approver else None,
+        claim_approver_user_id=claim_approver.id if claim_approver else None,
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def entitle(
+    session: Session, user: User, year: int, leave_type: LeaveType, days: str
+) -> LeaveEntitlement:
+    row = LeaveEntitlement(
+        user_id=user.id, year=year, leave_type=leave_type, entitled_days=Decimal(days)
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def add_leave(
+    session: Session,
+    user: User,
+    start: str,
+    end: str | None = None,
+    *,
+    status: RequestStatus = S.APPROVED,
+    leave_type: LeaveType = LeaveType.ANNUAL,
+    days: str = "1",
+    approver: User | None = None,
+) -> LeaveRequest:
+    row = LeaveRequest(
+        employee_id=user.id,
+        leave_type=leave_type,
+        start_date=date.fromisoformat(start),
+        end_date=date.fromisoformat(end or start),
+        calendar_days=Decimal(days),
+        working_days=Decimal(days),
+        status=status,
+        approver_user_id=approver.id if approver else None,
+        submitted_at=utcnow() if status != S.DRAFT else None,
+        reviewed_by_user_id=(approver or user).id if status in DECIDED else None,
+        reviewed_at=utcnow() if status in DECIDED else None,
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def add_claim(
+    session: Session,
+    user: User,
+    amount: str,
+    receipt: str,
+    *,
+    status: RequestStatus = S.APPROVED,
+    approver: User | None = None,
+) -> ClaimRequest:
+    row = ClaimRequest(
+        employee_id=user.id,
+        claim_type=ClaimType.MEAL,
+        amount=Decimal(amount),
+        receipt_date=date.fromisoformat(receipt),
+        status=status,
+        approver_user_id=approver.id if approver else None,
+        submitted_at=utcnow() if status != S.DRAFT else None,
+        reviewed_by_user_id=(approver or user).id if status in DECIDED else None,
+        reviewed_at=utcnow() if status in DECIDED else None,
+    )
+    session.add(row)
+    session.flush()
+    return row
+"""Fixtures for the chat tests: frozen Hong Kong date, scripted LLM, recording adapter."""
+
+from collections.abc import Iterator
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.db.session import Database
+from app.main import create_app
+from tests.chat.helpers import TODAY, Chat, RecordingAdapter, ScriptedLLM
+from tests.conftest import CSRF_HEADERS, login, make_settings
+
+CATHY = "cathy.ng@example.com"  # employee with NO editable requests in the seed
+AMY = "amy.lau@example.com"  # employee with pending seed requests (used as "someone else")
+BEN = "ben.chow@example.com"
+HR = "helen.yeung@example.com"  # the HR approver of Cathy and Daniel
+FINANCE = "eva.cheung@example.com"
+
+
+@pytest.fixture(autouse=True)
+def frozen_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze Hong Kong "today" (the chat service and ``ClaimDraft`` both read it)."""
+    monkeypatch.setattr("app.domain.clock.today_hk", lambda: TODAY)
+    monkeypatch.setattr("app.schemas.drafts.today_hk", lambda: TODAY)
+
+
+@pytest.fixture
+def llm() -> ScriptedLLM:
+    return ScriptedLLM()
+
+
+@pytest.fixture
+def adapter() -> RecordingAdapter:
+    return RecordingAdapter()
+
+
+@pytest.fixture
+def chat_app(seeded: Database, llm: ScriptedLLM, adapter: RecordingAdapter) -> FastAPI:
+    return create_app(
+        make_settings(), database=seeded, llm_provider=llm, submission_adapter=adapter
+    )
+
+
+def _client(app: FastAPI, email: str) -> Iterator[TestClient]:
+    with TestClient(app, headers=CSRF_HEADERS) as client:
+        login(client, email)
+        yield client
+
+
+@pytest.fixture
+def cathy(chat_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(chat_app, CATHY)
+
+
+@pytest.fixture
+def amy(chat_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(chat_app, AMY)
+
+
+@pytest.fixture
+def ben(chat_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(chat_app, BEN)
+
+
+@pytest.fixture
+def hr(chat_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(chat_app, HR)
+
+
+@pytest.fixture
+def finance(chat_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(chat_app, FINANCE)
+
+
+@pytest.fixture
+def chat(cathy: TestClient) -> Chat:
+    return Chat(cathy)
+
+
+@pytest.fixture
+def amy_chat(amy: TestClient) -> Chat:
+    return Chat(amy)
+
+
+@pytest.fixture
+def ben_chat(ben: TestClient) -> Chat:
+    return Chat(ben)
+"""Test doubles and small helpers for the chat tests (no network, no real LLM)."""
+
+from collections.abc import Callable, Sequence
+from datetime import date
+from typing import Any
+
+from fastapi.testclient import TestClient
+
+from app.domain.enums import ClaimType, DayPart, LeaveType, RequestStatus, RequestType
+from app.integrations.base import (
+    ClaimSubmissionPayload,
+    LeaveSubmissionPayload,
+    SubmissionResult,
+)
+from app.llm.schemas import (
+    AgentTurn,
+    AttachmentInput,
+    ClaimFields,
+    Intent,
+    LeaveFields,
+    LLMContext,
+    RequestRef,
+    StatusQuery,
+)
+
+TODAY = date(2026, 9, 25)  # a Friday; Hong Kong "today" in every chat test
+
+
+class ScriptedLLM:
+    """Returns queued ``AgentTurn`` objects (or raises queued exceptions), records every call."""
+
+    name = "scripted"
+    model = "scripted"
+
+    def __init__(self) -> None:
+        self.queue: list[AgentTurn | Exception] = []
+        self.calls: list[tuple[str, LLMContext]] = []
+        self.attachments_seen: list[list[AttachmentInput]] = []  # files of each call (may be [])
+        self.on_call: Callable[[], None] | None = None
+
+    def push(self, *items: AgentTurn | Exception) -> None:
+        self.queue.extend(items)
+
+    def analyse(
+        self,
+        user_message: str,
+        context: LLMContext,
+        attachments: Sequence[AttachmentInput] = (),
+    ) -> AgentTurn:
+        self.calls.append((user_message, context))
+        self.attachments_seen.append(list(attachments))
+        if self.on_call is not None:
+            self.on_call()
+        if not self.queue:
+            raise AssertionError("ScriptedLLM queue is empty: the test did not expect an LLM call")
+        item = self.queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class RecordingAdapter:
+    """A ``SubmissionAdapter`` that records payloads and can be told to fail."""
+
+    provider = "fake"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []  # (kind, wire body)
+        self.payloads: list[LeaveSubmissionPayload | ClaimSubmissionPayload] = []
+        self.failures: list[SubmissionResult] = []
+        self.on_call: Callable[[], None] | None = None
+        self._counter = 100
+
+    def fail_next(self, http_status: int = 503, error: str = "Service unavailable") -> None:
+        self.failures.append(
+            SubmissionResult(ok=False, http_status=http_status, error_message=error)
+        )
+
+    def _result(self) -> SubmissionResult:
+        if self.on_call is not None:
+            self.on_call()
+        if self.failures:
+            return self.failures.pop(0)
+        self._counter += 1
+        ref = str(self._counter)
+        return SubmissionResult(
+            ok=True,
+            http_status=201,
+            external_reference_id=ref,
+            response_summary={"id": ref, "createdAt": "2026-09-25T03:00:00.000Z"},
+        )
+
+    def submit_leave(self, payload: LeaveSubmissionPayload) -> SubmissionResult:
+        self.payloads.append(payload)
+        self.calls.append(("leave", payload.to_wire()))
+        return self._result()
+
+    def submit_claim(self, payload: ClaimSubmissionPayload) -> SubmissionResult:
+        self.payloads.append(payload)
+        self.calls.append(("claim", payload.to_wire()))
+        return self._result()
+
+
+# ---- AgentTurn builders -------------------------------------------------------------------------
+def d(text: str) -> date:
+    return date.fromisoformat(text)
+
+
+def leave_turn(intent: Intent = Intent.CREATE_LEAVE, **fields: Any) -> AgentTurn:
+    return AgentTurn(
+        intent=intent,
+        request_type=RequestType.LEAVE,
+        leave=LeaveFields(**fields),
+        confidence=0.9,
+    )
+
+
+def details_leave(**fields: Any) -> AgentTurn:
+    return leave_turn(Intent.PROVIDE_DETAILS, **fields)
+
+
+def claim_turn(intent: Intent = Intent.CREATE_CLAIM, **fields: Any) -> AgentTurn:
+    return AgentTurn(
+        intent=intent,
+        request_type=RequestType.CLAIM,
+        claim=ClaimFields(**fields),
+        confidence=0.9,
+    )
+
+
+def details_claim(**fields: Any) -> AgentTurn:
+    return claim_turn(Intent.PROVIDE_DETAILS, **fields)
+
+
+def update_turn(
+    *,
+    request_id: int | None = None,
+    request_type: RequestType | None = None,
+    hint: str | None = None,
+    leave: dict[str, Any] | None = None,
+    claim: dict[str, Any] | None = None,
+) -> AgentTurn:
+    return AgentTurn(
+        intent=Intent.UPDATE_REQUEST,
+        request_type=request_type,
+        target=RequestRef(request_id=request_id, request_type=request_type, hint=hint),
+        leave=LeaveFields(**leave) if leave else None,
+        claim=ClaimFields(**claim) if claim else None,
+        confidence=0.9,
+    )
+
+
+def cancel_turn(
+    *,
+    request_id: int | None = None,
+    request_type: RequestType | None = None,
+    hint: str | None = None,
+) -> AgentTurn:
+    return AgentTurn(
+        intent=Intent.CANCEL_REQUEST,
+        request_type=request_type,
+        target=RequestRef(request_id=request_id, request_type=request_type, hint=hint),
+        confidence=0.9,
+    )
+
+
+def status_turn(
+    *,
+    request_type: RequestType | None = None,
+    request_id: int | None = None,
+    status: RequestStatus | None = None,
+) -> AgentTurn:
+    return AgentTurn(
+        intent=Intent.CHECK_STATUS,
+        request_type=request_type,
+        status_query=StatusQuery(request_type=request_type, request_id=request_id, status=status),
+        confidence=0.9,
+    )
+
+
+def simple_turn(intent: Intent, **kw: Any) -> AgentTurn:
+    return AgentTurn(intent=intent, confidence=0.9, **kw)
+
+
+FULL_LEAVE = {
+    "leave_type": LeaveType.ANNUAL,
+    "start_date": d("2026-10-05"),
+    "end_date": d("2026-10-07"),
+}
+VALID_CLAIM = {
+    "claim_type": ClaimType.TRAVEL,
+    "amount": 120.0,
+    "receipt_date": d("2026-09-20"),
+}
+PM = DayPart.PM
+AM = DayPart.AM
+
+
+# ---- HTTP wrapper ----------------------------------------------------------------------------
+class Chat:
+    """Thin wrapper around one conversation on a logged-in ``TestClient``."""
+
+    def __init__(self, client: TestClient, conversation_id: int | None = None) -> None:
+        self.client = client
+        if conversation_id is None:
+            response = client.post("/api/chat/conversations")
+            assert response.status_code == 201, response.text
+            conversation_id = response.json()["id"]
+        self.id = conversation_id
+
+    def say_raw(self, text: str) -> Any:
+        return self.client.post(
+            f"/api/chat/conversations/{self.id}/messages", json={"content": text}
+        )
+
+    def say(self, text: str) -> dict[str, Any]:
+        response = self.say_raw(text)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    def act_raw(self, card_id: str, action: str = "confirm") -> Any:
+        return self.client.post(
+            f"/api/chat/conversations/{self.id}/actions",
+            json={"card_id": card_id, "action": action},
+        )
+
+    def act(self, card_id: str, action: str = "confirm") -> dict[str, Any]:
+        response = self.act_raw(card_id, action)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    def detail(self) -> dict[str, Any]:
+        response = self.client.get(f"/api/chat/conversations/{self.id}")
+        assert response.status_code == 200, response.text
+        return response.json()
+
+
+def ui_of(response: dict[str, Any], index: int = -1) -> dict[str, Any] | None:
+    return response["assistant_messages"][index]["ui"]
+
+
+def text_of(response: dict[str, Any], index: int = -1) -> str:
+    return response["assistant_messages"][index]["content"]
+
+
+def card_of(response: dict[str, Any]) -> dict[str, Any]:
+    ui = ui_of(response)
+    assert ui is not None and ui["type"] == "confirmation_card", response
+    return ui
+
+
+def field_values(card: dict[str, Any]) -> dict[str, str]:
+    return {f["key"]: f["value"] for f in card["fields"]}
+
+
+# ---- seed ids (deterministic order in app/seed.py; verified in test_seed_id_assumptions) -----
+AMY_PENDING_LEAVE = 1  # L1, Amy, pending_approval
+AMY_PENDING_CLAIM = 1  # C1, Amy, pending_approval
+CATHY_APPROVED_LEAVE = 3  # L3
+CATHY_APPROVED_CLAIM = 3  # C3
+BEN_REJECTED_LEAVE = 4  # L4, reviewer note "Team is short-staffed..."
+BEN_REJECTED_CLAIM = 4  # C4
+
+
+def submit_leave(chat: Chat, llm: ScriptedLLM, **fields: Any) -> int:
+    """Create + confirm a leave through the chat and return the new request id."""
+    llm.push(leave_turn(**(fields or FULL_LEAVE)))
+    card = card_of(chat.say("create leave"))
+    result = ui_of(chat.act(card["card_id"]))
+    assert result["type"] == "result_card" and result["outcome"] == "submitted", result
+    return int(result["request_id"])
+
+
+def submit_claim(chat: Chat, llm: ScriptedLLM, **fields: Any) -> int:
+    llm.push(claim_turn(**(fields or VALID_CLAIM)))
+    card = card_of(chat.say("create claim"))
+    result = ui_of(chat.act(card["card_id"]))
+    assert result["type"] == "result_card" and result["outcome"] == "submitted", result
+    return int(result["request_id"])
+"""Fixtures for the attachment tests: temporary UPLOAD_DIR, scripted LLM, several users."""
+
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.db.session import Database
+from app.main import create_app
+from tests.chat.helpers import TODAY, Chat, RecordingAdapter, ScriptedLLM
+from tests.conftest import CSRF_HEADERS, login, make_settings
+
+CATHY = "cathy.ng@example.com"
+AMY = "amy.lau@example.com"
+HR = "helen.yeung@example.com"  # the HR approver of Cathy and Daniel
+FINANCE = "eva.cheung@example.com"
+
+
+@pytest.fixture(autouse=True)
+def frozen_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.domain.clock.today_hk", lambda: TODAY)
+    monkeypatch.setattr("app.schemas.drafts.today_hk", lambda: TODAY)
+
+
+@pytest.fixture
+def upload_dir(tmp_path: Path) -> Path:
+    return tmp_path / "uploads"
+
+
+@pytest.fixture
+def llm() -> ScriptedLLM:
+    return ScriptedLLM()
+
+
+@pytest.fixture
+def adapter() -> RecordingAdapter:
+    return RecordingAdapter()
+
+
+@pytest.fixture
+def att_app(
+    seeded: Database, llm: ScriptedLLM, adapter: RecordingAdapter, upload_dir: Path
+) -> FastAPI:
+    return create_app(
+        make_settings(upload_dir=str(upload_dir)),
+        database=seeded,
+        llm_provider=llm,
+        submission_adapter=adapter,
+    )
+
+
+def _client(app: FastAPI, email: str | None) -> Iterator[TestClient]:
+    with TestClient(app, headers=CSRF_HEADERS) as client:
+        if email:
+            login(client, email)
+        yield client
+
+
+@pytest.fixture
+def cathy(att_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(att_app, CATHY)
+
+
+@pytest.fixture
+def amy(att_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(att_app, AMY)
+
+
+@pytest.fixture
+def hr(att_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(att_app, HR)
+
+
+@pytest.fixture
+def finance(att_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(att_app, FINANCE)
+
+
+@pytest.fixture
+def anon(att_app: FastAPI) -> Iterator[TestClient]:
+    yield from _client(att_app, None)
+
+
+@pytest.fixture
+def chat(cathy: TestClient) -> Chat:
+    return Chat(cathy)
+
+
+@pytest.fixture
+def amy_chat(amy: TestClient) -> Chat:
+    return Chat(amy)
+"""Sample file bytes and small wrappers for the attachment tests (offline, deterministic)."""
+
+import asyncio
+from collections.abc import Iterator
+from typing import Any
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.services.attachments import sniff_content_type
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 40
+JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x01" * 40
+WEBP = b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 40
+HEIC = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x00" * 40
+HEIF = b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00mif1heic" + b"\x00" * 40
+PDF = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n%%EOF\n"
+
+HTML = b"<!doctype html><html><body><script>alert(1)</script></body></html>"
+SVG = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><script>1</script></svg>'
+EXE = b"MZ\x90\x00\x03\x00\x00\x00" + b"\x00" * 60
+ZIP = b"PK\x03\x04" + b"\x00" * 60
+GIF = b"GIF89a" + b"\x00" * 40
+
+MB = 1024 * 1024
+
+
+def padded(header: bytes, size: int) -> bytes:
+    """``header`` followed by zero bytes up to exactly ``size`` bytes."""
+    return header + b"\x00" * (size - len(header))
+
+
+def upload(
+    client: TestClient,
+    conversation_id: int,
+    data: bytes,
+    filename: str = "receipt.png",
+    content_type: str | None = "auto",
+    field: str = "file",
+) -> Any:
+    if content_type == "auto":  # declare what the bytes really are (like a well-behaved browser)
+        content_type = sniff_content_type(data) or "application/octet-stream"
+    files = {field: (filename, data, content_type)} if content_type else {field: (filename, data)}
+    return client.post(f"/api/chat/conversations/{conversation_id}/attachments", files=files)
+
+
+def upload_ok(client: TestClient, conversation_id: int, data: bytes = PNG, **kw: Any) -> dict:
+    response = upload(client, conversation_id, data, **kw)
+    assert response.status_code == 201, response.text
+    return response.json()["attachment"]
+
+
+def multipart_body(
+    data: bytes, filename: str = "big.png", content_type: str = "image/png", boundary: str = "BND"
+) -> tuple[bytes, bytes, bytes]:
+    """(head, data, tail) of a one-file multipart body, so tests can stream it in pieces."""
+    head = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    return head, data, tail
+
+
+class AsgiResult:
+    def __init__(self, status: int, body: bytes, consumed: int) -> None:
+        self.status = status
+        self.body = body
+        self.consumed = consumed  # body messages the server pulled from the client
+
+
+def asgi_upload(
+    app: FastAPI,
+    conversation_id: int,
+    cookie: str,
+    chunks: Iterator[bytes] | list[bytes],
+    *,
+    content_length: int | None = None,
+    boundary: str = "BND",
+) -> AsgiResult:
+    """POST a multipart body straight to the ASGI app with no Content-Length (chunked) unless
+    ``content_length`` is given, counting how many body chunks the server actually reads."""
+    pieces = list(chunks)
+    consumed = 0
+    sent: list[dict[str, Any]] = []
+    index = 0
+
+    async def receive() -> dict[str, Any]:
+        nonlocal consumed, index
+        if index < len(pieces):
+            piece = pieces[index]
+            index += 1
+            consumed += 1
+            return {"type": "http.request", "body": piece, "more_body": index < len(pieces)}
+        await asyncio.sleep(3600)  # the client has nothing more; never reached when refused
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    headers = [
+        (b"host", b"testserver"),
+        (b"content-type", f"multipart/form-data; boundary={boundary}".encode()),
+        (b"x-requested-with", b"XMLHttpRequest"),
+        (b"cookie", f"scmp_session={cookie}".encode()),
+    ]
+    if content_length is not None:
+        headers.append((b"content-length", str(content_length).encode()))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "path": f"/api/chat/conversations/{conversation_id}/attachments",
+        "raw_path": f"/api/chat/conversations/{conversation_id}/attachments".encode(),
+        "query_string": b"",
+        "root_path": "",
+        "scheme": "http",
+        "headers": headers,
+        "client": ("127.0.0.1", 1234),
+        "server": ("testserver", 80),
+        "state": {},
+    }
+
+    async def run() -> None:
+        await asyncio.wait_for(app(scope, receive, send), timeout=30)
+
+    asyncio.run(run())
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return AsgiResult(status, body, consumed)

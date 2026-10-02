@@ -1,0 +1,1318 @@
+=== nuxt.config.ts
+import tailwindcss from '@tailwindcss/vite'
+
+// Theme defaults; override with NUXT_PUBLIC_THEME_* (see ../.env.example).
+// The real .env lives at the repo root; package.json scripts pass `--dotenv ../.env`
+// (missing file is ignored, existing process env wins).
+export default defineNuxtConfig({
+  compatibilityDate: '2026-09-01',
+  devtools: { enabled: false },
+  modules: ['@nuxt/eslint'],
+  css: ['~/assets/css/main.css'],
+  devServer: { port: Number(process.env.WEB_PORT) || 9180 },
+  vite: { plugins: [tailwindcss()] },
+  runtimeConfig: {
+    // Private (server-only): API base used during SSR. In Docker, `localhost` is the web container
+    // itself, so compose sets NUXT_API_BASE_SERVER=http://api:9181. Empty falls back to public.apiBase.
+    apiBaseServer: '',
+    public: {
+      // Browser-facing API base (NUXT_PUBLIC_API_BASE).
+      apiBase: 'http://localhost:9181',
+      theme: {
+        lightPrimary: '#32a9e1',
+        lightSecondary: '#1e40af',
+        lightBackground: '#ffffff',
+        darkPrimary: '#7dd3fc',
+        darkSecondary: '#94a3b8',
+        darkBackground: '#020617',
+      },
+    },
+  },
+})
+=== eslint.config.mjs
+// @ts-check
+import withNuxt from './.nuxt/eslint.config.mjs'
+
+export default withNuxt()
+=== vitest.config.ts
+import { defineConfig } from 'vitest/config'
+
+export default defineConfig({
+  test: { include: ['tests/**/*.test.ts'], environment: 'node' },
+})
+=== tsconfig.json
+{
+  "files": [],
+  "references": [
+    { "path": "./.nuxt/tsconfig.app.json" },
+    { "path": "./.nuxt/tsconfig.server.json" },
+    { "path": "./.nuxt/tsconfig.shared.json" },
+    { "path": "./.nuxt/tsconfig.node.json" }
+  ]
+}
+=== app/app.vue
+<script setup lang="ts">
+const { public: { theme } } = useRuntimeConfig()
+const mode = useThemeMode()
+
+useHead({
+  htmlAttrs: {
+    lang: 'en',
+    'data-theme': computed(() => (mode.value === 'system' ? undefined : mode.value)),
+  },
+  title: 'SCMP Internal Operations AI Assistant',
+  style: [{ id: 'theme-vars', innerHTML: buildThemeCss(theme) }],
+})
+</script>
+
+<template>
+  <NuxtLayout>
+    <NuxtPage />
+  </NuxtLayout>
+</template>
+=== app/middleware/auth.global.ts
+export default defineNuxtRouteMiddleware(async (to) => {
+  const { user, notice, getToken, refreshUser } = useAuth()
+
+  if (!getToken()) {
+    user.value = null // cookie expired or cleared (e.g. in another tab)
+  }
+  else if (!user.value) {
+    // First load (server or client) or after the state was cleared: validate the token with /me.
+    await refreshUser()
+  }
+
+  const authenticated = Boolean(user.value && getToken())
+  if (to.path === '/login') return authenticated ? navigateTo('/') : undefined
+  if (!authenticated) {
+    // An SSR redirect starts a new request, so carry the "expired" reason in a harmless query flag.
+    return navigateTo(notice.value ? { path: '/login', query: { reason: 'expired' } } : '/login')
+  }
+})
+=== app/composables/useApi.ts
+import type { NitroFetchOptions, NitroFetchRequest } from 'nitropack'
+
+/**
+ * `$fetch` wrapper for authenticated API calls: adds the Bearer header and signs the user out
+ * (clearing the cookie and redirecting to /login) when the API answers 401.
+ */
+export function useApi() {
+  const { apiBase, getToken, clearSession, withContext, expiredNotice } = useAuth()
+
+  return async function api<T>(path: string, options: NitroFetchOptions<NitroFetchRequest> = {}): Promise<T> {
+    const token = getToken()
+    try {
+      return await $fetch<T>(path, {
+        ...options,
+        baseURL: apiBase(),
+        headers: { ...(options.headers as Record<string, string> | undefined), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      }) as T
+    }
+    catch (error) {
+      if (extractStatus(error) === 401) {
+        clearSession(expiredNotice)
+        await withContext(() => navigateTo('/login'))
+      }
+      throw error
+    }
+  }
+}
+=== app/composables/useAuth.ts
+import type { CookieRef } from '#app'
+
+const TOKEN_COOKIE = 'auth-token'
+const tokenCookies = new WeakMap<object, CookieRef<string | null>>()
+const EXPIRED_NOTICE = 'Your session has expired. Please sign in again.'
+
+/**
+ * Session state. The JWT lives only in the `auth-token` cookie (never in useState, so it is not
+ * serialised into the SSR payload); only the user object is shared state.
+ */
+export function useAuth() {
+  const nuxtApp = useNuxtApp()
+  const config = useRuntimeConfig()
+  const secure = useRequestURL().protocol === 'https:'
+
+  const user = useState<AuthUser | null>('auth-user', () => null)
+  const notice = useState<string | null>('auth-notice', () => null)
+
+  function apiBase(): string {
+    return resolveApiBase({
+      isServer: import.meta.server,
+      publicBase: config.public.apiBase,
+      serverBase: import.meta.server ? config.apiBaseServer : undefined, // private key: never read in the browser
+    })
+  }
+
+  // useCookie/navigateTo need the Nuxt context, which is lost after an `await` in event handlers.
+  // Re-enter it only when it is really missing: a nested runWithContext during SSR would clear the
+  // outer context and break later composable calls in the same middleware.
+  function withContext<T>(fn: () => T): T {
+    return tryUseNuxtApp() ? fn() : nuxtApp.runWithContext(fn) as T
+  }
+
+  const cookieOptions = { sameSite: 'lax', secure, default: () => null } as const
+  // One ref per Nuxt app (i.e. per SSR request, or once in the browser), created in a valid context
+  // and reused for reads and clearing, so navigations do not pile up cookie watchers.
+  const tokenCookie = tokenCookies.get(nuxtApp) ?? useCookie<string | null>(TOKEN_COOKIE, cookieOptions)
+  tokenCookies.set(nuxtApp, tokenCookie)
+
+  const getToken = (): string | null => tokenCookie.value || null
+
+  /** Client-only (called from the sign-in click handler). */
+  function setToken(token: string, expiresIn: number) {
+    // A cookie ref's maxAge is fixed at creation, so make one with the lifetime the API gave us.
+    // Create it before touching tokenCookie so it still sees the old value and therefore writes.
+    const withLifetime = withContext(() =>
+      useCookie<string | null>(TOKEN_COOKIE, { ...cookieOptions, maxAge: authCookieMaxAge(expiresIn) }),
+    ) as CookieRef<string | null>
+    tokenCookie.value = token // keep this instance in sync
+    withLifetime.value = token // last write wins: cookie now carries Max-Age
+  }
+
+  function clearSession(message: string | null = null) {
+    tokenCookie.value = null
+    user.value = null
+    notice.value = message
+  }
+
+  const bearer = (token: string) => ({ Authorization: `Bearer ${token}` })
+
+  async function listMockUsers(): Promise<AuthUser[]> {
+    const data = await $fetch<unknown>('/api/auth/mock-users', { baseURL: apiBase(), timeout: 8000 })
+    return parseMockUsers(data)
+  }
+
+  async function loginAs(email: string): Promise<AuthUser> {
+    const data = await $fetch<Partial<LoginResponse>>('/api/auth/mock-google/login', {
+      method: 'POST',
+      baseURL: apiBase(),
+      body: { email },
+      timeout: 8000,
+    })
+    if (typeof data.access_token !== 'string' || !isAuthUser(data.user)) {
+      throw new Error('Malformed login response')
+    }
+    setToken(data.access_token, data.expires_in ?? 0)
+    user.value = data.user
+    notice.value = null
+    return data.user
+  }
+
+  /** Validates the cookie token with /api/auth/me. Clears the session on 401/403. */
+  async function refreshUser(): Promise<AuthUser | null> {
+    const token = getToken()
+    if (!token) {
+      user.value = null
+      return null
+    }
+    try {
+      const me = await $fetch<unknown>('/api/auth/me', { baseURL: apiBase(), headers: bearer(token), timeout: 8000 })
+      if (!isAuthUser(me)) throw new Error('Malformed /me response')
+      user.value = me
+      return me
+    }
+    catch (error) {
+      const status = extractStatus(error)
+      if (status === 401 || status === 403) clearSession(EXPIRED_NOTICE)
+      else user.value = null
+      return null
+    }
+  }
+
+  /** Best-effort server logout; the local session is always cleared first. */
+  async function logout() {
+    const token = getToken()
+    clearSession()
+    if (token) {
+      void $fetch('/api/auth/logout', { method: 'POST', baseURL: apiBase(), headers: bearer(token), timeout: 3000 })
+        .catch(() => undefined)
+    }
+    await withContext(() => navigateTo('/login'))
+  }
+
+  return { user, notice, apiBase, withContext, getToken, clearSession, listMockUsers, loginAs, refreshUser, logout, expiredNotice: EXPIRED_NOTICE }
+}
+=== app/composables/useThemeMode.ts
+/** Cookie-backed theme mode; readable on server and client, so SSR output matches hydration. */
+export function useThemeMode() {
+  const cookie = useCookie<string>('theme-mode', {
+    default: () => 'system',
+    sameSite: 'lax',
+    maxAge: 60 * 60 * 24 * 365,
+  })
+  const mode = computed<ThemeMode>({
+    get: () => (isThemeMode(cookie.value) ? cookie.value : 'system'),
+    set: (value) => {
+      cookie.value = value
+    },
+  })
+  return mode
+}
+=== app/utils/auth.ts
+/** Pure, framework-free auth helpers (unit-tested offline in tests/auth.test.ts). */
+
+export type Role = 'employee' | 'hr_approver' | 'finance_approver'
+
+export interface AuthUser {
+  id: number
+  email: string
+  display_name: string
+  role: Role
+}
+
+export interface LoginResponse {
+  access_token: string
+  token_type: string
+  expires_in: number
+  user: AuthUser
+}
+
+/** Canonical display order (matches the order the API returns mock users in). */
+export const ROLES: readonly Role[] = ['employee', 'hr_approver', 'finance_approver']
+
+export const ROLE_LABELS: Readonly<Record<Role, string>> = {
+  employee: 'Employee',
+  hr_approver: 'HR Approver',
+  finance_approver: 'Finance Approver',
+}
+
+export const ROLE_GROUP_LABELS: Readonly<Record<Role, string>> = {
+  employee: 'Employees',
+  hr_approver: 'HR approvers',
+  finance_approver: 'Finance approvers',
+}
+
+/** Single source of truth for the mock-SSO warning; reused by the login page and the chooser modal. */
+export const MOCK_WARNING = {
+  title: 'Mock sign-in: demonstration only',
+  text: 'This is a demonstration-only mock sign-in. It is not connected to Google. '
+    + 'Choosing an account signs you in immediately as that fictional user, with no password.',
+} as const
+
+export const MOCK_SESSION_REMINDER = {
+  title: 'Mock session',
+  text: 'You are signed in through the demonstration-only mock Google sign-in as a fictional user. '
+    + 'No real Google account, password or SCMP data is involved.',
+} as const
+
+export interface RoleCapabilities {
+  summary: string
+  items: readonly string[]
+}
+
+/** Product scope from AGENTS.md; every item ships in a later phase. */
+export const ROLE_CAPABILITIES: Readonly<Record<Role, RoleCapabilities>> = {
+  employee: {
+    summary: 'Submit your own requests and follow their status.',
+    items: [
+      'Create a Leave Application',
+      'Create a Staff Claim',
+      'View your own requests only',
+    ],
+  },
+  hr_approver: {
+    summary: 'Review Leave requests. Staff Claims are out of scope for this role.',
+    items: [
+      'List Leave requests',
+      'View Leave request details',
+      'Approve or reject Leave requests',
+    ],
+  },
+  finance_approver: {
+    summary: 'Review Staff Claims. Leave requests are out of scope for this role.',
+    items: [
+      'List Staff Claims',
+      'View Staff Claim details',
+      'Approve or reject Staff Claims',
+    ],
+  },
+}
+
+export function isRole(value: unknown): value is Role {
+  return typeof value === 'string' && (ROLES as readonly string[]).includes(value)
+}
+
+export function roleLabel(role: unknown): string {
+  return isRole(role) ? ROLE_LABELS[role] : 'Unknown role'
+}
+
+export function isAuthUser(value: unknown): value is AuthUser {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  return typeof v.id === 'number'
+    && typeof v.email === 'string' && v.email.length > 0
+    && typeof v.display_name === 'string'
+    && isRole(v.role)
+}
+
+/** Keeps only well-formed users from an untrusted API payload. */
+export function parseMockUsers(payload: unknown): AuthUser[] {
+  return Array.isArray(payload) ? payload.filter(isAuthUser) : []
+}
+
+export interface RoleGroup {
+  role: Role
+  label: string
+  users: AuthUser[]
+}
+
+/** Groups users by role in canonical order, omitting empty groups. */
+export function groupUsersByRole(users: readonly AuthUser[]): RoleGroup[] {
+  return ROLES
+    .map(role => ({ role, label: ROLE_GROUP_LABELS[role], users: users.filter(u => u.role === role) }))
+    .filter(group => group.users.length > 0)
+}
+
+/** Up to two initials (first + last word), falling back to the e-mail, then "?". */
+export function getInitials(displayName: string | null | undefined, email?: string | null): string {
+  const words = (displayName ?? '').trim().split(/\s+/).filter(Boolean)
+  const letters = (word: string) => Array.from(word)[0] ?? ''
+  if (words.length >= 2) return (letters(words[0]!) + letters(words[words.length - 1]!)).toUpperCase()
+  if (words.length === 1) return letters(words[0]!).toUpperCase()
+  const fromEmail = letters((email ?? '').trim())
+  return fromEmail ? fromEmail.toUpperCase() : '?'
+}
+
+const AVATAR_COLOURS = ['#1967d2', '#188038', '#a50e0e', '#8430ce', '#0b6e7f', '#b06000'] as const
+
+/** Deterministic avatar background; every colour gives >= 4.5:1 with white initials. */
+export function avatarColour(seed: string): string {
+  let hash = 0
+  for (const ch of seed) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0
+  return AVATAR_COLOURS[hash % AVATAR_COLOURS.length]!
+}
+
+export const DEFAULT_COOKIE_MAX_AGE = 3600
+const MAX_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
+
+/** Cookie lifetime in seconds from the API's `expires_in`; invalid values fall back to one hour. */
+export function authCookieMaxAge(expiresIn: unknown): number {
+  if (typeof expiresIn !== 'number' || !Number.isFinite(expiresIn) || expiresIn < 1) {
+    return DEFAULT_COOKIE_MAX_AGE
+  }
+  return Math.min(Math.floor(expiresIn), MAX_COOKIE_MAX_AGE)
+}
+
+/** Extracts an HTTP status from an ofetch/FetchError-like value; undefined for network errors. */
+export function extractStatus(error: unknown): number | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  const e = error as { status?: unknown, statusCode?: unknown, response?: { status?: unknown } }
+  for (const candidate of [e.statusCode, e.status, e.response?.status]) {
+    if (typeof candidate === 'number' && candidate >= 100) return candidate
+  }
+  return undefined
+}
+
+export type AuthAction = 'list-users' | 'login'
+
+/** User-facing message for an auth API failure (never echoes server text or tokens). */
+export function authErrorMessage(status: number | undefined, action: AuthAction): string {
+  if (status === undefined) return 'Cannot reach the API. Check that the backend is running and try again.'
+  if (status === 404) return 'Mock sign-in is disabled on this server.'
+  if (action === 'login') {
+    if (status === 401) return 'That mock account was not recognised. Please choose another.'
+    if (status === 403) return 'That account is inactive and cannot sign in.'
+  }
+  if (status >= 500) return 'The server had a problem. Please try again in a moment.'
+  return 'Something went wrong. Please try again.'
+}
+
+/** Picks the API base URL: private container-network URL during SSR, public URL in the browser. */
+export function resolveApiBase(opts: { isServer: boolean, publicBase: string, serverBase?: string | null }): string {
+  const chosen = opts.isServer && opts.serverBase ? opts.serverBase : opts.publicBase
+  return chosen.replace(/\/+$/, '')
+}
+=== app/utils/theme.ts
+export interface ThemeConfig {
+  lightPrimary: string
+  lightSecondary: string
+  lightBackground: string
+  darkPrimary: string
+  darkSecondary: string
+  darkBackground: string
+}
+
+export type ThemeMode = 'light' | 'dark' | 'system'
+
+export const DEFAULT_THEME: Readonly<ThemeConfig> = {
+  lightPrimary: '#32a9e1',
+  lightSecondary: '#1e40af',
+  lightBackground: '#ffffff',
+  darkPrimary: '#7dd3fc',
+  darkSecondary: '#94a3b8',
+  darkBackground: '#020617',
+}
+
+const HEX_RE = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i
+
+export function isValidHex(value: unknown): value is string {
+  return typeof value === 'string' && HEX_RE.test(value.trim())
+}
+
+/** Returns a lower-cased valid hex colour, or the fallback when malformed. */
+export function sanitizeHex(value: unknown, fallback: string): string {
+  return isValidHex(value) ? value.trim().toLowerCase() : fallback
+}
+
+export function resolveTheme(input?: Partial<Record<keyof ThemeConfig, unknown>> | null): ThemeConfig {
+  const source = input ?? {}
+  const out = { ...DEFAULT_THEME }
+  for (const key of Object.keys(DEFAULT_THEME) as (keyof ThemeConfig)[]) {
+    out[key] = sanitizeHex(source[key], DEFAULT_THEME[key])
+  }
+  return out
+}
+
+export function isThemeMode(value: unknown): value is ThemeMode {
+  return value === 'light' || value === 'dark' || value === 'system'
+}
+
+/** Builds the :root CSS for light, prefers-color-scheme dark, and data-theme overrides. */
+export function buildThemeCss(input?: Partial<Record<keyof ThemeConfig, unknown>> | null): string {
+  const t = resolveTheme(input)
+  // --theme-* feed the Tailwind @theme tokens (a token cannot reference its own name);
+  // --color-* carry the same values for direct use.
+  const vars = (p: string, s: string, b: string) =>
+    `--theme-primary:${p};--theme-secondary:${s};--theme-background:${b};--color-primary:${p};--color-secondary:${s};--color-background:${b};`
+  const light = vars(t.lightPrimary, t.lightSecondary, t.lightBackground)
+  const dark = vars(t.darkPrimary, t.darkSecondary, t.darkBackground)
+  return [
+    `:root{${light}}`,
+    `@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){${dark}}}`,
+    `:root[data-theme="light"]{${light}}`,
+    `:root[data-theme="dark"]{${dark}}`,
+  ].join('\n')
+}
+=== app/components/AccountChooserModal.vue
+<script setup lang="ts">
+const props = defineProps<{ open: boolean }>()
+const emit = defineEmits<{ close: [] }>()
+
+const { listMockUsers, loginAs } = useAuth()
+
+const dialogRef = ref<HTMLElement | null>(null)
+const users = ref<AuthUser[]>([])
+const loading = ref(false)
+const listError = ref<string | null>(null)
+const loginError = ref<string | null>(null)
+const signingInEmail = ref<string | null>(null)
+const groups = computed(() => groupUsersByRole(users.value))
+
+let returnFocusTo: HTMLElement | null = null
+const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+
+async function loadUsers() {
+  loading.value = true
+  listError.value = null
+  try {
+    users.value = await listMockUsers()
+  }
+  catch (error) {
+    users.value = []
+    listError.value = authErrorMessage(extractStatus(error), 'list-users')
+  }
+  finally {
+    loading.value = false
+  }
+  await nextTick()
+  // Move focus from the dialog container to the first account once the list is ready.
+  if (document.activeElement === dialogRef.value) {
+    dialogRef.value?.querySelector<HTMLElement>('[data-account-row]')?.focus()
+  }
+}
+
+async function choose(user: AuthUser) {
+  if (signingInEmail.value) return
+  signingInEmail.value = user.email
+  loginError.value = null
+  try {
+    await loginAs(user.email)
+    await navigateTo('/')
+  }
+  catch (error) {
+    loginError.value = authErrorMessage(extractStatus(error), 'login')
+    signingInEmail.value = null
+  }
+}
+
+function requestClose() {
+  if (signingInEmail.value) return // do not abandon a sign-in in flight
+  emit('close')
+}
+
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    event.stopPropagation()
+    requestClose()
+    return
+  }
+  if (event.key !== 'Tab' || !dialogRef.value) return
+  const items = Array.from(dialogRef.value.querySelectorAll<HTMLElement>(FOCUSABLE))
+  if (items.length === 0) {
+    event.preventDefault()
+    return
+  }
+  const first = items[0]!
+  const last = items[items.length - 1]!
+  const active = document.activeElement
+  if (event.shiftKey && (active === first || active === dialogRef.value)) {
+    event.preventDefault()
+    last.focus()
+  }
+  else if (!event.shiftKey && active === last) {
+    event.preventDefault()
+    first.focus()
+  }
+}
+
+function keepFocusInside(event: FocusEvent) {
+  const dialog = dialogRef.value
+  if (dialog && event.target instanceof Node && !dialog.contains(event.target)) {
+    dialog.querySelector<HTMLElement>(FOCUSABLE)?.focus()
+  }
+}
+
+watch(() => props.open, async (isOpen) => {
+  if (isOpen) {
+    returnFocusTo = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    document.body.style.overflow = 'hidden'
+    document.addEventListener('focusin', keepFocusInside)
+    signingInEmail.value = null
+    loginError.value = null
+    await nextTick()
+    dialogRef.value?.focus()
+    void loadUsers()
+  }
+  else {
+    document.body.style.overflow = ''
+    document.removeEventListener('focusin', keepFocusInside)
+    returnFocusTo?.focus()
+    returnFocusTo = null
+  }
+})
+
+onBeforeUnmount(() => {
+  document.body.style.overflow = ''
+  document.removeEventListener('focusin', keepFocusInside)
+})
+</script>
+
+<template>
+  <Teleport to="body">
+    <div
+      v-if="open"
+      class="fixed inset-0 z-50 flex items-end justify-center bg-black/60 sm:items-center sm:p-4"
+      @pointerdown.self="requestClose"
+    >
+      <div
+        ref="dialogRef"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="chooser-title"
+        aria-describedby="chooser-warning"
+        tabindex="-1"
+        class="max-h-[92dvh] w-full max-w-md overflow-y-auto rounded-t-2xl border border-secondary/30 bg-background p-5 text-secondary shadow-2xl outline-none sm:rounded-2xl"
+        @keydown="onKeydown"
+      >
+        <div class="flex items-start justify-between gap-3">
+          <div class="flex items-center gap-3">
+            <span class="h-6 w-6 shrink-0"><GoogleGLogo /></span>
+            <div>
+              <h2 id="chooser-title" class="text-lg font-semibold">
+                Choose a mock account
+              </h2>
+              <p class="text-sm opacity-80">
+                to sign in to SCMP Internal Operations AI Assistant
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="focus-ring -mr-1 -mt-1 rounded-full p-2 hover:bg-secondary/10"
+            aria-label="Close account chooser"
+            @click="requestClose"
+          >
+            <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+          </button>
+        </div>
+
+        <div id="chooser-warning" class="mt-4">
+          <MockWarning :title="MOCK_WARNING.title" :text="MOCK_WARNING.text" role="note" />
+        </div>
+
+        <p
+          v-if="loginError"
+          role="alert"
+          class="mt-4 rounded-lg border border-red-700 bg-red-50 p-3 text-sm text-red-900 dark-error"
+        >
+          {{ loginError }}
+        </p>
+
+        <div class="mt-4" :aria-busy="loading">
+          <p v-if="loading" role="status" class="flex items-center gap-2 py-6 text-sm">
+            <svg class="h-5 w-5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" opacity="0.25" />
+              <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+            </svg>
+            Loading mock accounts...
+          </p>
+
+          <div v-else-if="listError" role="alert" class="rounded-lg border border-red-700 bg-red-50 p-3 text-sm text-red-900 dark-error">
+            <p>{{ listError }}</p>
+            <button
+              type="button"
+              class="focus-ring mt-2 rounded-md border border-red-700 px-3 py-1 font-medium hover:bg-red-500/20"
+              @click="loadUsers"
+            >
+              Try again
+            </button>
+          </div>
+
+          <p v-else-if="groups.length === 0" class="py-6 text-sm">
+            No mock accounts are available. Check that the backend has seeded its fictional users.
+          </p>
+
+          <div v-else class="space-y-4">
+            <section v-for="group in groups" :key="group.role" :aria-labelledby="`group-${group.role}`">
+              <h3 :id="`group-${group.role}`" class="text-xs font-semibold uppercase tracking-wide opacity-80">
+                {{ group.label }}
+              </h3>
+              <ul class="mt-2 space-y-1">
+                <li v-for="u in group.users" :key="u.email">
+                  <button
+                    type="button"
+                    data-account-row
+                    class="focus-ring flex w-full items-center gap-3 rounded-lg border border-secondary/30 p-2.5 text-left hover:bg-secondary/10 aria-disabled:cursor-not-allowed aria-disabled:opacity-60 aria-disabled:hover:bg-transparent"
+                    :aria-disabled="signingInEmail !== null"
+                    :aria-busy="signingInEmail === u.email"
+                    @click="choose(u)"
+                  >
+                    <span
+                      class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-sm font-semibold text-white"
+                      :style="{ backgroundColor: avatarColour(u.email) }"
+                      aria-hidden="true"
+                    >{{ getInitials(u.display_name, u.email) }}</span>
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate font-medium">{{ u.display_name }}</span>
+                      <span class="block truncate text-sm opacity-80">{{ u.email }}</span>
+                      <RoleBadge :role="u.role" class="mt-1" />
+                    </span>
+                    <span v-if="signingInEmail === u.email" role="status" class="flex shrink-0 items-center gap-1.5 text-sm">
+                      <svg class="h-5 w-5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" opacity="0.25" />
+                        <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+                      </svg>
+                      <span class="sr-only sm:not-sr-only">Signing in...</span>
+                    </span>
+                  </button>
+                </li>
+              </ul>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+</template>
+=== app/components/AppHeader.vue
+<script setup lang="ts">
+const { user, logout } = useAuth()
+const signingOut = ref(false)
+
+async function signOut() {
+  signingOut.value = true
+  try {
+    await logout()
+  }
+  finally {
+    signingOut.value = false
+  }
+}
+</script>
+
+<template>
+  <header class="border-b border-secondary/30">
+    <div class="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-x-4 gap-y-3 px-4 py-3">
+      <p class="font-semibold">
+        SCMP Internal Operations AI Assistant
+      </p>
+      <div class="flex flex-wrap items-center gap-3">
+        <div
+          v-if="user"
+          class="flex items-center gap-2 rounded-full border border-secondary/30 py-1 pl-1 pr-3"
+        >
+          <span
+            class="flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold text-white"
+            :style="{ backgroundColor: avatarColour(user.email) }"
+            aria-hidden="true"
+          >{{ getInitials(user.display_name, user.email) }}</span>
+          <span class="max-w-[10rem] truncate text-sm font-medium">{{ user.display_name }}</span>
+          <RoleBadge :role="user.role" />
+        </div>
+        <ThemeToggle />
+        <button
+          type="button"
+          class="focus-ring rounded-lg border border-secondary/40 px-3 py-1.5 text-sm font-medium hover:bg-secondary/10 disabled:opacity-60"
+          :disabled="signingOut"
+          @click="signOut"
+        >
+          Sign out
+        </button>
+      </div>
+    </div>
+  </header>
+</template>
+=== app/components/GoogleGLogo.vue
+<template>
+  <!-- Standard four-colour Google "G"; drawn inline (no request to Google). Do not recolour or resize non-uniformly. -->
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+    <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+    <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+    <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+    <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+  </svg>
+</template>
+=== app/components/GoogleSignInButton.vue
+<template>
+  <button type="button" class="gsi-button" aria-haspopup="dialog">
+    <GoogleGLogo />
+    <span>Sign in with Google</span>
+  </button>
+</template>
+=== app/components/MockWarning.vue
+<script setup lang="ts">
+withDefaults(defineProps<{
+  title: string
+  text: string
+  /** "alert" for the page banner; the modal uses "note" so the warning is not announced twice. */
+  role?: 'alert' | 'note'
+}>(), { role: 'alert' })
+</script>
+
+<template>
+  <div class="mock-warning flex gap-3 rounded-lg p-4" :role="role">
+    <svg class="mock-warning-icon mt-0.5 h-6 w-6 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+      <path d="M12 9v4M12 17h.01" />
+    </svg>
+    <div class="min-w-0">
+      <p class="font-semibold">
+        {{ title }}
+      </p>
+      <p class="mt-1 text-sm leading-relaxed">
+        {{ text }}
+      </p>
+    </div>
+  </div>
+</template>
+=== app/components/RoleBadge.vue
+<script setup lang="ts">
+defineProps<{ role: Role }>()
+</script>
+
+<template>
+  <span class="role-badge" :data-role="role">{{ roleLabel(role) }}</span>
+</template>
+=== app/components/ThemeToggle.vue
+<script setup lang="ts">
+const mode = useThemeMode()
+const options: { value: ThemeMode, label: string }[] = [
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
+  { value: 'system', label: 'System' },
+]
+</script>
+
+<template>
+  <div
+    role="group"
+    aria-label="Colour theme"
+    class="inline-flex overflow-hidden rounded-lg border border-secondary/40"
+  >
+    <button
+      v-for="option in options"
+      :key="option.value"
+      type="button"
+      :aria-pressed="mode === option.value"
+      class="px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-primary"
+      :class="mode === option.value ? 'bg-primary text-slate-950' : 'text-secondary hover:bg-secondary/10'"
+      @click="mode = option.value"
+    >
+      {{ option.label }}
+    </button>
+  </div>
+</template>
+=== app/layouts/auth.vue
+<template>
+  <div class="min-h-screen bg-background text-secondary">
+    <div class="absolute right-4 top-4">
+      <ThemeToggle />
+    </div>
+    <slot />
+  </div>
+</template>
+=== app/layouts/default.vue
+<template>
+  <div class="min-h-screen bg-background text-secondary">
+    <AppHeader />
+    <slot />
+  </div>
+</template>
+=== app/pages/index.vue
+<script setup lang="ts">
+useHead({ title: 'Home - SCMP Internal Operations AI Assistant' })
+
+const { user } = useAuth()
+const capabilities = computed(() => (user.value ? ROLE_CAPABILITIES[user.value.role] : null))
+</script>
+
+<template>
+  <main v-if="user && capabilities" class="mx-auto max-w-3xl space-y-6 px-4 py-8">
+    <section>
+      <h1 class="text-2xl font-bold">
+        Signed in as {{ user.display_name }} ({{ roleLabel(user.role) }})
+      </h1>
+      <p class="mt-1 text-sm opacity-90">
+        {{ user.email }}
+      </p>
+    </section>
+
+    <MockWarning :title="MOCK_SESSION_REMINDER.title" :text="MOCK_SESSION_REMINDER.text" role="note" />
+
+    <section class="rounded-2xl border border-secondary/30 p-5" aria-labelledby="capabilities-title">
+      <div class="flex flex-wrap items-center gap-2">
+        <h2 id="capabilities-title" class="text-lg font-semibold">
+          What you can do
+        </h2>
+        <RoleBadge :role="user.role" />
+      </div>
+      <p class="mt-2 text-sm opacity-90">
+        {{ capabilities.summary }}
+      </p>
+      <ul class="mt-4 space-y-2">
+        <li
+          v-for="item in capabilities.items"
+          :key="item"
+          class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-secondary/20 px-3 py-2"
+        >
+          <span>{{ item }}</span>
+          <span class="rounded-full border border-secondary/40 px-2 py-0.5 text-xs font-medium">Coming in the next phase</span>
+        </li>
+      </ul>
+    </section>
+  </main>
+</template>
+=== app/pages/login.vue
+<script setup lang="ts">
+definePageMeta({ layout: 'auth' })
+useHead({ title: 'Sign in - SCMP Internal Operations AI Assistant' })
+
+const { notice, expiredNotice } = useAuth()
+const route = useRoute()
+const message = computed(() => notice.value ?? (route.query.reason === 'expired' ? expiredNotice : null))
+const chooserOpen = ref(false)
+
+function openChooser(event: MouseEvent) {
+  // Safari does not focus buttons on click; focus explicitly so focus can return here on close.
+  if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus()
+  chooserOpen.value = true
+}
+</script>
+
+<template>
+  <main class="mx-auto flex min-h-screen max-w-xl flex-col justify-center gap-6 px-4 py-16">
+    <header>
+      <p class="text-sm font-semibold uppercase tracking-wide">
+        Internal operations demo
+      </p>
+      <h1 class="mt-2 text-3xl font-bold">
+        SCMP Internal Operations AI Assistant
+      </h1>
+      <p class="mt-3 opacity-90">
+        A proof-of-concept employee self-service assistant for Leave Applications and Staff Claims.
+        It uses fictional data only.
+      </p>
+    </header>
+
+    <MockWarning :title="MOCK_WARNING.title" :text="MOCK_WARNING.text" />
+
+    <p
+      v-if="message"
+      role="status"
+      class="rounded-lg border border-secondary/40 p-3 text-sm"
+    >
+      {{ message }}
+    </p>
+
+    <div>
+      <GoogleSignInButton @click="openChooser" />
+      <p class="mt-3 text-sm opacity-90">
+        Opens a list of fictional accounts. No real Google account is used.
+      </p>
+    </div>
+
+    <AccountChooserModal :open="chooserOpen" @close="chooserOpen = false" />
+  </main>
+</template>
+=== app/assets/css/main.css
+@import "tailwindcss";
+
+/* Runtime values (--theme-* and --color-*) are injected at :root by app/app.vue
+   from runtimeConfig.public.theme; these tokens expose them as utilities. */
+@theme inline {
+  --color-primary: var(--theme-primary);
+  --color-secondary: var(--theme-secondary);
+  --color-background: var(--theme-background);
+}
+
+html {
+  color-scheme: light;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) {
+    color-scheme: dark;
+  }
+}
+
+body {
+  background-color: var(--theme-background);
+  color: var(--theme-secondary);
+}
+
+/* ---- Mock-warning (fixed amber) and role-badge palettes -------------------------------------
+   Not env-driven: these are status colours whose contrast is verified, so they follow the same
+   light / prefers-color-scheme / data-theme switching as the theme tokens but stay constant. */
+:root {
+  --warn-bg: #fffbeb;
+  --warn-border: #d97706;
+  --warn-text: #451a03;
+  --warn-icon: #b45309;
+  --badge-employee-bg: #e0f2fe;
+  --badge-employee-fg: #075985;
+  --badge-hr-bg: #ede9fe;
+  --badge-hr-fg: #5b21b6;
+  --badge-finance-bg: #dcfce7;
+  --badge-finance-fg: #166534;
+  --gsi-bg: #ffffff;
+  --gsi-border: #747775;
+  --gsi-fg: #1f1f1f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --warn-bg: #451a03;
+    --warn-border: #f59e0b;
+    --warn-text: #fef3c7;
+    --warn-icon: #fbbf24;
+    --badge-employee-bg: #0c4a6e;
+    --badge-employee-fg: #e0f2fe;
+    --badge-hr-bg: #4c1d95;
+    --badge-hr-fg: #ede9fe;
+    --badge-finance-bg: #14532d;
+    --badge-finance-fg: #dcfce7;
+    --gsi-bg: #131314;
+    --gsi-border: #8e918f;
+    --gsi-fg: #e3e3e3;
+  }
+}
+
+:root[data-theme="dark"] {
+  --warn-bg: #451a03;
+  --warn-border: #f59e0b;
+  --warn-text: #fef3c7;
+  --warn-icon: #fbbf24;
+  --badge-employee-bg: #0c4a6e;
+  --badge-employee-fg: #e0f2fe;
+  --badge-hr-bg: #4c1d95;
+  --badge-hr-fg: #ede9fe;
+  --badge-finance-bg: #14532d;
+  --badge-finance-fg: #dcfce7;
+  --gsi-bg: #131314;
+  --gsi-border: #8e918f;
+  --gsi-fg: #e3e3e3;
+}
+
+.mock-warning {
+  background-color: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-left-width: 6px;
+  color: var(--warn-text);
+}
+
+.mock-warning-icon {
+  color: var(--warn-icon);
+}
+
+.role-badge {
+  display: inline-block;
+  border-radius: 9999px;
+  padding: 0.125rem 0.625rem;
+  font-size: 0.75rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.role-badge[data-role="employee"] {
+  background-color: var(--badge-employee-bg);
+  color: var(--badge-employee-fg);
+}
+
+.role-badge[data-role="hr_approver"] {
+  background-color: var(--badge-hr-bg);
+  color: var(--badge-hr-fg);
+}
+
+.role-badge[data-role="finance_approver"] {
+  background-color: var(--badge-finance-bg);
+  color: var(--badge-finance-fg);
+}
+
+/* "Sign in with Google" button: light (default) / dark themes per Google's branding guidelines
+   (fill #FFFFFF/#131314, 1px stroke #747775/#8E918F, text #1F1F1F/#E3E3E3, 12px left padding,
+   10px after the logo, 12px right padding). Font: Google Sans Medium where installed, then
+   Roboto, then the system stack; no web font is fetched from Google. */
+.gsi-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 40px;
+  min-width: 200px;
+  max-width: 100%;
+  padding: 0 12px;
+  border: 1px solid var(--gsi-border);
+  border-radius: 4px;
+  background-color: var(--gsi-bg);
+  color: var(--gsi-fg);
+  font-family: "Google Sans", "Roboto", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  letter-spacing: 0.25px;
+  cursor: pointer;
+  transition: box-shadow 0.15s;
+}
+
+.gsi-button:hover {
+  box-shadow: 0 1px 2px 0 rgb(60 64 67 / 30%), 0 1px 3px 1px rgb(60 64 67 / 15%);
+}
+
+.gsi-button > svg {
+  width: 20px;
+  height: 20px;
+  margin-right: 10px;
+  flex: none;
+}
+
+.gsi-button:focus-visible,
+.focus-ring:focus-visible {
+  outline: 2px solid var(--theme-secondary);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin {
+    animation: none;
+  }
+}
+
+/* Error panels: fixed light red on light theme, dark red on dark theme (contrast >= 4.5:1). */
+:root[data-theme="dark"] .dark-error {
+  background-color: #450a0a;
+  color: #fee2e2;
+  border-color: #f87171;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .dark-error {
+    background-color: #450a0a;
+    color: #fee2e2;
+    border-color: #f87171;
+  }
+}
+=== tests/auth.test.ts
+import { describe, expect, it } from 'vitest'
+import {
+  authCookieMaxAge,
+  authErrorMessage,
+  avatarColour,
+  extractStatus,
+  getInitials,
+  groupUsersByRole,
+  isAuthUser,
+  MOCK_WARNING,
+  parseMockUsers,
+  resolveApiBase,
+  ROLE_CAPABILITIES,
+  roleLabel,
+  ROLES,
+} from '../app/utils/auth'
+
+const user = (id: number, role: string) => ({ id, email: `u${id}@example.com`, display_name: `User ${id}`, role })
+
+describe('role labels and capabilities', () => {
+  it('maps every role to a label and falls back for unknown values', () => {
+    expect(roleLabel('employee')).toBe('Employee')
+    expect(roleLabel('hr_approver')).toBe('HR Approver')
+    expect(roleLabel('finance_approver')).toBe('Finance Approver')
+    expect(roleLabel('admin')).toBe('Unknown role')
+  })
+
+  it('keeps approver scopes separate: HR is Leave-only, Finance is Claim-only', () => {
+    const hr = ROLE_CAPABILITIES.hr_approver.items.join(' ')
+    const finance = ROLE_CAPABILITIES.finance_approver.items.join(' ')
+    expect(hr).toMatch(/Leave/)
+    expect(hr).not.toMatch(/Claim/)
+    expect(finance).toMatch(/Claim/)
+    expect(finance).not.toMatch(/Leave/)
+    expect(ROLE_CAPABILITIES.employee.items.join(' ')).toMatch(/own requests only/)
+  })
+
+  it('defines capabilities for every role', () => {
+    for (const role of ROLES) expect(ROLE_CAPABILITIES[role].items.length).toBeGreaterThan(0)
+  })
+})
+
+describe('getInitials / avatarColour', () => {
+  it('uses first and last word, uppercased', () => {
+    expect(getInitials('Amy Lau')).toBe('AL')
+    expect(getInitials('  ben  chi  wong ')).toBe('BW')
+    expect(getInitials('Madonna')).toBe('M')
+  })
+
+  it('falls back to the e-mail, then a question mark', () => {
+    expect(getInitials('', 'zed@example.com')).toBe('Z')
+    expect(getInitials(null, null)).toBe('?')
+  })
+
+  it('returns a stable colour for the same seed', () => {
+    expect(avatarColour('amy.lau@example.com')).toBe(avatarColour('amy.lau@example.com'))
+    expect(avatarColour('x')).toMatch(/^#[0-9a-f]{6}$/i)
+  })
+})
+
+describe('authCookieMaxAge', () => {
+  it('uses expires_in seconds when valid', () => {
+    expect(authCookieMaxAge(3600)).toBe(3600)
+    expect(authCookieMaxAge(90.9)).toBe(90)
+  })
+
+  it('falls back to one hour for invalid values and caps very long ones', () => {
+    for (const bad of [0, -5, Number.NaN, Infinity, '3600', null, undefined]) expect(authCookieMaxAge(bad)).toBe(3600)
+    expect(authCookieMaxAge(10 ** 9)).toBe(60 * 60 * 24 * 7)
+  })
+})
+
+describe('error mapping', () => {
+  it('extracts a status from ofetch-like errors and returns undefined for network errors', () => {
+    expect(extractStatus({ statusCode: 401 })).toBe(401)
+    expect(extractStatus({ response: { status: 403 } })).toBe(403)
+    expect(extractStatus(new TypeError('fetch failed'))).toBeUndefined()
+    expect(extractStatus(null)).toBeUndefined()
+  })
+
+  it('maps login failures to distinct, non-leaky messages', () => {
+    expect(authErrorMessage(401, 'login')).toMatch(/not recognised/)
+    expect(authErrorMessage(403, 'login')).toMatch(/inactive/)
+    expect(authErrorMessage(404, 'login')).toMatch(/disabled/)
+    expect(authErrorMessage(undefined, 'login')).toMatch(/Cannot reach the API/)
+    expect(authErrorMessage(500, 'list-users')).toMatch(/server had a problem/)
+    expect(authErrorMessage(401, 'list-users')).toBe('Something went wrong. Please try again.')
+  })
+})
+
+describe('user payload handling', () => {
+  it('validates users and drops malformed entries', () => {
+    expect(isAuthUser(user(1, 'employee'))).toBe(true)
+    expect(isAuthUser(user(1, 'root'))).toBe(false)
+    expect(isAuthUser({ id: '1', email: 'a@b.c', display_name: 'A', role: 'employee' })).toBe(false)
+    expect(parseMockUsers([user(1, 'employee'), { nope: true }, null])).toHaveLength(1)
+    expect(parseMockUsers({ not: 'an array' })).toEqual([])
+  })
+
+  it('groups users by role in canonical order and omits empty groups', () => {
+    const users = parseMockUsers([user(1, 'finance_approver'), user(2, 'employee'), user(3, 'employee')])
+    const groups = groupUsersByRole(users)
+    expect(groups.map(g => g.role)).toEqual(['employee', 'finance_approver'])
+    expect(groups[0]!.users).toHaveLength(2)
+    expect(groups[0]!.label).toBe('Employees')
+  })
+})
+
+describe('resolveApiBase and warning copy', () => {
+  it('uses the private server base only during SSR and strips trailing slashes', () => {
+    const base = { publicBase: 'http://localhost:9181/', serverBase: 'http://api:9181' }
+    expect(resolveApiBase({ isServer: true, ...base })).toBe('http://api:9181')
+    expect(resolveApiBase({ isServer: false, ...base })).toBe('http://localhost:9181')
+    expect(resolveApiBase({ isServer: true, publicBase: 'http://localhost:9181', serverBase: '' })).toBe('http://localhost:9181')
+  })
+
+  it('states plainly that the sign-in is a mock, not Google, and passwordless', () => {
+    expect(MOCK_WARNING.text).toMatch(/demonstration-only mock sign-in/)
+    expect(MOCK_WARNING.text).toMatch(/not connected to Google/)
+    expect(MOCK_WARNING.text).toMatch(/no password/)
+  })
+})
+=== tests/theme.test.ts
+import { describe, expect, it } from 'vitest'
+import { buildThemeCss, DEFAULT_THEME, isValidHex, resolveTheme, sanitizeHex } from '../app/utils/theme'
+
+describe('theme utils', () => {
+  it('accepts 3/6-digit hex and rejects malformed values', () => {
+    expect(isValidHex('#32a9e1')).toBe(true)
+    expect(isValidHex('#FFF')).toBe(true)
+    for (const bad of ['32a9e1', '#12345', '#gggggg', 'red', '#fff;}body{', '', null, 42]) {
+      expect(isValidHex(bad)).toBe(false)
+    }
+  })
+
+  it('normalises valid values and falls back on malformed ones', () => {
+    expect(sanitizeHex(' #ABCDEF ', '#000000')).toBe('#abcdef')
+    expect(sanitizeHex('nope', '#123456')).toBe('#123456')
+  })
+
+  it('resolves a partial/invalid config to defaults', () => {
+    expect(resolveTheme(undefined)).toEqual(DEFAULT_THEME)
+    const t = resolveTheme({ lightPrimary: '#ff0000', darkPrimary: 'bad' })
+    expect(t.lightPrimary).toBe('#ff0000')
+    expect(t.darkPrimary).toBe(DEFAULT_THEME.darkPrimary)
+  })
+
+  it('builds CSS for light, prefers-color-scheme and data-theme overrides', () => {
+    const css = buildThemeCss({ lightPrimary: '#ff0000' })
+    expect(css).toContain(':root{--theme-primary:#ff0000;')
+    expect(css).toContain('@media (prefers-color-scheme: dark)')
+    expect(css).toContain(':root[data-theme="dark"]{--theme-primary:#7dd3fc;')
+    expect(css).toContain(':root[data-theme="light"]{--theme-primary:#ff0000;')
+    expect(css).toContain('--color-primary:#ff0000;')
+  })
+})
+=== Dockerfile
+# syntax=docker/dockerfile:1
+FROM oven/bun:1 AS build
+WORKDIR /app
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --ignore-scripts
+COPY . .
+RUN bun run build
+
+FROM node:24-slim AS runtime
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    NITRO_HOST=0.0.0.0 \
+    NITRO_PORT=9180
+WORKDIR /app
+COPY --from=build --chown=node:node /app/.output ./.output
+USER node
+EXPOSE 9180
+# Theme and API bases stay overridable at runtime, e.g.
+#   -e NUXT_PUBLIC_THEME_LIGHT_PRIMARY='#ff0000' -e NUXT_PUBLIC_API_BASE=http://localhost:9181
+#   -e NUXT_API_BASE_SERVER=http://api:9181   (private; SSR-only, used inside the container network)
+CMD ["node", ".output/server/index.mjs"]
